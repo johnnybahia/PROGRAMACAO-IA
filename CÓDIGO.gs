@@ -20,6 +20,7 @@ const CONFIG = {
   PEDIDO_COL_REFERENCIA: 2,      // Coluna B
   PEDIDO_COL_PRAZO_DIAS: 3,      // Coluna C
   PEDIDO_COL_COR: 4,             // Coluna D
+  PEDIDO_COL_PRIORIDADE: 5,      // Coluna E — grupo de prioridade (1, 2, 3...)
 
   // Colunas das abas de máquinas (base 1)
   MAQUINA_COL_REFERENCIA: 7,     // Coluna G
@@ -28,7 +29,7 @@ const CONFIG = {
   MAQUINA_CELL_MODELO: "L1",     // Nome do modelo
 
   // Limiar de vantagem para trocar do Balanceamento para outra estratégia (%)
-  // Se outra estratégia for X% mais rápida que o Balanceamento, ela assume
+  // Se a melhor combinação for X% mais rápida que tudo-Balanceamento, ela assume
   LIMIAR_TROCA_PERCENT: 10,
 
   // Abas que devem permanecer ocultas após execução
@@ -75,21 +76,28 @@ function analisarDistribuicao() {
       return;
     }
 
-    // ── Avalia todas as estratégias e escolhe a melhor ──
-    ss.toast("Simulando estratégias para escolher a melhor...", "📦 Produção", 10);
-    const { melhor, ranking } = escolherMelhorEstrategia(pedidos, modelos);
+    // ── Avalia todas as estratégias e combinações por grupo ──
+    const grupos = agruparPorPrioridade(pedidos);
+    const numGrupos = grupos.length;
+    const totalCombinacoes = Math.pow(6, numGrupos);
+    ss.toast(
+      numGrupos > 1
+        ? `Simulando ${totalCombinacoes} combinações de estratégias para ${numGrupos} grupos de prioridade...`
+        : "Simulando estratégias para escolher a melhor...",
+      "📦 Produção", 30
+    );
+    const { melhor, ranking } = escolherMelhorEstrategia(pedidos, modelos, grupos);
 
-    // ── Gera distribuição com a melhor estratégia ──
-    ss.toast(`Gerando distribuição com: ${melhor.nome}...`, "📦 Produção", 10);
-    const pedidosOrdenados = melhor.ordenar(pedidos, modelos);
-    const { todasLevas, semCadastro } = otimizarDistribuicao(pedidosOrdenados, modelos);
+    // ── Gera distribuição com a melhor combinação ──
+    ss.toast(`Gerando distribuição...`, "📦 Produção", 10);
+    const { todasLevas, semCadastro } = otimizarDistribuicao(melhor.ordenados, modelos);
 
     ss.toast("Analisando sugestões de tempo...", "📦 Produção", 5);
     const sugestoes = calcularSugestoes(modelos);
 
     ss.toast("Salvando resultados...", "📦 Produção", 5);
     salvarResultado(ss, todasLevas, semCadastro, sugestoes, melhor);
-    salvarComparativo(ss, ranking, pedidos.length, Object.keys(modelos).length);
+    salvarComparativo(ss, melhor, ranking, pedidos.length, Object.keys(modelos).length);
 
     const resumo = gerarResumo(todasLevas, semCadastro, melhor, ranking);
     reaplicarAbasOcultas(ss);
@@ -117,15 +125,18 @@ function lerPedidos(ss) {
     const referencia = String(linha[CONFIG.PEDIDO_COL_REFERENCIA - 1]).trim();
     const prazoDias = parseFloat(linha[CONFIG.PEDIDO_COL_PRAZO_DIAS - 1]) || 999;
     const cor = String(linha[CONFIG.PEDIDO_COL_COR - 1] || "").trim();
+    const prioridadeRaw = parseInt(linha[CONFIG.PEDIDO_COL_PRIORIDADE - 1]);
+    const prioridade = isNaN(prioridadeRaw) || prioridadeRaw <= 0 ? 1 : prioridadeRaw;
 
     if (!referencia || isNaN(totalMaquinas) || totalMaquinas <= 0) continue;
 
     pedidos.push({
       referencia,
-      cor,                          // cor do lote
+      cor,
       maquinasNecessarias: totalMaquinas,
       prazoDias,
-      prazoHoras: prazoDias * CONFIG.HORAS_POR_DIA
+      prazoHoras: prazoDias * CONFIG.HORAS_POR_DIA,
+      prioridade
     });
   }
 
@@ -160,7 +171,6 @@ function lerModelos(ss) {
 
       if (isNaN(totalMaquinas) || totalMaquinas <= 0) {
         log.push(`⚠ "${nomeAba}": K1 inválido ("${valorK1}") — usando nome da aba e 1 máquina como padrão.`);
-        // Continua mesmo assim com 1 máquina, não descarta a aba
       }
 
       const qtdMaquinas = (isNaN(totalMaquinas) || totalMaquinas <= 0) ? 1 : totalMaquinas;
@@ -189,9 +199,60 @@ function lerModelos(ss) {
     }
   }
 
-  // Salva log para diagnóstico
   PropertiesService.getScriptProperties().setProperty("ULTIMO_LOG_MODELOS", log.join("\n"));
   return modelos;
+}
+
+
+// ── AGRUPAMENTO POR PRIORIDADE ─────────────────────────────
+// Retorna array ordenado de { prioridade, pedidos[] }
+function agruparPorPrioridade(pedidos) {
+  const mapa = {};
+  for (const p of pedidos) {
+    const pri = p.prioridade || 1;
+    if (!mapa[pri]) mapa[pri] = [];
+    mapa[pri].push(p);
+  }
+  return Object.keys(mapa)
+    .map(k => parseInt(k))
+    .sort((a, b) => a - b)
+    .map(pri => ({ prioridade: pri, pedidos: mapa[pri] }));
+}
+
+
+// ── GERAR TODAS AS COMBINAÇÕES DE ESTRATÉGIAS ──────────────
+// Para N grupos e 6 estratégias, gera 6^N combinações
+// Cada combinação é um array de índices: [idxG1, idxG2, idxG3, ...]
+function gerarCombinacoesEstrategias(numGrupos, numEstrategias) {
+  const combinacoes = [];
+  const indices = new Array(numGrupos).fill(0);
+
+  while (true) {
+    combinacoes.push([...indices]);
+    let pos = numGrupos - 1;
+    while (pos >= 0) {
+      indices[pos]++;
+      if (indices[pos] < numEstrategias) break;
+      indices[pos] = 0;
+      pos--;
+    }
+    if (pos < 0) break;
+  }
+
+  return combinacoes;
+}
+
+
+// ── SIMULAR UMA COMBINAÇÃO DE ESTRATÉGIAS POR GRUPO ────────
+// Aplica estrategia[combinacao[i]] ao grupo[i], concatena tudo e simula
+function simularCombinacao(grupos, combinacao, estrategias, modelos) {
+  let ordenados = [];
+  for (let i = 0; i < grupos.length; i++) {
+    const pedidosGrupo = estrategias[combinacao[i]].ordenar(grupos[i].pedidos, modelos);
+    ordenados = ordenados.concat(pedidosGrupo);
+  }
+  const tempo = simularTermino(ordenados, modelos);
+  return { tempo, ordenados };
 }
 
 
@@ -297,58 +358,93 @@ function getEstrategias() {
 }
 
 
-// ── ESCOLHE A MELHOR ESTRATÉGIA ────────────────────────────
-function escolherMelhorEstrategia(pedidos, modelos) {
+// ── ESCOLHE A MELHOR COMBINAÇÃO DE ESTRATÉGIAS POR GRUPO ───
+function escolherMelhorEstrategia(pedidos, modelos, grupos) {
   const estrategias = getEstrategias();
   const limiar = CONFIG.LIMIAR_TROCA_PERCENT;
+  const idxBal = estrategias.findIndex(e => e.id === "balanceamento");
 
-  // Calcula tempo de cada estratégia
+  // ── Ranking individual das 6 estratégias (para exibição no COMPARATIVO)
   const ranking = estrategias.map(est => {
     const ordenados = est.ordenar(pedidos, modelos);
     const terminoTotal = simularTermino(ordenados, modelos);
     return { ...est, terminoTotal, terminoHoras: arredondar(terminoTotal), ordenados };
   });
-
-  // Tempo do Balanceamento (sempre estratégia de referência)
-  const balanceamento = ranking.find(r => r.id === "balanceamento");
-  const tempoBalanceamento = balanceamento.terminoTotal;
-
-  // Calcula diferença de cada estratégia em relação ao Balanceamento
+  const tempoBalRanking = ranking.find(r => r.id === "balanceamento").terminoTotal;
   for (const est of ranking) {
-    const diff = arredondar(est.terminoTotal - tempoBalanceamento);
-    const percentual = tempoBalanceamento > 0
-      ? arredondar(((est.terminoTotal - tempoBalanceamento) / tempoBalanceamento) * 100)
+    est.diff = arredondar(est.terminoTotal - tempoBalRanking);
+    est.percentual = tempoBalRanking > 0
+      ? arredondar(((est.terminoTotal - tempoBalRanking) / tempoBalRanking) * 100)
       : 0;
-    est.diff = diff;
-    est.percentual = percentual; // negativo = mais rápido que balanceamento
   }
-
-  // Ordena pelo menor tempo
   ranking.sort((a, b) => a.terminoTotal - b.terminoTotal);
 
-  // Decide qual estratégia usar:
-  // - Balanceamento é sempre o padrão
-  // - Só troca se outra for LIMIAR_TROCA_PERCENT% mais rápida (percentual negativo)
-  const maisRapida = ranking[0];
-  const ganhoVsBalanceamento = maisRapida.percentual; // negativo = ganho real
+  // ── Referência: Balanceamento em TODOS os grupos
+  const numGrupos = grupos.length;
+  const combRef = new Array(numGrupos).fill(idxBal);
+  const { tempo: tempoRef, ordenados: ordenadosRef } = simularCombinacao(grupos, combRef, estrategias, modelos);
 
-  let melhor;
-  let decisao;
+  // ── Testa TODAS as combinações de estratégias por grupo (6^N combinações)
+  const combinacoes = gerarCombinacoesEstrategias(numGrupos, estrategias.length);
+  let melhorComb = [...combRef];
+  let melhorTempo = tempoRef;
+  let melhorOrdenados = ordenadosRef;
 
-  // Regra simples: se qualquer estratégia for >= LIMIAR_TROCA_PERCENT% mais rápida → ela vence
-  // Caso contrário → Balanceamento vence sempre
-  if (maisRapida.id !== "balanceamento" && ganhoVsBalanceamento <= -limiar) {
-    melhor = maisRapida;
-    decisao = `⚡ ${maisRapida.nome} foi ${Math.abs(ganhoVsBalanceamento)}% mais rápida — superou o limiar de ${limiar}%`;
+  for (const comb of combinacoes) {
+    const { tempo, ordenados } = simularCombinacao(grupos, comb, estrategias, modelos);
+    if (tempo < melhorTempo) {
+      melhorTempo = tempo;
+      melhorComb = [...comb];
+      melhorOrdenados = ordenados;
+    }
+  }
+
+  // ── Aplica LIMIAR: só substitui tudo-Balanceamento se for LIMIAR% mais rápido
+  const isTodoBal = (comb) => comb.every(i => i === idxBal);
+  const ganho = tempoRef > 0 ? ((melhorTempo - tempoRef) / tempoRef) * 100 : 0;
+
+  let combinacaoFinal, tempoFinal, ordenadosFinal, decisao;
+
+  if (!isTodoBal(melhorComb) && ganho <= -limiar) {
+    combinacaoFinal = melhorComb;
+    tempoFinal = melhorTempo;
+    ordenadosFinal = melhorOrdenados;
+    decisao = `⚡ Combinação otimizada foi ${Math.abs(arredondar(ganho))}% mais rápida — superou o limiar de ${limiar}%`;
   } else {
-    melhor = balanceamento;
-    const info = (maisRapida.id !== "balanceamento" && ganhoVsBalanceamento < 0)
-      ? ` (melhor alternativa foi ${Math.abs(ganhoVsBalanceamento)}% mais rápida — abaixo do limiar de ${limiar}%)`
+    combinacaoFinal = combRef;
+    tempoFinal = tempoRef;
+    ordenadosFinal = ordenadosRef;
+    const info = !isTodoBal(melhorComb) && ganho < 0
+      ? ` (melhor combinação foi ${Math.abs(arredondar(ganho))}% mais rápida — abaixo do limiar de ${limiar}%)`
       : "";
     decisao = `✅ Balanceamento venceu${info}`;
   }
 
-  melhor.decisao = decisao;
+  // ── Monta detalhamento por grupo de prioridade
+  const estrategiasPorGrupo = combinacaoFinal.map((idxEst, i) => ({
+    grupo: grupos[i].prioridade,
+    estrategia: estrategias[idxEst],
+    quantidadePedidos: grupos[i].pedidos.length
+  }));
+
+  const todasBal = isTodoBal(combinacaoFinal);
+  const nomeResumido = (nome) => nome.replace(/^\d+ — /, "").replace(/^✅ /, "").substring(0, 22);
+  const nomeEstrategia = todasBal
+    ? estrategias[idxBal].nome
+    : estrategiasPorGrupo.map(g => `G${g.grupo}: ${nomeResumido(g.estrategia.nome)}`).join(" | ");
+
+  const melhor = {
+    id: todasBal ? "balanceamento" : "combinacao_prioridade",
+    nome: nomeEstrategia,
+    terminoTotal: tempoFinal,
+    terminoHoras: arredondar(tempoFinal),
+    ordenados: ordenadosFinal,
+    decisao,
+    estrategiasPorGrupo,
+    usaPrioridade: numGrupos > 1,
+    totalCombinacoes: combinacoes.length
+  };
+
   return { melhor, ranking };
 }
 
@@ -356,8 +452,7 @@ function escolherMelhorEstrategia(pedidos, modelos) {
 // ── OTIMIZAÇÃO ─────────────────────────────────────────────
 function otimizarDistribuicao(pedidosOrdenados, modelos) {
 
-  // Pedidos já chegam ordenados pela melhor estratégia
-  // Fila única — cada máquina tem sua hora de próxima disponibilidade
+  // Pedidos já chegam ordenados pela melhor combinação de estratégias
   const filas = {};
   for (const nomeAba in modelos) {
     filas[nomeAba] = new Array(modelos[nomeAba].totalMaquinas).fill(0);
@@ -367,9 +462,8 @@ function otimizarDistribuicao(pedidosOrdenados, modelos) {
   const semCadastro = [];
 
   for (const pedido of pedidosOrdenados) {
-    const { referencia, cor, maquinasNecessarias } = pedido;
+    const { referencia, cor, maquinasNecessarias, prioridade } = pedido;
 
-    // Coleta todas as máquinas físicas que conhecem esta referência
     const maquinasFisicas = [];
     for (const nomeAba in modelos) {
       const modelo = modelos[nomeAba];
@@ -386,17 +480,14 @@ function otimizarDistribuicao(pedidosOrdenados, modelos) {
     }
 
     if (maquinasFisicas.length === 0) {
-      semCadastro.push({ referencia, cor: cor || "-", maquinasNecessarias });
+      semCadastro.push({ referencia, cor: cor || "-", maquinasNecessarias, prioridade: prioridade || 1 });
       continue;
     }
 
-    // Aloca exatamente maquinasNecessarias slots
-    // Máquinas podem ser reutilizadas (rodam em sequência para fechar a cor)
     const porModelo = {};
     let slotsRestantes = maquinasNecessarias;
 
     while (slotsRestantes > 0) {
-      // Sempre escolhe a máquina que terminará mais cedo
       maquinasFisicas.sort((a, b) =>
         (filas[a.aba][a.idxMaquina] + a.tempoProducao) -
         (filas[b.aba][b.idxMaquina] + b.tempoProducao)
@@ -422,6 +513,7 @@ function otimizarDistribuicao(pedidosOrdenados, modelos) {
     for (const chave in porModelo) {
       const aloc = porModelo[chave];
       resultado.push({
+        prioridade: prioridade || 1,
         referencia,
         cor: cor || "-",
         nomeModelo: aloc.nomeModelo,
@@ -514,19 +606,19 @@ function salvarResultado(ss, todasLevas, semCadastro, sugestoes, estrategiaUsada
   if (abaExistente) ss.deleteSheet(abaExistente);
   const aba = ss.insertSheet(CONFIG.ABA_RESULTADO);
 
-  const cabecalho = [
-    "Referência", "Cor", "Modelo", "Aba", "Máquinas Alocadas",
-    "Tempo Produção (h)", "Início (h)", "Término (h)"
-  ];
+  const usaPrioridade = estrategiaUsada && estrategiaUsada.usaPrioridade;
 
-  // Cores por leva (1ª=verde escuro, 2ª=azul, 3ª=roxo, 4+=cinza escuro)
+  const cabecalho = usaPrioridade
+    ? ["Prioridade", "Referência", "Cor", "Modelo", "Aba", "Máquinas Alocadas", "Tempo Produção (h)", "Início (h)", "Término (h)"]
+    : ["Referência", "Cor", "Modelo", "Aba", "Máquinas Alocadas", "Tempo Produção (h)", "Início (h)", "Término (h)"];
+
   const coresTitulo  = ["#1B5E20", "#0D47A1", "#4A148C", "#37474F", "#BF360C", "#006064"];
   const coresCabSub  = ["#2E7D32", "#1565C0", "#6A1B9A", "#546E7A", "#E64A19", "#00838F"];
   const coresFundo   = ["#E8F5E9", "#E3F2FD", "#F3E5F5", "#ECEFF1", "#FBE9E7", "#E0F7FA"];
 
   let linhaAtual = 1;
 
-  // ── Banner da estratégia escolhida
+  // ── Banner principal da estratégia/combinação escolhida
   if (estrategiaUsada) {
     const rangeBanner = aba.getRange(linhaAtual, 1, 1, cabecalho.length);
     rangeBanner.merge();
@@ -542,10 +634,29 @@ function salvarResultado(ss, todasLevas, semCadastro, sugestoes, estrategiaUsada
     rangeLimiar.setValue(`ℹ️  Limiar de troca configurado: ${CONFIG.LIMIAR_TROCA_PERCENT}% — outra estratégia só substitui o Balanceamento se for pelo menos ${CONFIG.LIMIAR_TROCA_PERCENT}% mais rápida`);
     rangeLimiar.setBackground("#E3F2FD").setFontColor("#0D47A1").setFontStyle("italic")
       .setHorizontalAlignment("center");
-    linhaAtual += 2;
-  }
+    linhaAtual++;
 
-  // Sem formatação condicional de status (prazo removido)
+    // ── Detalhamento por grupo de prioridade (se houver mais de 1 grupo)
+    if (usaPrioridade && estrategiaUsada.estrategiasPorGrupo) {
+      const rangeGruposTit = aba.getRange(linhaAtual, 1, 1, cabecalho.length);
+      rangeGruposTit.merge();
+      rangeGruposTit.setValue(`📋 ESTRATÉGIA POR GRUPO DE PRIORIDADE  |  ${estrategiaUsada.totalCombinacoes} combinações analisadas`);
+      rangeGruposTit.setBackground("#263238").setFontColor("#FFFFFF").setFontWeight("bold")
+        .setHorizontalAlignment("center");
+      linhaAtual++;
+
+      for (const g of estrategiaUsada.estrategiasPorGrupo) {
+        const rangeGrupo = aba.getRange(linhaAtual, 1, 1, cabecalho.length);
+        rangeGrupo.merge();
+        rangeGrupo.setValue(`   Grupo ${g.grupo} (${g.quantidadePedidos} pedido${g.quantidadePedidos !== 1 ? "s" : ""}): ${g.estrategia.nome}`);
+        const corGrupo = g.grupo === 1 ? "#1B5E20" : g.grupo === 2 ? "#0D47A1" : g.grupo === 3 ? "#4A148C" : "#37474F";
+        rangeGrupo.setBackground(corGrupo).setFontColor("#FFFFFF");
+        linhaAtual++;
+      }
+    }
+
+    linhaAtual++;
+  }
 
   for (let i = 0; i < todasLevas.length; i++) {
     const leva = todasLevas[i];
@@ -555,29 +666,37 @@ function salvarResultado(ss, todasLevas, semCadastro, sugestoes, estrategiaUsada
     const nomeEst = estrategiaUsada ? estrategiaUsada.nome : "✅ Mais Rápido Primeiro";
     const nomeLeva = `✅ DISTRIBUIÇÃO OTIMIZADA — Estratégia: ${nomeEst}`;
 
-    // Título da leva
-    if (i > 0) linhaAtual += 2; // espaço entre levas
+    if (i > 0) linhaAtual += 2;
     const rangeTit = aba.getRange(linhaAtual, 1, 1, cabecalho.length);
     rangeTit.merge();
     rangeTit.setValue(nomeLeva);
     rangeTit.setBackground(corTit).setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
     linhaAtual++;
 
-    // Cabeçalho
     aba.getRange(linhaAtual, 1, 1, cabecalho.length).setValues([cabecalho]);
     aba.getRange(linhaAtual, 1, 1, cabecalho.length)
       .setBackground(corCab).setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
     linhaAtual++;
 
-    // Dados
-    const linhas = leva.map(r => [r.referencia, r.cor || "-", r.nomeModelo, r.aba, r.maquinasAlocadas,
-      r.tempoProducao, r.inicio, r.termino]);
-    aba.getRange(linhaAtual, 1, linhas.length, cabecalho.length).setValues(linhas);
+    const linhas = leva.map(r => usaPrioridade
+      ? [r.prioridade || 1, r.referencia, r.cor || "-", r.nomeModelo, r.aba, r.maquinasAlocadas, r.tempoProducao, r.inicio, r.termino]
+      : [r.referencia, r.cor || "-", r.nomeModelo, r.aba, r.maquinasAlocadas, r.tempoProducao, r.inicio, r.termino]
+    );
 
-    // Linhas alternadas
-    for (let j = 0; j < linhas.length; j++) {
-      if (j % 2 === 0) {
-        aba.getRange(linhaAtual + j, 1, 1, cabecalho.length).setBackground(corFundo);
+    if (linhas.length > 0) {
+      aba.getRange(linhaAtual, 1, linhas.length, cabecalho.length).setValues(linhas);
+
+      // Coloração alternada, com destaque por grupo de prioridade
+      for (let j = 0; j < linhas.length; j++) {
+        let corLinha;
+        if (usaPrioridade) {
+          const pri = leva[j].prioridade || 1;
+          const coresPri = ["#E8F5E9", "#E3F2FD", "#F3E5F5", "#ECEFF1", "#FBE9E7", "#E0F7FA"];
+          corLinha = coresPri[Math.min(pri - 1, coresPri.length - 1)];
+        } else {
+          corLinha = j % 2 === 0 ? corFundo : null;
+        }
+        if (corLinha) aba.getRange(linhaAtual + j, 1, 1, cabecalho.length).setBackground(corLinha);
       }
     }
 
@@ -593,13 +712,18 @@ function salvarResultado(ss, todasLevas, semCadastro, sugestoes, estrategiaUsada
     rangeSC.setBackground("#E65100").setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
     linhaAtual++;
 
-    const cabSC = ["Referência", "Cor", "Máquinas Necessárias"];
+    const cabSC = usaPrioridade
+      ? ["Prioridade", "Referência", "Cor", "Máquinas Necessárias"]
+      : ["Referência", "Cor", "Máquinas Necessárias"];
     aba.getRange(linhaAtual, 1, 1, cabSC.length).setValues([cabSC]);
     aba.getRange(linhaAtual, 1, 1, cabSC.length)
       .setBackground("#BF360C").setFontColor("#FFFFFF").setFontWeight("bold");
     linhaAtual++;
 
-    const linhasSC = semCadastro.map(r => [r.referencia, r.cor || "-", r.maquinasNecessarias]);
+    const linhasSC = semCadastro.map(r => usaPrioridade
+      ? [r.prioridade || 1, r.referencia, r.cor || "-", r.maquinasNecessarias]
+      : [r.referencia, r.cor || "-", r.maquinasNecessarias]
+    );
     aba.getRange(linhaAtual, 1, linhasSC.length, cabSC.length).setValues(linhasSC);
     aba.getRange(linhaAtual, 1, linhasSC.length, cabSC.length).setBackground("#FBE9E7");
     linhaAtual += linhasSC.length;
@@ -646,32 +770,38 @@ function salvarResultado(ss, todasLevas, semCadastro, sugestoes, estrategiaUsada
 // ── RESUMO ─────────────────────────────────────────────────
 function gerarResumo(todasLevas, semCadastro, melhor, ranking) {
   const leva = todasLevas[0] || [];
-  const refs = new Set(leva.map(r => r.referencia));
   const maiorTermino = melhor ? melhor.terminoHoras : leva.reduce((max, r) => Math.max(max, r.termino || 0), 0);
   const dias = (maiorTermino / CONFIG.HORAS_POR_DIA).toFixed(1);
 
   let texto = `🏆 Estratégia escolhida: ${melhor ? melhor.nome : "Mais Rápido Primeiro"}\n`;
-  texto += `   Término total: ${maiorTermino}h (~${dias} dias)\n\n`;
+  texto += `   Término total: ${maiorTermino}h (~${dias} dias)\n`;
+
+  // Detalhamento por grupo de prioridade
+  if (melhor && melhor.usaPrioridade && melhor.estrategiasPorGrupo) {
+    texto += `\n📋 Estratégia por grupo de prioridade:\n`;
+    for (const g of melhor.estrategiasPorGrupo) {
+      texto += `   Grupo ${g.grupo} (${g.quantidadePedidos} pedidos): ${g.estrategia.nome}\n`;
+    }
+    texto += `   (${melhor.totalCombinacoes} combinações analisadas)\n`;
+  }
 
   // Mostra top 3 do ranking
   if (ranking && ranking.length > 0) {
-    texto += `📊 Ranking das estratégias:\n`;
+    texto += `\n📊 Ranking individual das estratégias:\n`;
     ranking.slice(0, 3).forEach((est, i) => {
       const diff = i === 0 ? "✅ melhor" : `+${arredondar(est.terminoTotal - ranking[0].terminoTotal)}h`;
       texto += `   ${i + 1}º ${est.nome.replace(/^[^—]+— /, "").substring(0, 30)}: ${est.terminoHoras}h (${diff})\n`;
     });
-    texto += `\n`;
   }
 
   if (semCadastro.length > 0) {
     const refsSC = new Set(semCadastro.map(r => r.referencia));
-    texto += `💡 Sem cadastro em máquinas: ${refsSC.size} referência(s)\n`;
+    texto += `\n💡 Sem cadastro em máquinas: ${refsSC.size} referência(s)\n`;
   }
 
   texto += `\nVerifique as abas DISTRIBUIÇÃO e COMPARATIVO.`;
   return texto;
 }
-
 
 
 // ══════════════════════════════════════════════════════════
@@ -719,13 +849,13 @@ function simularTermino(pedidosOrdenados, modelos) {
 
 
 // Salva comparativo na aba COMPARATIVO
-function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
+function salvarComparativo(ss, melhor, ranking, pedidosCount, modelosCount) {
   const NOME_ABA = "COMPARATIVO";
   const abaExistente = ss.getSheetByName(NOME_ABA);
   if (abaExistente) ss.deleteSheet(abaExistente);
   const aba = ss.insertSheet(NOME_ABA);
 
-  const melhor = ranking[0];
+  const melhorRanking = ranking[0];
   const cab = ["Posição", "Estratégia", "Descrição", "Término Total (h)", "Diferença vs Melhor (h)", "Variação %"];
   let linha = 1;
 
@@ -737,21 +867,54 @@ function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
     .setFontWeight("bold").setFontSize(13).setHorizontalAlignment("center");
   linha++;
 
-  // ── Sub-título com estratégia vencedora e decisão
-  const corSub = melhor.id === "balanceamento" ? "#1B5E20" : "#E65100";
+  // ── Resultado da combinação otimizada (sempre exibe o que foi escolhido)
+  const corBanner = melhor.id === "balanceamento" ? "#1B5E20" : "#E65100";
   const rangeSub = aba.getRange(linha, 1, 1, cab.length);
   rangeSub.merge();
-  rangeSub.setValue(`🏆 Estratégia escolhida: ${melhor.nome}  —  Término total: ${melhor.terminoHoras}h`);
-  rangeSub.setBackground(corSub).setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
+  rangeSub.setValue(`🏆 Escolhido: ${melhor.nome}  —  Término total: ${melhor.terminoHoras}h`);
+  rangeSub.setBackground(corBanner).setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
   linha++;
 
   const rangeDecisao = aba.getRange(linha, 1, 1, cab.length);
   rangeDecisao.merge();
   rangeDecisao.setValue(`${melhor.decisao || ""}  |  Limiar configurado: ${CONFIG.LIMIAR_TROCA_PERCENT}%`);
   rangeDecisao.setBackground("#E8F5E9").setFontColor("#1B5E20").setFontStyle("italic").setHorizontalAlignment("center");
-  linha += 2;
+  linha++;
 
-  // ── Cabeçalho
+  // ── Detalhamento por grupo de prioridade
+  if (melhor.usaPrioridade && melhor.estrategiasPorGrupo) {
+    const rangeGruposTit = aba.getRange(linha, 1, 1, cab.length);
+    rangeGruposTit.merge();
+    rangeGruposTit.setValue(`📋 COMBINAÇÃO VENCEDORA POR GRUPO DE PRIORIDADE  |  ${melhor.totalCombinacoes} combinações analisadas`);
+    rangeGruposTit.setBackground("#263238").setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
+    linha++;
+
+    const cabGrupos = ["Grupo", "Nº Pedidos", "Estratégia Escolhida", "Descrição", "", ""];
+    aba.getRange(linha, 1, 1, cab.length).setValues([cabGrupos]);
+    aba.getRange(linha, 1, 1, cab.length)
+      .setBackground("#37474F").setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
+    linha++;
+
+    for (const g of melhor.estrategiasPorGrupo) {
+      aba.getRange(linha, 1, 1, cab.length).setValues([[
+        `Grupo ${g.grupo}`, g.quantidadePedidos, g.estrategia.nome, g.estrategia.descricao, "", ""
+      ]]);
+      const coresGrupo = ["#E8F5E9", "#E3F2FD", "#F3E5F5", "#ECEFF1", "#FBE9E7"];
+      aba.getRange(linha, 1, 1, cab.length)
+        .setBackground(coresGrupo[Math.min(g.grupo - 1, coresGrupo.length - 1)]);
+      linha++;
+    }
+
+    linha++;
+  }
+
+  // ── Cabeçalho do ranking individual
+  const rangeCabRanking = aba.getRange(linha, 1, 1, cab.length);
+  rangeCabRanking.merge();
+  rangeCabRanking.setValue("📊 RANKING INDIVIDUAL DAS 6 ESTRATÉGIAS (referência comparativa — sem restrição de prioridade)");
+  rangeCabRanking.setBackground("#455A64").setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
+  linha++;
+
   aba.getRange(linha, 1, 1, cab.length).setValues([cab]);
   aba.getRange(linha, 1, 1, cab.length)
     .setBackground("#263238").setFontColor("#FFFFFF").setFontWeight("bold").setHorizontalAlignment("center");
@@ -761,9 +924,9 @@ function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
   for (let i = 0; i < ranking.length; i++) {
     const est = ranking[i];
     const isMelhor = i === 0;
-    const diffVsMelhor = arredondar(est.terminoTotal - melhor.terminoTotal);
-    const percVsMelhor = melhor.terminoTotal > 0
-      ? arredondar(((est.terminoTotal - melhor.terminoTotal) / melhor.terminoTotal) * 100)
+    const diffVsMelhor = arredondar(est.terminoTotal - melhorRanking.terminoTotal);
+    const percVsMelhor = melhorRanking.terminoTotal > 0
+      ? arredondar(((est.terminoTotal - melhorRanking.terminoTotal) / melhorRanking.terminoTotal) * 100)
       : 0;
 
     const diffStr = isMelhor ? "—" : (diffVsMelhor >= 0 ? `+${diffVsMelhor}h` : `${diffVsMelhor}h`);
@@ -774,7 +937,6 @@ function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
       posStr, est.nome, est.descricao, est.terminoHoras + "h", diffStr, percStr
     ]]);
 
-    // Cor: verde escuro = melhor, verde claro = mais rápido que ref, vermelho = mais lento
     let corFundo;
     if (isMelhor) corFundo = "#1B5E20";
     else if (percVsMelhor < 0) corFundo = "#C8E6C9";
@@ -793,7 +955,10 @@ function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
   rangeRodape.setValue(
     `ℹ️  A variação % compara cada estratégia contra o Balanceamento por Modelo (referência operacional). ` +
     `Outra estratégia só substitui o Balanceamento se superar o limiar de ${CONFIG.LIMIAR_TROCA_PERCENT}% de vantagem — ` +
-    `abaixo disso, os custos operacionais reais (setup, deslocamento, fadiga) consomem o ganho teórico.`
+    `abaixo disso, os custos operacionais reais (setup, deslocamento, fadiga) consomem o ganho teórico.` +
+    (melhor.usaPrioridade
+      ? ` | Com grupos de prioridade, o sistema testou ${melhor.totalCombinacoes} combinações de estratégias para encontrar a melhor sequência global.`
+      : "")
   );
   rangeRodape.setBackground("#E3F2FD").setFontColor("#0D47A1")
     .setFontStyle("italic").setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
@@ -809,9 +974,8 @@ function salvarComparativo(ss, ranking, pedidosCount, modelosCount) {
 
 function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numModelos) {
   let linha = linhaInicio;
-  const numCombinacoes = fatorial_aprox(numPedidos); // N! combinações possíveis
+  const numCombinacoes = fatorial_aprox(numPedidos);
 
-  // ── Título da seção
   const rangeTit = aba.getRange(linha, 1, 1, numCols);
   rangeTit.merge();
   rangeTit.setValue("🔬 ANÁLISE CIENTÍFICA — Algoritmo vs Planejador Humano");
@@ -819,7 +983,6 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
     .setFontWeight("bold").setFontSize(12).setHorizontalAlignment("center");
   linha++;
 
-  // ── DESTAQUE PRINCIPAL — eficiência geral
   const eficienciaGeral = calcEficienciaGeral(numPedidos, numModelos);
   const rangeDest = aba.getRange(linha, 1, 2, numCols);
   rangeDest.merge();
@@ -831,7 +994,6 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
   aba.setRowHeight(linha + 1, 60);
   linha += 2;
 
-  // ── Sub-linha explicando o número
   const rangeSub2 = aba.getRange(linha, 1, 1, numCols);
   rangeSub2.merge();
   rangeSub2.setValue(
@@ -845,7 +1007,6 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
   aba.setRowHeight(linha, 50);
   linha += 2;
 
-  // ── Dados do problema atual
   const rangeProb = aba.getRange(linha, 1, 1, numCols);
   rangeProb.merge();
   rangeProb.setValue(
@@ -856,7 +1017,6 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
     .setFontWeight("bold").setHorizontalAlignment("center");
   linha += 2;
 
-  // ── Cabeçalho da tabela científica
   const cabCiencia = ["Dimensão", "Humano", "Algoritmo", "Vantagem do Algoritmo", "Fonte Científica"];
   aba.getRange(linha, 1, 1, cabCiencia.length).setValues([cabCiencia]);
   aba.getRange(linha, 1, 1, cabCiencia.length)
@@ -864,7 +1024,6 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
     .setFontWeight("bold").setHorizontalAlignment("center");
   linha++;
 
-  // ── Dados científicos baseados na literatura
   const dados = [
     [
       "Velocidade de análise",
@@ -911,8 +1070,8 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
     [
       "Comparativo de estratégias",
       "1 estratégia por vez",
-      "6 estratégias simultâneas",
-      "6× mais cenários avaliados",
+      "6 estratégias × combinações por grupo",
+      "Todas as combinações avaliadas",
       "SCW.AI Scheduling Optimization (2025)"
     ],
     [
@@ -928,12 +1087,10 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
     aba.getRange(linha, 1, 1, cabCiencia.length).setValues([dados[i]]);
     const corFundo = i % 2 === 0 ? "#F3E5F5" : "#EDE7F6";
     aba.getRange(linha, 1, 1, cabCiencia.length).setBackground(corFundo);
-    // Destaca a coluna de vantagem em verde
     aba.getRange(linha, 4, 1, 1).setBackground("#C8E6C9").setFontColor("#1B5E20").setFontWeight("bold");
     linha++;
   }
 
-  // ── Nota metodológica
   linha += 2;
   const rangeNota = aba.getRange(linha, 1, 1, numCols);
   rangeNota.merge();
@@ -953,36 +1110,22 @@ function adicionarSecaoCientifica(aba, linhaInicio, numCols, numPedidos, numMode
 
 
 function calcEficienciaGeral(numPedidos, numModelos) {
-  // Eficiência baseada em 3 fatores combinados com pesos científicos:
-  // 1) Cobertura combinatória: quantas combinações o algoritmo avalia vs humano (peso 50%)
-  // 2) Ganho de makespan documentado em literatura: 23-40% (peso 30%)
-  // 3) Consistência e velocidade: eliminação de erro humano (peso 20%)
-
-  // Fator 1: cobertura combinatória (Miller 1956 — humano avalia 7±2 opções)
   const limiteHumano = 7;
-  const totalCombinacoes = fatorial_num(Math.min(numPedidos, 20)); // cap em 20! para não overflow
+  const totalCombinacoes = fatorial_num(Math.min(numPedidos, 20));
   const cobertura = Math.min(99.99, ((totalCombinacoes - limiteHumano) / totalCombinacoes) * 100);
-
-  // Fator 2: ganho de makespan médio documentado (30%)
-  const ganhoMakespan = 31.5; // média entre 23% e 40% da literatura
-
-  // Fator 3: consistência (sempre 100% determinístico vs humano variável)
+  const ganhoMakespan = 31.5;
   const consistencia = 95;
-
-  // Média ponderada
   const eficiencia = (cobertura * 0.5) + (ganhoMakespan * 0.3) + (consistencia * 0.2);
   return Math.min(99, Math.round(eficiencia));
 }
 
 
 function fatorial_aprox(n) {
-  // Retorna representação legível de N!
   if (n <= 10) {
     let f = 1;
     for (let i = 2; i <= n; i++) f *= i;
     return f.toLocaleString();
   }
-  // Stirling approximation para N grandes
   const log10 = (n * Math.log10(n / Math.E) + 0.5 * Math.log10(2 * Math.PI * n));
   const exp = Math.floor(log10);
   return `~10^${exp}`;
@@ -990,7 +1133,6 @@ function fatorial_aprox(n) {
 
 
 function calcVantagem(n) {
-  // Quantas combinações o algoritmo avalia vs humano (limite ~7)
   if (n <= 7) return Math.round(fatorial_num(n) / 7);
   const log10 = (n * Math.log10(n / Math.E) + 0.5 * Math.log10(2 * Math.PI * n));
   return `10^${Math.floor(log10 - 1)}`;
