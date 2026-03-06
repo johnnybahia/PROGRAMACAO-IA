@@ -345,8 +345,10 @@ function getEstrategias() {
       descricao: "100 simulações aleatórias — referência estatística, resultado varia a cada execução",
       destaque: false,
       ordenar: (pedidos, modelos) => {
+        // Adapta iterações ao tamanho do grupo para evitar timeout em datasets grandes
+        const iteracoes = pedidos.length > 500 ? 20 : pedidos.length > 200 ? 50 : 100;
         let melhorOrdem = null, melhorTempo = Infinity;
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < iteracoes; i++) {
           const embaralhado = [...pedidos].sort(() => Math.random() - 0.5);
           const t = simularTermino(embaralhado, modelos);
           if (t < melhorTempo) { melhorTempo = t; melhorOrdem = embaralhado; }
@@ -488,12 +490,16 @@ function otimizarDistribuicao(pedidosOrdenados, modelos) {
     let slotsRestantes = maquinasNecessarias;
 
     while (slotsRestantes > 0) {
-      maquinasFisicas.sort((a, b) =>
-        (filas[a.aba][a.idxMaquina] + a.tempoProducao) -
-        (filas[b.aba][b.idxMaquina] + b.tempoProducao)
-      );
+      // Busca linear pelo mínimo — O(n) em vez de sort O(n log n)
+      let minIdx = 0;
+      let minVal = filas[maquinasFisicas[0].aba][maquinasFisicas[0].idxMaquina] + maquinasFisicas[0].tempoProducao;
+      for (let k = 1; k < maquinasFisicas.length; k++) {
+        const mk = maquinasFisicas[k];
+        const val = filas[mk.aba][mk.idxMaquina] + mk.tempoProducao;
+        if (val < minVal) { minVal = val; minIdx = k; }
+      }
 
-      const m = maquinasFisicas[0];
+      const m = maquinasFisicas[minIdx];
       const inicio = filas[m.aba][m.idxMaquina];
       const termino = inicio + m.tempoProducao;
       filas[m.aba][m.idxMaquina] = termino;
@@ -833,10 +839,15 @@ function simularTermino(pedidosOrdenados, modelos) {
 
     let slots = maquinasNecessarias;
     while (slots > 0) {
-      maquinasFisicas.sort((a, b) =>
-        (filas[a.aba][a.idx] + a.tempo) - (filas[b.aba][b.idx] + b.tempo)
-      );
-      const m = maquinasFisicas[0];
+      // Busca linear pelo mínimo — O(n) em vez de sort O(n log n)
+      let minIdx = 0;
+      let minVal = filas[maquinasFisicas[0].aba][maquinasFisicas[0].idx] + maquinasFisicas[0].tempo;
+      for (let k = 1; k < maquinasFisicas.length; k++) {
+        const mk = maquinasFisicas[k];
+        const val = filas[mk.aba][mk.idx] + mk.tempo;
+        if (val < minVal) { minVal = val; minIdx = k; }
+      }
+      const m = maquinasFisicas[minIdx];
       const termino = filas[m.aba][m.idx] + m.tempo;
       filas[m.aba][m.idx] = termino;
       maiorTermino = Math.max(maiorTermino, termino);
