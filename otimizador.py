@@ -148,6 +148,18 @@ class SheetBuilder:
             ws = self.ss.add_worksheet(self.name, rows=5000, cols=self.cols + 5)
         self._ws  = ws
         self._sid = ws.id
+        # Desfaz todos os merges existentes antes de aplicar novos
+        self.formats.append({
+            'unmergeCells': {
+                'range': {
+                    'sheetId':          ws.id,
+                    'startRowIndex':    0,
+                    'endRowIndex':      5000,
+                    'startColumnIndex': 0,
+                    'endColumnIndex':   self.cols + 5,
+                }
+            }
+        })
 
     def write(self, values: list, bg=None, fg='#000000', bold=False,
               italic=False, h_align='LEFT', wrap=False, font_size=11):
