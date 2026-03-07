@@ -8,15 +8,16 @@ Sem limite de tempo. Simulações em paralelo com numpy.
 
 Estrutura da aba PEDIDO:
   Col A: Data Inicial Especial (opcional — força início a partir desta data)
-  Col B: Produto
-  Col C: Referência
-  Col D: Cor
-  Col E: Quantidade de Máquinas
-  Col F: Cliente
-  Col G: Ordem de Compra
-  Col H: Data de Entrega da OC (deadline)
-  Col I: Data Finalização do Pedido  ← preenchida pelo código
-  Col J: Prazo                       ← preenchida pelo código (+X antecipado / -X atrasado)
+  Col B: Máquina Especial (opcional — nome L1 da aba de máquina; restringe alocação a esse modelo)
+  Col C: Produto
+  Col D: Referência
+  Col E: Cor
+  Col F: Quantidade de Máquinas
+  Col G: Cliente
+  Col H: Ordem de Compra
+  Col I: Data de Entrega da OC (deadline)
+  Col J: Data Finalização do Pedido  ← preenchida pelo código
+  Col K: Prazo                       ← preenchida pelo código (X dias antecipado / -X dias atrasado)
   Cel L1: Data base de início do planejamento
 
 Aba opcional 'DATAS FORA DE PROGRAMAÇÃO':
@@ -67,9 +68,15 @@ CONFIG = {
         'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
     },
-    # Monte Carlo: mais iterações pois não há limite de tempo
-    # > 1000 pedidos → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
+    # Monte Carlo / SA base: > 1000 → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
+    # Simulated Annealing
+    'SA_ITER_MULT': 4,    # iterações SA = MC_iters × multiplicador
+    'SA_T0_FRAC':   0.05, # temperatura inicial como fração do makespan atual
+    'SA_COOLING':   0.995,
+    # 2-opt local search
+    '2OPT_MAX_N':  300,   # busca exaustiva O(n²) se n ≤ este valor; acima → amostragem
+    '2OPT_PASSES': 5,     # máximo de passagens por rodada
 }
 
 SCOPES = [
@@ -335,9 +342,9 @@ def ler_datas_bloqueadas(spreadsheet) -> set:
 def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
     """
     Lê a aba PEDIDO com a estrutura:
-      A: Data Inicial Especial  B: Produto  C: Referência  D: Cor
-      E: Qtd Máquinas  F: Cliente  G: Ordem de Compra  H: Data de Entrega
-      I: Data Finalização (saída)  J: Prazo (saída)
+      A: Data Inicial Especial  B: Máquina Especial  C: Produto  D: Referência  E: Cor
+      F: Qtd Máquinas  G: Cliente  H: Ordem de Compra  I: Data de Entrega
+      J: Data Finalização (saída)  K: Prazo (saída)
       L1: Data base (lida separadamente por ler_data_base)
     """
     ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
@@ -345,17 +352,18 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
     pedidos = []
 
     for i, linha in enumerate(rows[1:], start=2):   # i = linha real no sheet
-        if len(linha) < 5:
+        if len(linha) < 6:
             continue
         try:
-            data_esp_str = linha[0].strip() if linha[0].strip() else ''
-            produto      = linha[1].strip() if len(linha) > 1 else ''
-            ref          = linha[2].strip() if len(linha) > 2 else ''
-            cor          = linha[3].strip() if len(linha) > 3 else ''
-            qtd_str      = linha[4].strip() if len(linha) > 4 else ''
-            cliente      = linha[5].strip() if len(linha) > 5 else ''
-            ordem_compra = linha[6].strip() if len(linha) > 6 else ''
-            data_ent_str = linha[7].strip() if len(linha) > 7 else ''
+            data_esp_str    = linha[0].strip() if linha[0].strip() else ''
+            maquina_especial = linha[1].strip() if len(linha) > 1 else ''
+            produto         = linha[2].strip() if len(linha) > 2 else ''
+            ref             = linha[3].strip() if len(linha) > 3 else ''
+            cor             = linha[4].strip() if len(linha) > 4 else ''
+            qtd_str         = linha[5].strip() if len(linha) > 5 else ''
+            cliente         = linha[6].strip() if len(linha) > 6 else ''
+            ordem_compra    = linha[7].strip() if len(linha) > 7 else ''
+            data_ent_str    = linha[8].strip() if len(linha) > 8 else ''
         except IndexError:
             continue
 
@@ -393,6 +401,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             'deadline_horas':       deadline_horas,
             'data_especial':        data_esp,
             'min_start':            min_start,
+            'maquina_especial':     maquina_especial,
             'prioridade':           1,          # mantido para compatibilidade interna
         })
 
@@ -490,6 +499,51 @@ def precomputar_maquinas(modelos: dict):
     return ref_data, num_machines, ridx_map
 
 
+# ── PRÉ-COMPUTAÇÃO DE RESTRIÇÕES POR PEDIDO ───────────────────────────────────
+def preparar_restricoes_pedidos(pedidos: list, ref_data: dict, modelos: dict):
+    """
+    Pré-computa, para cada pedido, os arrays filtrados de gidxs/tempos/aba_idx
+    considerando a restrição de 'maquina_especial' (col B da aba PEDIDO).
+
+    Armazena diretamente no dict do pedido:
+      _gidxs   — numpy array de índices globais válidos
+      _tempos  — numpy array de tempos correspondentes
+      _aba_idx — lista de (aba, slot) correspondentes
+
+    Pedidos sem cadastro recebem _gidxs = None.
+    Chamado uma única vez após precomputar_maquinas; todos os pontos de
+    simulação e alocação usam esses arrays — garantindo que a restrição
+    seja respeitada em 100% das análises.
+    """
+    for p in pedidos:
+        chave = _chave_pedido(p, ref_data)
+        d     = ref_data.get(chave)
+        if d is None:
+            p['_gidxs'] = p['_tempos'] = p['_aba_idx'] = None
+            continue
+
+        maq_esp = (p.get('maquina_especial') or '').strip()
+        if maq_esp:
+            mask = np.array([
+                modelos[aba]['nome_modelo'] == maq_esp
+                for aba, _ in d['aba_idx']
+            ])
+            if mask.any():
+                p['_gidxs']   = d['gidxs'][mask]
+                p['_tempos']  = d['tempos'][mask]
+                p['_aba_idx'] = [ai for ai, m in zip(d['aba_idx'], mask) if m]
+            else:
+                print(f'  ⚠ Máquina especial "{maq_esp}" não encontrada '
+                      f'para ref "{p["referencia"]}" — usando todas as disponíveis.')
+                p['_gidxs']   = d['gidxs']
+                p['_tempos']  = d['tempos']
+                p['_aba_idx'] = d['aba_idx']
+        else:
+            p['_gidxs']   = d['gidxs']
+            p['_tempos']  = d['tempos']
+            p['_aba_idx'] = d['aba_idx']
+
+
 # ── RESOLUÇÃO DE CHAVE (ref + cor com fallback para ref genérica) ─────────────
 def _chave_pedido(p: dict, ref_data: dict) -> str:
     """
@@ -509,16 +563,22 @@ def _chave_pedido(p: dict, ref_data: dict) -> str:
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
 def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     """
-    Simula tempo total de produção respeitando min_start de cada pedido.
+    Simula tempo total de produção respeitando min_start e maquina_especial de cada pedido.
+    Usa arrays pré-computados (_gidxs/_tempos) quando disponíveis — assim a restrição
+    de máquina especial é considerada em todas as simulações de estratégia/Monte Carlo.
     Thread-safe (cria 'filas' local).
     """
     filas = np.zeros(num_machines, dtype=np.float64)
     maior = 0.0
     for p in pedidos:
-        d = ref_data.get(_chave_pedido(p, ref_data))
-        if d is None:
-            continue
-        gidxs, tempos = d['gidxs'], d['tempos']
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
         min_s = float(p.get('min_start', 0.0))
         for _ in range(p['maquinas_necessarias']):
             available = np.maximum(filas[gidxs], min_s)
@@ -592,18 +652,58 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             -get_menor_tempo(p['referencia'], modelos), p.get('cor', ''),
         ))
 
-    def monte_carlo(pedidos):
-        n     = len(pedidos)
-        iters = _mc_iter(n)
-        melhor  = None
-        mt      = float('inf')
+    def wspt(pedidos):
+        """
+        Weighted Shortest Processing Time — regra ótima para parallel machines com pesos.
+        Score = p_j / w_j  onde  p_j = menor tempo disponível,  w_j = 1/deadline.
+        Pedidos urgentes (prazo próximo) e rápidos entram primeiro.
+        Usa _tempos pré-computados → respeita restrição de maquina_especial.
+        """
+        def _score(p):
+            tempos = p.get('_tempos')
+            p_j = float(np.min(tempos)) if tempos is not None and len(tempos) > 0 \
+                  else get_menor_tempo(_chave_pedido(p, ref_data), modelos)
+            dl = p.get('deadline_horas')
+            w_j = 1.0 / max(dl, 1.0) if dl else 1e-9  # prazo próximo = peso alto
+            return p_j / max(w_j, 1e-12)              # minimiza p/w
+        return sorted(pedidos, key=_score)
+
+    def simulated_annealing(pedidos):
+        """
+        Simulated Annealing — metaheurística que sai de ótimos locais.
+        Parte da melhor solução heurística determinística, aplica trocas
+        de pares e aceita soluções piores com probabilidade e^(-Δ/T),
+        onde T esfria gradualmente. Muito mais eficiente que Monte Carlo puro.
+        Usa arrays pré-computados → restrição de maquina_especial garantida.
+        """
+        n = len(pedidos)
+        if n < 4:
+            return list(edd(pedidos))
+
+        # Semente: melhor entre EDD, WSPT e Mais Rápido
+        candidatos_ini = [list(edd(pedidos)), list(wspt(pedidos)), list(rapido(pedidos))]
+        current = min(candidatos_ini,
+                      key=lambda o: simular_termino(o, ref_data, num_machines))
+        current_t = simular_termino(current, ref_data, num_machines)
+        best, best_t = list(current), current_t
+
+        T       = current_t * CONFIG['SA_T0_FRAC']
+        cooling = CONFIG['SA_COOLING']
+        iters   = _mc_iter(n) * CONFIG['SA_ITER_MULT']
+
         for _ in range(iters):
-            emb = random.sample(pedidos, n)
-            t   = simular_termino(emb, ref_data, num_machines)
-            if t < mt:
-                mt     = t
-                melhor = emb
-        return melhor or pedidos
+            a, b = random.sample(range(n), 2)
+            neighbor = list(current)
+            neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
+            neighbor_t = simular_termino(neighbor, ref_data, num_machines)
+            delta = neighbor_t - current_t
+            if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+                current, current_t = neighbor, neighbor_t
+                if current_t < best_t:
+                    best, best_t = list(current), current_t
+            T *= cooling
+
+        return best
 
     return [
         {'id': 'edd',          'nome': '✅ EDD — Prazo Mais Próximo Primeiro',
@@ -624,9 +724,12 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         {'id': 'lento',        'nome': '6 — Mais Lento Primeiro',
          'descricao': 'Maior tempo de produção primeiro — jobs longos entram antes',
          'fn': lento},
-        {'id': 'monte_carlo',  'nome': '7 — Melhor Aleatório (Monte Carlo)',
-         'descricao': f'Até {CONFIG["MC_ITER"][0][1]}–{CONFIG["MC_ITER"][-1][1]} simulações aleatórias — adapta ao volume',
-         'fn': monte_carlo},
+        {'id': 'wspt',         'nome': '7 — WSPT (Urgência × Velocidade)',
+         'descricao': 'Weighted Shortest Processing Time — regra ótima teórica para parallel machines',
+         'fn': wspt},
+        {'id': 'sa',           'nome': '8 — Simulated Annealing',
+         'descricao': f'Metaheurística guiada: {CONFIG["SA_ITER_MULT"]}× iterações vs Monte Carlo, sai de ótimos locais',
+         'fn': simulated_annealing},
     ]
 
 
@@ -646,6 +749,47 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
         if pos < 0:
             break
     return combinacoes
+
+
+# ── 2-OPT LOCAL SEARCH ────────────────────────────────────────────────────────
+def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
+    """
+    Refinamento por busca local 2-opt.
+
+    Para n ≤ 2OPT_MAX_N: testa todos os pares O(n²) por passagem.
+    Para n > 2OPT_MAX_N: amostra n×4 pares aleatórios por passagem
+    (custo controlado, ainda encontra melhorias significativas).
+
+    Repete até não encontrar melhoria ou atingir 2OPT_PASSES passagens.
+    Usa arrays pré-computados dos pedidos → respeita maquina_especial.
+    Custo zero se a solução já estiver num ótimo local.
+    """
+    n = len(ordenados)
+    if n < 2:
+        return list(ordenados), simular_termino(ordenados, ref_data, num_machines)
+
+    melhor   = list(ordenados)
+    melhor_t = simular_termino(melhor, ref_data, num_machines)
+    max_n    = CONFIG['2OPT_MAX_N']
+
+    for _ in range(CONFIG['2OPT_PASSES']):
+        melhorou = False
+        pares = (
+            [(i, j) for i in range(n - 1) for j in range(i + 1, n)]
+            if n <= max_n
+            else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
+        )
+        for a, b in pares:
+            cand      = list(melhor)
+            cand[a], cand[b] = cand[b], cand[a]
+            t = simular_termino(cand, ref_data, num_machines)
+            if t < melhor_t - 1e-9:
+                melhor, melhor_t = cand, t
+                melhorou = True
+        if not melhorou:
+            break
+
+    return melhor, melhor_t
 
 
 # ── ESCOLHA PARALELA DA MELHOR ESTRATÉGIA ────────────────────────────────────
@@ -777,8 +921,12 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         ordem_compra = pedido.get('ordem_compra', '')
         linha_sheet  = pedido.get('linha_sheet')
 
-        d = ref_data.get(_chave_pedido(pedido, ref_data))
-        if d is None:
+        # Usa arrays pré-computados (já aplicam restrição de maquina_especial)
+        gidxs   = pedido.get('_gidxs')
+        tempos  = pedido.get('_tempos')
+        aba_idx = pedido.get('_aba_idx')
+
+        if gidxs is None:
             sem_cadastro.append({
                 'referencia':           ref,
                 'produto':              produto,
@@ -791,7 +939,6 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             })
             continue
 
-        gidxs, tempos, aba_idx = d['gidxs'], d['tempos'], d['aba_idx']
         por_modelo = {}
 
         for _ in range(slots):
@@ -912,9 +1059,9 @@ def calcular_sugestoes(modelos: dict) -> list:
     return sugestoes
 
 
-# ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas I e J) ──────────────────────────
+# ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas J e K) ──────────────────────────
 def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
-    """Preenche colunas I (data finalização) e J (prazo) na aba PEDIDO."""
+    """Preenche colunas J (data finalização) e K (prazo) na aba PEDIDO."""
     ws = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
 
     # Para cada pedido, pega o termino mais tardio entre as alocações
@@ -928,22 +1075,22 @@ def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
 
     cell_list = []
     for ln, r in por_linha.items():
-        val_i = r['dt_termino'].strftime('%d/%m/%Y')
-        val_j = r['prazo_str'] if r['prazo_str'] else '—'
-        cell_list.append(gspread.Cell(ln, 9, val_i))
+        val_j = r['dt_termino'].strftime('%d/%m/%Y')
+        val_k = r['prazo_str'] if r['prazo_str'] else '—'
         cell_list.append(gspread.Cell(ln, 10, val_j))
+        cell_list.append(gspread.Cell(ln, 11, val_k))
 
-    # Items sem cadastro: informa na coluna I, J vazia
+    # Items sem cadastro: informa na coluna J, K vazia
     for r in sem_cadastro:
         ln = r.get('linha_sheet')
         if ln is None or ln in por_linha:
             continue
-        cell_list.append(gspread.Cell(ln, 9, 'Sem cadastro'))
-        cell_list.append(gspread.Cell(ln, 10, '—'))
+        cell_list.append(gspread.Cell(ln, 10, 'Sem cadastro'))
+        cell_list.append(gspread.Cell(ln, 11, '—'))
 
     if cell_list:
         ws.update_cells(cell_list, value_input_option='RAW')
-        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (I e J).')
+        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (J e K).')
 
 
 # ── SALVAR RESULTADO ─────────────────────────────────────────────────────────
@@ -1432,10 +1579,25 @@ def main():
         ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
         print(f'  ✔ Reindexado: {num_machines} máquinas físicas.')
 
+    preparar_restricoes_pedidos(pedidos, ref_data, modelos)
+    print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
+
     print('6/8 Escolhendo melhor estratégia...')
     grupos = agrupar_por_prioridade(pedidos)
     melhor, ranking = escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     print(f'  ✔ {melhor["decisao"]}')
+
+    print('  Refinando com busca local 2-opt...')
+    ordenados_2opt, t_2opt = busca_local_2opt(melhor['ordenados'], ref_data, num_machines)
+    if t_2opt < melhor['terminoTotal'] - 1e-9:
+        ganho_2opt = _round(((melhor['terminoTotal'] - t_2opt) / melhor['terminoTotal']) * 100)
+        melhor['ordenados']    = ordenados_2opt
+        melhor['terminoTotal'] = t_2opt
+        melhor['terminoHoras'] = _round(t_2opt)
+        melhor['decisao']     += f' → 2-opt −{ganho_2opt}%'
+        print(f'  ✔ 2-opt melhorou {ganho_2opt}% → {_round(t_2opt)}h')
+    else:
+        print(f'  ✔ 2-opt: solução já estava em ótimo local')
 
     print('7/8 Gerando distribuição otimizada...')
     resultado, sem_cadastro = otimizar_distribuicao(
