@@ -18,7 +18,7 @@ Estrutura da aba PEDIDO:
   Col I: Data de Entrega da OC (deadline)
   Col J: Data Finalização do Pedido  ← preenchida pelo código
   Col K: Prazo                       ← preenchida pelo código (X dias antecipado / -X dias atrasado)
-  Cel L1: Data base de início do planejamento
+  Cel M1: Data base de início do planejamento
 
 Aba opcional 'DATAS FORA DE PROGRAMAÇÃO':
   Col A: datas bloqueadas (sem produção) — formato DD/MM/YYYY
@@ -310,13 +310,13 @@ def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -
 
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
 def ler_data_base(spreadsheet) -> date:
-    """Lê a data base de início (célula L1) da aba PEDIDO."""
+    """Lê a data base de início (célula M1) da aba PEDIDO."""
     ws  = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
-    val = ws.acell('L1').value or ''
+    val = ws.acell('M1').value or ''
     d   = parse_data(val)
     if d is None:
         d = date.today()
-        print(f'  ⚠ L1 da aba PEDIDO inválido ou vazio. Usando hoje: {d.strftime("%d/%m/%Y")}')
+        print(f'  ⚠ M1 da aba PEDIDO inválido ou vazio. Usando hoje: {d.strftime("%d/%m/%Y")}')
     return d
 
 
@@ -345,7 +345,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
       A: Data Inicial Especial  B: Máquina Especial  C: Produto  D: Referência  E: Cor
       F: Qtd Máquinas  G: Cliente  H: Ordem de Compra  I: Data de Entrega
       J: Data Finalização (saída)  K: Prazo (saída)
-      L1: Data base (lida separadamente por ler_data_base)
+      M1: Data base (lida separadamente por ler_data_base)
     """
     ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
     rows = ws.get_all_values()
