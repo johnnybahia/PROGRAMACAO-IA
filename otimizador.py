@@ -68,9 +68,15 @@ CONFIG = {
         'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
     },
-    # Monte Carlo: mais iterações pois não há limite de tempo
-    # > 1000 pedidos → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
+    # Monte Carlo / SA base: > 1000 → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
+    # Simulated Annealing
+    'SA_ITER_MULT': 4,    # iterações SA = MC_iters × multiplicador
+    'SA_T0_FRAC':   0.05, # temperatura inicial como fração do makespan atual
+    'SA_COOLING':   0.995,
+    # 2-opt local search
+    '2OPT_MAX_N':  300,   # busca exaustiva O(n²) se n ≤ este valor; acima → amostragem
+    '2OPT_PASSES': 5,     # máximo de passagens por rodada
 }
 
 SCOPES = [
@@ -646,18 +652,58 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             -get_menor_tempo(p['referencia'], modelos), p.get('cor', ''),
         ))
 
-    def monte_carlo(pedidos):
-        n     = len(pedidos)
-        iters = _mc_iter(n)
-        melhor  = None
-        mt      = float('inf')
+    def wspt(pedidos):
+        """
+        Weighted Shortest Processing Time — regra ótima para parallel machines com pesos.
+        Score = p_j / w_j  onde  p_j = menor tempo disponível,  w_j = 1/deadline.
+        Pedidos urgentes (prazo próximo) e rápidos entram primeiro.
+        Usa _tempos pré-computados → respeita restrição de maquina_especial.
+        """
+        def _score(p):
+            tempos = p.get('_tempos')
+            p_j = float(np.min(tempos)) if tempos is not None and len(tempos) > 0 \
+                  else get_menor_tempo(_chave_pedido(p, ref_data), modelos)
+            dl = p.get('deadline_horas')
+            w_j = 1.0 / max(dl, 1.0) if dl else 1e-9  # prazo próximo = peso alto
+            return p_j / max(w_j, 1e-12)              # minimiza p/w
+        return sorted(pedidos, key=_score)
+
+    def simulated_annealing(pedidos):
+        """
+        Simulated Annealing — metaheurística que sai de ótimos locais.
+        Parte da melhor solução heurística determinística, aplica trocas
+        de pares e aceita soluções piores com probabilidade e^(-Δ/T),
+        onde T esfria gradualmente. Muito mais eficiente que Monte Carlo puro.
+        Usa arrays pré-computados → restrição de maquina_especial garantida.
+        """
+        n = len(pedidos)
+        if n < 4:
+            return list(edd(pedidos))
+
+        # Semente: melhor entre EDD, WSPT e Mais Rápido
+        candidatos_ini = [list(edd(pedidos)), list(wspt(pedidos)), list(rapido(pedidos))]
+        current = min(candidatos_ini,
+                      key=lambda o: simular_termino(o, ref_data, num_machines))
+        current_t = simular_termino(current, ref_data, num_machines)
+        best, best_t = list(current), current_t
+
+        T       = current_t * CONFIG['SA_T0_FRAC']
+        cooling = CONFIG['SA_COOLING']
+        iters   = _mc_iter(n) * CONFIG['SA_ITER_MULT']
+
         for _ in range(iters):
-            emb = random.sample(pedidos, n)
-            t   = simular_termino(emb, ref_data, num_machines)
-            if t < mt:
-                mt     = t
-                melhor = emb
-        return melhor or pedidos
+            a, b = random.sample(range(n), 2)
+            neighbor = list(current)
+            neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
+            neighbor_t = simular_termino(neighbor, ref_data, num_machines)
+            delta = neighbor_t - current_t
+            if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+                current, current_t = neighbor, neighbor_t
+                if current_t < best_t:
+                    best, best_t = list(current), current_t
+            T *= cooling
+
+        return best
 
     return [
         {'id': 'edd',          'nome': '✅ EDD — Prazo Mais Próximo Primeiro',
@@ -678,9 +724,12 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         {'id': 'lento',        'nome': '6 — Mais Lento Primeiro',
          'descricao': 'Maior tempo de produção primeiro — jobs longos entram antes',
          'fn': lento},
-        {'id': 'monte_carlo',  'nome': '7 — Melhor Aleatório (Monte Carlo)',
-         'descricao': f'Até {CONFIG["MC_ITER"][0][1]}–{CONFIG["MC_ITER"][-1][1]} simulações aleatórias — adapta ao volume',
-         'fn': monte_carlo},
+        {'id': 'wspt',         'nome': '7 — WSPT (Urgência × Velocidade)',
+         'descricao': 'Weighted Shortest Processing Time — regra ótima teórica para parallel machines',
+         'fn': wspt},
+        {'id': 'sa',           'nome': '8 — Simulated Annealing',
+         'descricao': f'Metaheurística guiada: {CONFIG["SA_ITER_MULT"]}× iterações vs Monte Carlo, sai de ótimos locais',
+         'fn': simulated_annealing},
     ]
 
 
@@ -700,6 +749,47 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
         if pos < 0:
             break
     return combinacoes
+
+
+# ── 2-OPT LOCAL SEARCH ────────────────────────────────────────────────────────
+def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
+    """
+    Refinamento por busca local 2-opt.
+
+    Para n ≤ 2OPT_MAX_N: testa todos os pares O(n²) por passagem.
+    Para n > 2OPT_MAX_N: amostra n×4 pares aleatórios por passagem
+    (custo controlado, ainda encontra melhorias significativas).
+
+    Repete até não encontrar melhoria ou atingir 2OPT_PASSES passagens.
+    Usa arrays pré-computados dos pedidos → respeita maquina_especial.
+    Custo zero se a solução já estiver num ótimo local.
+    """
+    n = len(ordenados)
+    if n < 2:
+        return list(ordenados), simular_termino(ordenados, ref_data, num_machines)
+
+    melhor   = list(ordenados)
+    melhor_t = simular_termino(melhor, ref_data, num_machines)
+    max_n    = CONFIG['2OPT_MAX_N']
+
+    for _ in range(CONFIG['2OPT_PASSES']):
+        melhorou = False
+        pares = (
+            [(i, j) for i in range(n - 1) for j in range(i + 1, n)]
+            if n <= max_n
+            else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
+        )
+        for a, b in pares:
+            cand      = list(melhor)
+            cand[a], cand[b] = cand[b], cand[a]
+            t = simular_termino(cand, ref_data, num_machines)
+            if t < melhor_t - 1e-9:
+                melhor, melhor_t = cand, t
+                melhorou = True
+        if not melhorou:
+            break
+
+    return melhor, melhor_t
 
 
 # ── ESCOLHA PARALELA DA MELHOR ESTRATÉGIA ────────────────────────────────────
@@ -1496,6 +1586,18 @@ def main():
     grupos = agrupar_por_prioridade(pedidos)
     melhor, ranking = escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     print(f'  ✔ {melhor["decisao"]}')
+
+    print('  Refinando com busca local 2-opt...')
+    ordenados_2opt, t_2opt = busca_local_2opt(melhor['ordenados'], ref_data, num_machines)
+    if t_2opt < melhor['terminoTotal'] - 1e-9:
+        ganho_2opt = _round(((melhor['terminoTotal'] - t_2opt) / melhor['terminoTotal']) * 100)
+        melhor['ordenados']    = ordenados_2opt
+        melhor['terminoTotal'] = t_2opt
+        melhor['terminoHoras'] = _round(t_2opt)
+        melhor['decisao']     += f' → 2-opt −{ganho_2opt}%'
+        print(f'  ✔ 2-opt melhorou {ganho_2opt}% → {_round(t_2opt)}h')
+    else:
+        print(f'  ✔ 2-opt: solução já estava em ótimo local')
 
     print('7/8 Gerando distribuição otimizada...')
     resultado, sem_cadastro = otimizar_distribuicao(
