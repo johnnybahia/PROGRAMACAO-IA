@@ -428,13 +428,15 @@ def ler_modelos(spreadsheet) -> dict:
             nome_modelo = l1.strip() or nome
 
             referencias = {}
+            descricoes  = {}
             rows = ws.get_all_values()
             for linha in rows[1:]:
                 if len(linha) < 7:
                     continue
-                ref       = ' '.join(linha[6].split())    # Coluna G = REFERENCIA
+                descricao = ' '.join(linha[0].split())        # Coluna A = descrição completa
+                ref       = ' '.join(linha[6].split())        # Coluna G = REFERENCIA
                 cor_maq   = ' '.join(linha[5].split()) if len(linha) > 5 else ''  # Coluna F = COR
-                tempo_str = linha[1].strip()    # Coluna B
+                tempo_str = linha[1].strip()                  # Coluna B
                 if not ref:
                     continue
                 try:
@@ -445,6 +447,8 @@ def ler_modelos(spreadsheet) -> dict:
                     continue
                 chave = f"{ref} {cor_maq}" if cor_maq else ref
                 referencias[chave] = tempo
+                if descricao:
+                    descricoes[chave] = descricao
 
             if not referencias:
                 continue
@@ -453,6 +457,7 @@ def ler_modelos(spreadsheet) -> dict:
                 'nome_modelo':    nome_modelo,
                 'total_maquinas': total_maq,
                 'referencias':    referencias,
+                'descricoes':     descricoes,
             }
             print(f'  ✔ "{nome}": {total_maq} máquinas, {len(referencias)} referências')
         except Exception as e:
@@ -1431,10 +1436,18 @@ def _detectar_lacunas(pedidos: list, modelos: dict) -> list:
         if tempo <= 0:
             continue
 
+        # Busca a descrição completa (coluna A) em qualquer máquina que já tenha o combined
+        descricao = ''
+        for a in com_combined:
+            descricao = modelos[a].get('descricoes', {}).get(combined, '')
+            if descricao:
+                break
+
         sugestoes.append({
             'ref':               ref,
             'cor':               cor,
             'combined':          combined,
+            'descricao':         descricao,
             'maquinas_faltando': faltando,
             'maquinas_com_cor':  com_combined,
             'tempo_sugerido':    tempo,
@@ -1473,9 +1486,8 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
     print(f'   {len(sugestoes)} combinação(ões) ref+cor com lacuna nas máquinas:\n')
     for sug in sugestoes:
         nomes_f = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_faltando'])
-        nomes_t = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_com_cor']) or '(nenhuma)'
-        print(f'   Ref "{sug["ref"]}"  Cor "{sug["cor"]}"')
-        print(f'     Já cadastrada em.: {nomes_t}')
+        desc_str = f'  ({sug["descricao"]})' if sug['descricao'] else ''
+        print(f'   Ref "{sug["ref"]}"  Cor "{sug["cor"]}"{desc_str}')
         print(f'     Falta cadastrar..: {nomes_f}')
         print(f'     Tempo estimado...: {sug["tempo_sugerido"]}h/máquina')
         print()
