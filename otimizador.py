@@ -493,6 +493,51 @@ def precomputar_maquinas(modelos: dict):
     return ref_data, num_machines, ridx_map
 
 
+# ── PRÉ-COMPUTAÇÃO DE RESTRIÇÕES POR PEDIDO ───────────────────────────────────
+def preparar_restricoes_pedidos(pedidos: list, ref_data: dict, modelos: dict):
+    """
+    Pré-computa, para cada pedido, os arrays filtrados de gidxs/tempos/aba_idx
+    considerando a restrição de 'maquina_especial' (col B da aba PEDIDO).
+
+    Armazena diretamente no dict do pedido:
+      _gidxs   — numpy array de índices globais válidos
+      _tempos  — numpy array de tempos correspondentes
+      _aba_idx — lista de (aba, slot) correspondentes
+
+    Pedidos sem cadastro recebem _gidxs = None.
+    Chamado uma única vez após precomputar_maquinas; todos os pontos de
+    simulação e alocação usam esses arrays — garantindo que a restrição
+    seja respeitada em 100% das análises.
+    """
+    for p in pedidos:
+        chave = _chave_pedido(p, ref_data)
+        d     = ref_data.get(chave)
+        if d is None:
+            p['_gidxs'] = p['_tempos'] = p['_aba_idx'] = None
+            continue
+
+        maq_esp = (p.get('maquina_especial') or '').strip()
+        if maq_esp:
+            mask = np.array([
+                modelos[aba]['nome_modelo'] == maq_esp
+                for aba, _ in d['aba_idx']
+            ])
+            if mask.any():
+                p['_gidxs']   = d['gidxs'][mask]
+                p['_tempos']  = d['tempos'][mask]
+                p['_aba_idx'] = [ai for ai, m in zip(d['aba_idx'], mask) if m]
+            else:
+                print(f'  ⚠ Máquina especial "{maq_esp}" não encontrada '
+                      f'para ref "{p["referencia"]}" — usando todas as disponíveis.')
+                p['_gidxs']   = d['gidxs']
+                p['_tempos']  = d['tempos']
+                p['_aba_idx'] = d['aba_idx']
+        else:
+            p['_gidxs']   = d['gidxs']
+            p['_tempos']  = d['tempos']
+            p['_aba_idx'] = d['aba_idx']
+
+
 # ── RESOLUÇÃO DE CHAVE (ref + cor com fallback para ref genérica) ─────────────
 def _chave_pedido(p: dict, ref_data: dict) -> str:
     """
@@ -512,16 +557,22 @@ def _chave_pedido(p: dict, ref_data: dict) -> str:
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
 def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     """
-    Simula tempo total de produção respeitando min_start de cada pedido.
+    Simula tempo total de produção respeitando min_start e maquina_especial de cada pedido.
+    Usa arrays pré-computados (_gidxs/_tempos) quando disponíveis — assim a restrição
+    de máquina especial é considerada em todas as simulações de estratégia/Monte Carlo.
     Thread-safe (cria 'filas' local).
     """
     filas = np.zeros(num_machines, dtype=np.float64)
     maior = 0.0
     for p in pedidos:
-        d = ref_data.get(_chave_pedido(p, ref_data))
-        if d is None:
-            continue
-        gidxs, tempos = d['gidxs'], d['tempos']
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
         min_s = float(p.get('min_start', 0.0))
         for _ in range(p['maquinas_necessarias']):
             available = np.maximum(filas[gidxs], min_s)
@@ -780,10 +831,12 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         ordem_compra = pedido.get('ordem_compra', '')
         linha_sheet  = pedido.get('linha_sheet')
 
-        maquina_especial = (pedido.get('maquina_especial') or '').strip()
+        # Usa arrays pré-computados (já aplicam restrição de maquina_especial)
+        gidxs   = pedido.get('_gidxs')
+        tempos  = pedido.get('_tempos')
+        aba_idx = pedido.get('_aba_idx')
 
-        d = ref_data.get(_chave_pedido(pedido, ref_data))
-        if d is None:
+        if gidxs is None:
             sem_cadastro.append({
                 'referencia':           ref,
                 'produto':              produto,
@@ -796,20 +849,6 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             })
             continue
 
-        gidxs, tempos, aba_idx = d['gidxs'], d['tempos'], d['aba_idx']
-
-        # Se o pedido tem máquina especial, restringe a alocação ao modelo cujo L1 coincide
-        if maquina_especial:
-            mask = np.array([
-                modelos[aba]['nome_modelo'] == maquina_especial
-                for aba, _ in aba_idx
-            ])
-            if mask.any():
-                gidxs   = gidxs[mask]
-                tempos  = tempos[mask]
-                aba_idx = [ai for ai, m in zip(aba_idx, mask) if m]
-            else:
-                print(f'  ⚠ Máquina especial "{maquina_especial}" não encontrada para ref "{ref}" — usando todas as máquinas disponíveis.')
         por_modelo = {}
 
         for _ in range(slots):
@@ -1449,6 +1488,9 @@ def main():
         modelos  = modelos_novos
         ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
         print(f'  ✔ Reindexado: {num_machines} máquinas físicas.')
+
+    preparar_restricoes_pedidos(pedidos, ref_data, modelos)
+    print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
     print('6/8 Escolhendo melhor estratégia...')
     grupos = agrupar_por_prioridade(pedidos)
