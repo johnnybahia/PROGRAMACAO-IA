@@ -6,6 +6,22 @@ Otimizador de Distribuição de Produção — Google Sheets + Python
 Lê e escreve diretamente na planilha Google Sheets.
 Sem limite de tempo. Simulações em paralelo com numpy.
 
+Estrutura da aba PEDIDO:
+  Col A: Data Inicial Especial (opcional — força início a partir desta data)
+  Col B: Produto
+  Col C: Referência
+  Col D: Cor
+  Col E: Quantidade de Máquinas
+  Col F: Cliente
+  Col G: Ordem de Compra
+  Col H: Data de Entrega da OC (deadline)
+  Col I: Data Finalização do Pedido  ← preenchida pelo código
+  Col J: Prazo                       ← preenchida pelo código (+X antecipado / -X atrasado)
+  Cel L1: Data base de início do planejamento
+
+Aba opcional 'DATAS FORA DE PROGRAMAÇÃO':
+  Col A: datas bloqueadas (sem produção) — formato DD/MM/YYYY
+
 Uso:
     python otimizador.py <URL_da_planilha> <credenciais.json>
 
@@ -22,6 +38,7 @@ import random
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, date, timedelta
 
 try:
     import numpy as np
@@ -41,14 +58,16 @@ except ImportError:
 CONFIG = {
     'ABA_PEDIDO':           'PEDIDO',
     'ABA_RESULTADO':        'DISTRIBUIÇÃO',
+    'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
     'LIMIAR_TROCA_PERCENT': 10,
     'ABAS_IGNORAR': {
-        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO',
+        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
+        'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS',
     },
     # Monte Carlo: mais iterações pois não há limite de tempo
-    # > 1000 pedidos no grupo → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
+    # > 1000 pedidos → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
 }
 
@@ -115,7 +134,7 @@ class SheetBuilder:
         self.name    = sheet_name
         self.cols    = cols
         self.row     = 1
-        self.data    = []   # (row, col, value) – para batch write
+        self.data    = []   # (row, col, value)
         self.formats = []   # Sheets API batchUpdate requests
         self._ws     = None
         self._sid    = None
@@ -130,7 +149,6 @@ class SheetBuilder:
         self._ws  = ws
         self._sid = ws.id
 
-    # ── linha de dados ──────────────────────────────────────────────────────
     def write(self, values: list, bg=None, fg='#000000', bold=False,
               italic=False, h_align='LEFT', wrap=False, font_size=11):
         for i, val in enumerate(values):
@@ -145,7 +163,6 @@ class SheetBuilder:
         self.row += 1
         return self
 
-    # ── banner com merge ────────────────────────────────────────────────────
     def banner(self, text: str, bg: str, fg='#FFFFFF', bold=True,
                font_size=11, h_align='CENTER', wrap=False):
         self.data.append((self.row, 1, text))
@@ -170,7 +187,6 @@ class SheetBuilder:
         self.row += n
         return self
 
-    # ── congela linhas ──────────────────────────────────────────────────────
     def freeze(self, rows: int):
         self.formats.append({
             'updateSheetProperties': {
@@ -182,9 +198,7 @@ class SheetBuilder:
             }
         })
 
-    # ── aplica tudo em lote ─────────────────────────────────────────────────
     def flush(self):
-        # 1) Escreve dados
         if self.data:
             cell_list = []
             for r, c, v in self.data:
@@ -192,9 +206,7 @@ class SheetBuilder:
                 cell_list.append(cell)
             self._ws.update_cells(cell_list, value_input_option='USER_ENTERED')
 
-        # 2) Aplica formatos
         if self.formats:
-            # Insere sheetId em todos os ranges que não têm
             for req in self.formats:
                 self._inject_sid(req)
             self.ss.batch_update({'requests': self.formats})
@@ -222,35 +234,155 @@ class SheetBuilder:
                 self._inject_sid(item)
 
 
+# ── UTILITÁRIOS DE DATA ───────────────────────────────────────────────────────
+def parse_data(s: str):
+    """Parseia string de data em vários formatos. Retorna date ou None."""
+    if not s or not s.strip():
+        return None
+    s = s.strip()
+    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set) -> datetime:
+    """
+    Converte offset em horas virtuais (excluindo dias bloqueados) para datetime real.
+    base_date é o dia 0 do planejamento (hora 0).
+    Dias bloqueados são pulados — não contam para o offset.
+    """
+    hpd = CONFIG['HORAS_POR_DIA']
+    if horas_offset <= 0:
+        return datetime.combine(base_date, datetime.min.time())
+
+    dias_completos  = int(horas_offset // hpd)
+    horas_restantes = horas_offset % hpd
+
+    data_atual    = base_date
+    dias_contados = 0
+    while dias_contados < dias_completos:
+        data_atual += timedelta(days=1)
+        if data_atual not in datas_bloqueadas:
+            dias_contados += 1
+
+    return datetime.combine(data_atual, datetime.min.time()) + timedelta(hours=horas_restantes)
+
+
+def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -> float:
+    """
+    Converte uma data alvo em offset de horas virtuais a partir de base_date,
+    excluindo dias bloqueados da contagem.
+    """
+    if target_date <= base_date:
+        return 0.0
+    hpd       = CONFIG['HORAS_POR_DIA']
+    dias      = 0
+    data_atual = base_date
+    while data_atual < target_date:
+        data_atual += timedelta(days=1)
+        if data_atual not in datas_bloqueadas:
+            dias += 1
+    return float(dias * hpd)
+
+
+# ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
+def ler_data_base(spreadsheet) -> date:
+    """Lê a data base de início (célula L1) da aba PEDIDO."""
+    ws  = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
+    val = ws.acell('L1').value or ''
+    d   = parse_data(val)
+    if d is None:
+        d = date.today()
+        print(f'  ⚠ L1 da aba PEDIDO inválido ou vazio. Usando hoje: {d.strftime("%d/%m/%Y")}')
+    return d
+
+
+def ler_datas_bloqueadas(spreadsheet) -> set:
+    """Lê as datas bloqueadas da aba 'DATAS FORA DE PROGRAMAÇÃO'."""
+    bloqueadas = set()
+    try:
+        ws   = spreadsheet.worksheet('DATAS FORA DE PROGRAMAÇÃO')
+        rows = ws.get_all_values()
+        for linha in rows[1:]:
+            if not linha:
+                continue
+            d = parse_data(linha[0])
+            if d:
+                bloqueadas.add(d)
+        print(f'  ✔ {len(bloqueadas)} data(s) bloqueada(s).')
+    except gspread.WorksheetNotFound:
+        print('  ℹ Aba "DATAS FORA DE PROGRAMAÇÃO" não encontrada — sem restrições de datas.')
+    return bloqueadas
+
+
 # ── LER PEDIDOS ──────────────────────────────────────────────────────────────
-def ler_pedidos(spreadsheet) -> list:
+def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
+    """
+    Lê a aba PEDIDO com a estrutura:
+      A: Data Inicial Especial  B: Produto  C: Referência  D: Cor
+      E: Qtd Máquinas  F: Cliente  G: Ordem de Compra  H: Data de Entrega
+      I: Data Finalização (saída)  J: Prazo (saída)
+      L1: Data base (lida separadamente por ler_data_base)
+    """
     ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
     rows = ws.get_all_values()
     pedidos = []
-    for linha in rows[1:]:   # pula cabeçalho
-        if len(linha) < 2:
+
+    for i, linha in enumerate(rows[1:], start=2):   # i = linha real no sheet
+        if len(linha) < 5:
             continue
         try:
-            total_maq = int(linha[0]) if linha[0].strip() else 0
-            ref       = linha[1].strip()
-            prazo     = float(linha[2].replace(',', '.')) if len(linha) > 2 and linha[2].strip() else 999
-            cor       = linha[3].strip() if len(linha) > 3 else ''
-            pri_raw   = linha[4].strip() if len(linha) > 4 else ''
-            pri       = int(pri_raw) if pri_raw.lstrip('-').isdigit() else 1
-            if pri <= 0:
-                pri = 1
-        except (ValueError, IndexError):
+            data_esp_str = linha[0].strip() if linha[0].strip() else ''
+            produto      = linha[1].strip() if len(linha) > 1 else ''
+            ref          = linha[2].strip() if len(linha) > 2 else ''
+            cor          = linha[3].strip() if len(linha) > 3 else ''
+            qtd_str      = linha[4].strip() if len(linha) > 4 else ''
+            cliente      = linha[5].strip() if len(linha) > 5 else ''
+            ordem_compra = linha[6].strip() if len(linha) > 6 else ''
+            data_ent_str = linha[7].strip() if len(linha) > 7 else ''
+        except IndexError:
             continue
-        if not ref or total_maq <= 0:
+
+        if not ref or not qtd_str:
             continue
+
+        try:
+            total_maq = int(float(qtd_str.replace(',', '.')))
+        except ValueError:
+            continue
+        if total_maq <= 0:
+            continue
+
+        # Data inicial especial → min_start em horas virtuais
+        data_esp  = parse_data(data_esp_str)
+        min_start = 0.0
+        if data_esp:
+            min_start = data_para_horas(data_base, data_esp, datas_bloqueadas)
+
+        # Deadline → offset em horas virtuais
+        data_entrega   = parse_data(data_ent_str)
+        deadline_horas = None
+        if data_entrega:
+            deadline_horas = data_para_horas(data_base, data_entrega, datas_bloqueadas)
+
         pedidos.append({
+            'linha_sheet':          i,
             'referencia':           ref,
+            'produto':              produto,
             'cor':                  cor,
+            'cliente':              cliente,
+            'ordem_compra':         ordem_compra,
             'maquinas_necessarias': total_maq,
-            'prazo_dias':           prazo,
-            'prazo_horas':          prazo * CONFIG['HORAS_POR_DIA'],
-            'prioridade':           pri,
+            'data_entrega':         data_entrega,
+            'deadline_horas':       deadline_horas,
+            'data_especial':        data_esp,
+            'min_start':            min_start,
+            'prioridade':           1,          # mantido para compatibilidade interna
         })
+
     return pedidos
 
 
@@ -317,7 +449,6 @@ def agrupar_por_prioridade(pedidos: list) -> list:
 def precomputar_maquinas(modelos: dict):
     """
     Mapeia cada referência para arrays numpy de índices globais e tempos.
-    Permite simular_termino sem loops Python internos pesados.
     """
     gidx_map = {}
     g = 0
@@ -349,19 +480,20 @@ def precomputar_maquinas(modelos: dict):
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
 def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     """
-    Simula tempo total de produção.
-    Para cada slot necessário, usa numpy argmin para encontrar a máquina
-    mais livre em O(n) vetorizado — thread-safe (cria 'filas' local).
+    Simula tempo total de produção respeitando min_start de cada pedido.
+    Thread-safe (cria 'filas' local).
     """
-    filas  = np.zeros(num_machines, dtype=np.float64)
-    maior  = 0.0
+    filas = np.zeros(num_machines, dtype=np.float64)
+    maior = 0.0
     for p in pedidos:
         d = ref_data.get(p['referencia'])
         if d is None:
             continue
         gidxs, tempos = d['gidxs'], d['tempos']
+        min_s = float(p.get('min_start', 0.0))
         for _ in range(p['maquinas_necessarias']):
-            ft   = filas[gidxs] + tempos
+            available = np.maximum(filas[gidxs], min_s)
+            ft   = available + tempos
             best = int(np.argmin(ft))
             fim  = float(ft[best])
             filas[gidxs[best]] = fim
@@ -380,13 +512,20 @@ def get_menor_tempo(ref: str, modelos: dict) -> float:
 
 
 def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
-    """Cria as 6 estratégias como closures sobre modelos e ref_data."""
+    """Cria as estratégias como closures sobre modelos e ref_data."""
 
     def _mc_iter(n):
         for threshold, iters in CONFIG['MC_ITER']:
             if n > threshold:
                 return iters
         return CONFIG['MC_ITER'][-1][1]
+
+    def edd(pedidos):
+        """Earliest Due Date — prazo mais próximo primeiro."""
+        return sorted(pedidos, key=lambda p: (
+            p['deadline_horas'] if p['deadline_horas'] is not None else float('inf'),
+            p.get('min_start', 0.0),
+        ))
 
     def balanceamento(pedidos):
         grupos = {}
@@ -396,7 +535,7 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                 if p['referencia'] in mod['referencias']:
                     t = mod['referencias'][p['referencia']]
                     if t < best_t:
-                        best_t  = t
+                        best_t   = t
                         best_aba = aba
             grupos.setdefault(best_aba, []).append(p)
         chaves  = list(grupos.keys())
@@ -425,8 +564,8 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         ))
 
     def monte_carlo(pedidos):
-        n       = len(pedidos)
-        iters   = _mc_iter(n)
+        n     = len(pedidos)
+        iters = _mc_iter(n)
         melhor  = None
         mt      = float('inf')
         for _ in range(iters):
@@ -438,22 +577,25 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         return melhor or pedidos
 
     return [
-        {'id': 'balanceamento', 'nome': '✅ Balanceamento por Modelo',
+        {'id': 'edd',          'nome': '✅ EDD — Prazo Mais Próximo Primeiro',
+         'descricao': 'Prioriza a data de entrega — minimiza atrasos',
+         'fn': edd},
+        {'id': 'balanceamento','nome': '2 — Balanceamento por Modelo',
          'descricao': 'Distribui equalizando carga entre modelos — operador focado',
          'fn': balanceamento},
-        {'id': 'rapido',        'nome': '2 — Mais Rápido Primeiro',
+        {'id': 'rapido',       'nome': '3 — Mais Rápido Primeiro',
          'descricao': 'Menor tempo de produção primeiro — libera máquinas mais cedo',
          'fn': rapido},
-        {'id': 'menor_demanda', 'nome': '3 — Menor Demanda Primeiro',
+        {'id': 'menor_demanda','nome': '4 — Menor Demanda Primeiro',
          'descricao': 'Menos máquinas necessárias primeiro — fecha muitos pedidos rapidamente',
          'fn': menor_demanda},
-        {'id': 'maior_demanda', 'nome': '4 — Maior Demanda Primeiro',
+        {'id': 'maior_demanda','nome': '5 — Maior Demanda Primeiro',
          'descricao': 'Mais máquinas necessárias primeiro — resolve gargalos grandes logo',
          'fn': maior_demanda},
-        {'id': 'lento',         'nome': '5 — Mais Lento Primeiro',
+        {'id': 'lento',        'nome': '6 — Mais Lento Primeiro',
          'descricao': 'Maior tempo de produção primeiro — jobs longos entram antes',
          'fn': lento},
-        {'id': 'monte_carlo',   'nome': '6 — Melhor Aleatório (Monte Carlo)',
+        {'id': 'monte_carlo',  'nome': '7 — Melhor Aleatório (Monte Carlo)',
          'descricao': f'Até {CONFIG["MC_ITER"][0][1]}–{CONFIG["MC_ITER"][-1][1]} simulações aleatórias — adapta ao volume',
          'fn': monte_carlo},
     ]
@@ -481,35 +623,35 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
 def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines):
     estrategias = make_estrategias(modelos, ref_data, num_machines)
     limiar      = CONFIG['LIMIAR_TROCA_PERCENT']
-    idx_bal     = next(i for i, e in enumerate(estrategias) if e['id'] == 'balanceamento')
+    idx_ref     = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
     num_grupos  = len(grupos)
 
-    # ── Pré-computa ordenações de cada grupo × estratégia (6^N → só precisa 6×N pré-ord.)
+    # Pré-computa ordenações de cada grupo × estratégia
     print('  Pré-computando ordenações por grupo e estratégia...')
     group_orderings = []
     for g in grupos:
         ord_g = [est['fn'](g['pedidos']) for est in estrategias]
         group_orderings.append(ord_g)
 
-    # ── Ranking individual (todos os pedidos juntos, sem divisão por grupo)
-    print('  Calculando ranking individual das 6 estratégias...')
+    # Ranking individual (todos os pedidos juntos)
+    print('  Calculando ranking individual das estratégias...')
     ranking = []
     for est in estrategias:
         ordenados = est['fn'](pedidos)
         t = simular_termino(ordenados, ref_data, num_machines)
         ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t), 'ordenados': ordenados})
-    t_bal_rank = next(r for r in ranking if r['id'] == 'balanceamento')['terminoTotal']
+    t_ref_rank = next(r for r in ranking if r['id'] == 'edd')['terminoTotal']
     for r in ranking:
-        r['diff']      = _round(r['terminoTotal'] - t_bal_rank)
-        r['percentual'] = _round(((r['terminoTotal'] - t_bal_rank) / t_bal_rank) * 100) if t_bal_rank > 0 else 0
+        r['diff']       = _round(r['terminoTotal'] - t_ref_rank)
+        r['percentual'] = _round(((r['terminoTotal'] - t_ref_rank) / t_ref_rank) * 100) if t_ref_rank > 0 else 0
     ranking.sort(key=lambda r: r['terminoTotal'])
 
-    # ── Referência: Balanceamento em todos os grupos
-    comb_ref     = [idx_bal] * num_grupos
-    ordenados_ref = [p for g_idx, g in enumerate(grupos) for p in group_orderings[g_idx][idx_bal]]
-    tempo_ref    = simular_termino(ordenados_ref, ref_data, num_machines)
+    # Referência: EDD em todos os grupos
+    comb_ref      = [idx_ref] * num_grupos
+    ordenados_ref = [p for g_idx, g in enumerate(grupos) for p in group_orderings[g_idx][idx_ref]]
+    tempo_ref     = simular_termino(ordenados_ref, ref_data, num_machines)
 
-    # ── Testa TODAS as combinações em paralelo (ThreadPoolExecutor)
+    # Testa TODAS as combinações em paralelo
     combinacoes = gerar_combinacoes(num_grupos, len(estrategias))
     print(f'  Testando {len(combinacoes)} combinações em paralelo...')
 
@@ -535,11 +677,10 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
                 melhor_comb      = comb
                 melhor_ordenados = ord_
 
-    # ── Limiar: só troca se ganho ≥ LIMIAR%
-    is_todo_bal = lambda c: all(i == idx_bal for i in c)
+    is_todo_ref = lambda c: all(i == idx_ref for i in c)
     ganho = ((melhor_tempo - tempo_ref) / tempo_ref) * 100 if tempo_ref > 0 else 0
 
-    if not is_todo_bal(melhor_comb) and ganho <= -limiar:
+    if not is_todo_ref(melhor_comb) and ganho <= -limiar:
         comb_final      = melhor_comb
         tempo_final     = melhor_tempo
         ordenados_final = melhor_ordenados
@@ -549,9 +690,9 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         tempo_final     = tempo_ref
         ordenados_final = ordenados_ref
         info = ''
-        if not is_todo_bal(melhor_comb) and ganho < 0:
+        if not is_todo_ref(melhor_comb) and ganho < 0:
             info = f' (melhor foi {abs(_round(ganho))}% mais rápida — abaixo do limiar de {limiar}%)'
-        decisao = f'✅ Balanceamento venceu{info}'
+        decisao = f'✅ EDD venceu{info}'
 
     estrategias_por_grupo = [
         {
@@ -562,49 +703,62 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         for i in range(num_grupos)
     ]
 
-    usa_pri   = num_grupos > 1
-    todo_bal  = is_todo_bal(comb_final)
+    usa_pri  = num_grupos > 1
+    todo_ref = is_todo_ref(comb_final)
 
     def _nome_res(n):
         return n.replace('✅ ', '').replace('2 — ', '').replace('3 — ', '') \
-                .replace('4 — ', '').replace('5 — ', '').replace('6 — ', '')[:22]
+                .replace('4 — ', '').replace('5 — ', '').replace('6 — ', '') \
+                .replace('7 — ', '')[:22]
 
-    nome_est = (estrategias[idx_bal]['nome'] if todo_bal
+    nome_est = (estrategias[idx_ref]['nome'] if todo_ref
                 else ' | '.join(f"G{g['grupo']}: {_nome_res(g['estrategia']['nome'])}"
                                 for g in estrategias_por_grupo))
 
     melhor = {
-        'id':                   'balanceamento' if todo_bal else 'combinacao_prioridade',
-        'nome':                 nome_est,
-        'terminoTotal':         tempo_final,
-        'terminoHoras':         _round(tempo_final),
-        'ordenados':            ordenados_final,
-        'decisao':              decisao,
-        'estrategiasPorGrupo':  estrategias_por_grupo,
-        'usaPrioridade':        usa_pri,
-        'totalCombinacoes':     len(combinacoes),
+        'id':                  'edd' if todo_ref else 'combinacao_prioridade',
+        'nome':                nome_est,
+        'terminoTotal':        tempo_final,
+        'terminoHoras':        _round(tempo_final),
+        'ordenados':           ordenados_final,
+        'decisao':             decisao,
+        'estrategiasPorGrupo': estrategias_por_grupo,
+        'usaPrioridade':       usa_pri,
+        'totalCombinacoes':    len(combinacoes),
     }
 
     return melhor, ranking
 
 
 # ── OTIMIZAR DISTRIBUIÇÃO ────────────────────────────────────────────────────
-def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map):
+def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map,
+                           data_base: date, datas_bloqueadas: set):
     filas        = np.zeros(num_machines, dtype=np.float64)
     resultado    = []
     sem_cadastro = []
 
     for pedido in pedidos_ordenados:
-        ref        = pedido['referencia']
-        cor        = pedido.get('cor', '') or '-'
-        slots      = pedido['maquinas_necessarias']
-        prioridade = pedido.get('prioridade', 1)
+        ref          = pedido['referencia']
+        cor          = pedido.get('cor', '') or '-'
+        slots        = pedido['maquinas_necessarias']
+        min_s        = float(pedido.get('min_start', 0.0))
+        data_entrega = pedido.get('data_entrega')
+        produto      = pedido.get('produto', '')
+        cliente      = pedido.get('cliente', '')
+        ordem_compra = pedido.get('ordem_compra', '')
+        linha_sheet  = pedido.get('linha_sheet')
 
         d = ref_data.get(ref)
         if d is None:
             sem_cadastro.append({
-                'referencia': ref, 'cor': cor,
-                'maquinas_necessarias': slots, 'prioridade': prioridade,
+                'referencia':           ref,
+                'produto':              produto,
+                'cor':                  cor,
+                'cliente':              cliente,
+                'ordem_compra':         ordem_compra,
+                'maquinas_necessarias': slots,
+                'data_entrega':         data_entrega,
+                'linha_sheet':          linha_sheet,
             })
             continue
 
@@ -612,37 +766,57 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         por_modelo = {}
 
         for _ in range(slots):
-            ft    = filas[gidxs] + tempos
+            available = np.maximum(filas[gidxs], min_s)
+            ft    = available + tempos
             best  = int(np.argmin(ft))
             fim   = float(ft[best])
             aba, _li = aba_idx[best]
-            inicio = float(filas[gidxs[best]])
+            inicio = float(max(filas[gidxs[best]], min_s))
             filas[gidxs[best]] = fim
 
             if aba not in por_modelo:
                 por_modelo[aba] = {
-                    'nome_modelo':   modelos[aba]['nome_modelo'],
-                    'aba':           aba,
+                    'nome_modelo':    modelos[aba]['nome_modelo'],
+                    'aba':            aba,
                     'tempo_producao': float(tempos[best]),
-                    'slots':         0,
-                    'inicio':        inicio,
-                    'termino':       fim,
+                    'slots':          0,
+                    'inicio':         inicio,
+                    'termino':        fim,
                 }
             por_modelo[aba]['slots']   += 1
             por_modelo[aba]['termino']  = max(por_modelo[aba]['termino'], fim)
             por_modelo[aba]['inicio']   = min(por_modelo[aba]['inicio'],  inicio)
 
         for aba, aloc in por_modelo.items():
+            dt_inicio  = horas_para_data(data_base, aloc['inicio'],  datas_bloqueadas)
+            dt_termino = horas_para_data(data_base, aloc['termino'], datas_bloqueadas)
+
+            prazo_str   = ''
+            prazo_delta = None
+            if data_entrega:
+                delta       = (data_entrega - dt_termino.date()).days
+                prazo_delta = delta
+                prazo_str   = (f'+{delta} dias antecipado' if delta >= 0
+                               else f'{delta} dias atrasado')
+
             resultado.append({
-                'prioridade':        prioridade,
                 'referencia':        ref,
+                'produto':           produto,
                 'cor':               cor,
+                'cliente':           cliente,
+                'ordem_compra':      ordem_compra,
                 'nome_modelo':       aloc['nome_modelo'],
                 'aba':               aloc['aba'],
                 'maquinas_alocadas': aloc['slots'],
                 'tempo_producao':    aloc['tempo_producao'],
-                'inicio':            _round(aloc['inicio']),
-                'termino':           _round(aloc['termino']),
+                'inicio_horas':      _round(aloc['inicio']),
+                'termino_horas':     _round(aloc['termino']),
+                'dt_inicio':         dt_inicio,
+                'dt_termino':        dt_termino,
+                'data_entrega':      data_entrega,
+                'prazo_str':         prazo_str,
+                'prazo_delta':       prazo_delta,
+                'linha_sheet':       linha_sheet,
             })
 
     return resultado, sem_cadastro
@@ -650,8 +824,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
 
 # ── SUGESTÕES ────────────────────────────────────────────────────────────────
 def calcular_sugestoes(modelos: dict) -> list:
-    nomes    = list(modelos.keys())
-    razoes   = {a: {} for a in nomes}
+    nomes     = list(modelos.keys())
+    razoes    = {a: {} for a in nomes}
     confianca = {a: {} for a in nomes}
 
     for a in nomes:
@@ -709,69 +883,106 @@ def calcular_sugestoes(modelos: dict) -> list:
     return sugestoes
 
 
+# ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas I e J) ──────────────────────────
+def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
+    """Preenche colunas I (data finalização) e J (prazo) na aba PEDIDO."""
+    ws = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
+
+    # Para cada pedido, pega o termino mais tardio entre as alocações
+    por_linha = {}
+    for r in resultado:
+        ln = r.get('linha_sheet')
+        if ln is None:
+            continue
+        if ln not in por_linha or r['dt_termino'] > por_linha[ln]['dt_termino']:
+            por_linha[ln] = r
+
+    cell_list = []
+    for ln, r in por_linha.items():
+        val_i = r['dt_termino'].strftime('%d/%m/%Y')
+        val_j = r['prazo_str'] if r['prazo_str'] else '—'
+        cell_list.append(gspread.Cell(ln, 9, val_i))
+        cell_list.append(gspread.Cell(ln, 10, val_j))
+
+    # Items sem cadastro: informa na coluna I, J vazia
+    for r in sem_cadastro:
+        ln = r.get('linha_sheet')
+        if ln is None or ln in por_linha:
+            continue
+        cell_list.append(gspread.Cell(ln, 9, 'Sem cadastro'))
+        cell_list.append(gspread.Cell(ln, 10, '—'))
+
+    if cell_list:
+        ws.update_cells(cell_list, value_input_option='USER_ENTERED')
+        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (I e J).')
+
+
 # ── SALVAR RESULTADO ─────────────────────────────────────────────────────────
 def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor):
-    usa_pri = melhor and melhor.get('usaPrioridade')
-    cab = (['Prioridade', 'Referência', 'Cor', 'Modelo', 'Aba', 'Máquinas Alocadas',
-            'Tempo Produção (h)', 'Início (h)', 'Término (h)']
-           if usa_pri else
-           ['Referência', 'Cor', 'Modelo', 'Aba', 'Máquinas Alocadas',
-            'Tempo Produção (h)', 'Início (h)', 'Término (h)'])
+    cab   = ['Referência', 'Produto', 'Cor', 'Cliente', 'Ordem de Compra',
+             'Modelo', 'Aba', 'Máquinas', 'Tempo Prod. (h)',
+             'Início', 'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, CONFIG['ABA_RESULTADO'], cols=ncols)
 
-    # Banner principal
-    cor_banner = '#1B5E20' if melhor['id'] == 'balanceamento' else '#E65100'
-    b.banner(f"🏆 Estratégia: {melhor['nome']}  |  Término total: {melhor['terminoHoras']}h  |  {melhor.get('decisao', '')}",
-             cor_banner, font_size=11)
-    b.banner(f"ℹ️  Limiar de troca: {CONFIG['LIMIAR_TROCA_PERCENT']}% — outra estratégia só substitui o Balanceamento se for pelo menos {CONFIG['LIMIAR_TROCA_PERCENT']}% mais rápida",
-             '#E3F2FD', fg='#0D47A1', bold=False)
-
-    if usa_pri and melhor.get('estrategiasPorGrupo'):
-        b.banner(f"📋 ESTRATÉGIA POR GRUPO  |  {melhor['totalCombinacoes']} combinações analisadas",
-                 '#263238')
-        cores_g = ['#1B5E20', '#0D47A1', '#4A148C', '#37474F', '#BF360C']
-        for g in melhor['estrategiasPorGrupo']:
-            cg = cores_g[min(g['grupo'] - 1, len(cores_g) - 1)]
-            b.banner(f"   Grupo {g['grupo']} ({g['quantidadePedidos']} pedido(s)): {g['estrategia']['nome']}", cg)
+    cor_banner = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
+    b.banner(
+        f"🏆 Estratégia: {melhor['nome']}  |  Término total: {melhor['terminoHoras']}h  |  {melhor.get('decisao', '')}",
+        cor_banner, font_size=11)
+    b.banner(
+        f"ℹ️  Limiar de troca: {CONFIG['LIMIAR_TROCA_PERCENT']}% — outra estratégia só substitui o EDD se for pelo menos {CONFIG['LIMIAR_TROCA_PERCENT']}% mais rápida",
+        '#E3F2FD', fg='#0D47A1', bold=False)
     b.blank()
 
-    # Cabeçalho
     b.write(cab, bg='#1B5E20', fg='#FFFFFF', bold=True, h_align='CENTER')
 
-    # Dados
-    cores_pri = ['#E8F5E9', '#E3F2FD', '#F3E5F5', '#ECEFF1', '#FBE9E7', '#E0F7FA']
     for r in resultado:
-        pri = r.get('prioridade', 1)
-        bg  = cores_pri[min(pri - 1, len(cores_pri) - 1)] if usa_pri else None
-        linha = ([pri, r['referencia'], r['cor'], r['nome_modelo'], r['aba'],
-                  r['maquinas_alocadas'], r['tempo_producao'], r['inicio'], r['termino']]
-                 if usa_pri else
-                 [r['referencia'], r['cor'], r['nome_modelo'], r['aba'],
-                  r['maquinas_alocadas'], r['tempo_producao'], r['inicio'], r['termino']])
-        b.write(linha, bg=bg)
+        inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M')  if r.get('dt_inicio')   else ''
+        termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
+        entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
 
-    # Sem cadastro
+        pd = r.get('prazo_delta')
+        if pd is None:
+            bg = None
+        elif pd < 0:
+            bg = '#FFCDD2'   # atrasado — vermelho claro
+        elif pd == 0:
+            bg = '#FFF9C4'   # no limite — amarelo
+        else:
+            bg = '#C8E6C9'   # antecipado — verde claro
+
+        b.write([
+            r['referencia'], r.get('produto', ''), r.get('cor', ''),
+            r.get('cliente', ''), r.get('ordem_compra', ''),
+            r['nome_modelo'], r['aba'], r['maquinas_alocadas'],
+            r['tempo_producao'], inicio_s, termino_s, entrega_s,
+            r.get('prazo_str', ''),
+        ], bg=bg)
+
     if sem_cadastro:
         b.blank()
         b.banner('💡 SEM CADASTRO — Referências não encontradas em nenhuma máquina', '#E65100')
-        cab_sc = (['Prioridade', 'Referência', 'Cor', 'Máquinas Necessárias']
-                  if usa_pri else ['Referência', 'Cor', 'Máquinas Necessárias'])
-        b.write(cab_sc, bg='#BF360C', fg='#FFFFFF', bold=True, h_align='CENTER')
+        b.write(['Referência', 'Produto', 'Cor', 'Cliente', 'Ordem de Compra',
+                 'Máquinas', '', '', '', '', '', 'Data Entrega', ''],
+                bg='#BF360C', fg='#FFFFFF', bold=True, h_align='CENTER')
         for r in sem_cadastro:
-            linha = ([r.get('prioridade', 1), r['referencia'], r['cor'], r['maquinas_necessarias']]
-                     if usa_pri else [r['referencia'], r['cor'], r['maquinas_necessarias']])
-            b.write(linha, bg='#FBE9E7')
+            entrega_s = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
+            b.write([
+                r['referencia'], r.get('produto', ''), r.get('cor', ''),
+                r.get('cliente', ''), r.get('ordem_compra', ''),
+                r['maquinas_necessarias'], '', '', '', '', '', entrega_s, '',
+            ], bg='#FBE9E7')
 
-    # Sugestões
     if sugestoes:
         b.blank()
         b.banner('💡 SUGESTÕES — Referências sem tempo cadastrado em certas máquinas', '#E65100')
-        b.write(['Referência', 'Máquina', 'Tempo Estimado (h)', 'Confiança', 'Refs Usadas', 'Base do Cálculo'],
+        b.write(['Referência', 'Máquina', 'Tempo Estimado (h)', 'Confiança', 'Refs Usadas', 'Base do Cálculo',
+                 '', '', '', '', '', '', ''],
                 bg='#BF360C', fg='#FFFFFF', bold=True, h_align='CENTER')
         for s in sugestoes:
             b.write([s['referencia'], s['maquina'], s['tempoEstimado'],
-                     s['confianca'], s['refsUsadas'], s['base']])
+                     s['confianca'], s['refsUsadas'], s['base'],
+                     '', '', '', '', '', '', ''])
 
     b.flush()
 
@@ -784,7 +995,7 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
 
     b.banner('📊 COMPARATIVO DE ESTRATÉGIAS DE DISTRIBUIÇÃO', '#0D47A1', font_size=13)
 
-    cor_b = '#1B5E20' if melhor['id'] == 'balanceamento' else '#E65100'
+    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
     b.banner(f"🏆 Escolhido: {melhor['nome']}  —  Término total: {melhor['terminoHoras']}h", cor_b)
     b.banner(f"{melhor.get('decisao', '')}  |  Limiar: {CONFIG['LIMIAR_TROCA_PERCENT']}%",
              '#E8F5E9', fg='#1B5E20', bold=False)
@@ -801,13 +1012,13 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
                      g['estrategia']['nome'], g['estrategia']['descricao'], '', ''], bg=cg)
         b.blank()
 
-    b.banner('📊 RANKING INDIVIDUAL DAS 6 ESTRATÉGIAS', '#455A64')
+    b.banner('📊 RANKING DAS ESTRATÉGIAS', '#455A64')
     b.write(cab, bg='#263238', fg='#FFFFFF', bold=True, h_align='CENTER')
 
     melhor_t = ranking[0]['terminoTotal']
     for i, est in enumerate(ranking):
-        diff = _round(est['terminoTotal'] - melhor_t)
-        perc = _round(((est['terminoTotal'] - melhor_t) / melhor_t) * 100) if melhor_t > 0 else 0
+        diff   = _round(est['terminoTotal'] - melhor_t)
+        perc   = _round(((est['terminoTotal'] - melhor_t) / melhor_t) * 100) if melhor_t > 0 else 0
         pos_s  = '🏆 1º' if i == 0 else f'{i + 1}º'
         diff_s = '—' if i == 0 else (f'+{diff}h' if diff >= 0 else f'{diff}h')
         perc_s = '✅ MELHOR' if i == 0 else (f'+{perc}% mais lento' if perc > 0 else f'{perc}% mais rápido')
@@ -822,8 +1033,8 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
 
     b.blank(2)
     b.banner(
-        f"ℹ️  Variação % vs Balanceamento. Troca só ocorre se ganho ≥ {CONFIG['LIMIAR_TROCA_PERCENT']}%."
-        + (f" | {melhor['totalCombinacoes']} combinações analisadas por grupos de prioridade."
+        f"ℹ️  Variação % vs EDD. Troca só ocorre se ganho ≥ {CONFIG['LIMIAR_TROCA_PERCENT']}%."
+        + (f" | {melhor['totalCombinacoes']} combinações analisadas."
            if melhor.get('usaPrioridade') else ''),
         '#E3F2FD', fg='#0D47A1', bold=False, wrap=True
     )
@@ -831,6 +1042,57 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
     b.blank(3)
     _secao_cientifica(b, num_pedidos, num_modelos)
     b.freeze(4)
+    b.flush()
+
+
+# ── SALVAR RELATÓRIO PARA IMPRESSÃO ──────────────────────────────────────────
+def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
+    """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
+    ordenado = sorted(
+        resultado,
+        key=lambda r: (r.get('dt_inicio') or datetime.min, r.get('dt_termino') or datetime.min)
+    )
+
+    cab   = ['Início', 'Término', 'Referência', 'Produto', 'Cor',
+             'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
+             'Data Entrega', 'Prazo']
+    ncols = len(cab)
+    b     = SheetBuilder(spreadsheet, CONFIG['ABA_RELATORIO'], cols=ncols)
+
+    hoje  = date.today().strftime('%d/%m/%Y')
+    b.banner(f'📋 RELATÓRIO DE PRODUÇÃO — Gerado em {hoje}', '#0D47A1', font_size=13)
+    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
+    b.banner(
+        f"🏆 {melhor['nome']}  |  Término total: {melhor['terminoHoras']}h  |  {melhor.get('decisao', '')}",
+        cor_b, font_size=11)
+    b.blank()
+    b.write(cab, bg='#263238', fg='#FFFFFF', bold=True, h_align='CENTER')
+    b.freeze(4)
+
+    cores_base = ['#FFFFFF', '#F5F5F5']
+    for i, r in enumerate(ordenado):
+        pd = r.get('prazo_delta')
+        if pd is not None and pd < 0:
+            bg = '#FFCDD2'   # atrasado
+        elif pd == 0:
+            bg = '#FFF9C4'   # no limite
+        elif pd is not None and pd > 0:
+            bg = '#C8E6C9'   # antecipado
+        else:
+            bg = cores_base[i % 2]
+
+        inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M')  if r.get('dt_inicio')   else ''
+        termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
+        entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
+
+        b.write([
+            inicio_s, termino_s,
+            r['referencia'], r.get('produto', ''), r.get('cor', ''),
+            r.get('cliente', ''), r.get('ordem_compra', ''),
+            r['nome_modelo'], r['maquinas_alocadas'],
+            entrega_s, r.get('prazo_str', ''),
+        ], bg=bg)
+
     b.flush()
 
 
@@ -886,15 +1148,14 @@ def _calc_vantagem(n):
     return f'10^{int(log10 - 1)}'
 
 def _calc_eficiencia(np_, nm):
-    f  = math.factorial(min(np_, 20))
+    f   = math.factorial(min(np_, 20))
     cob = min(99.99, ((f - 7) / f) * 100)
     return min(99, round(cob * 0.5 + 31.5 * 0.3 + 95 * 0.2))
 
 def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
-    dias = melhor['terminoHoras'] / CONFIG['HORAS_POR_DIA']
     linhas = [
         f"🏆 {melhor['nome']}",
-        f"   Término: {melhor['terminoHoras']}h (~{dias:.1f} dias)",
+        f"   Término: {melhor['terminoHoras']}h",
     ]
     if melhor.get('usaPrioridade') and melhor.get('estrategiasPorGrupo'):
         linhas.append('\n📋 Por grupo:')
@@ -905,6 +1166,12 @@ def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
         for i, est in enumerate(ranking[:3]):
             diff = '✅ melhor' if i == 0 else f"+{_round(est['terminoTotal'] - ranking[0]['terminoTotal'])}h"
             linhas.append(f"   {i+1}. {est['nome'][:38]}: {est['terminoHoras']}h ({diff})")
+
+    atrasados   = sum(1 for r in resultado if r.get('prazo_delta') is not None and r['prazo_delta'] < 0)
+    antecipados = sum(1 for r in resultado if r.get('prazo_delta') is not None and r['prazo_delta'] > 0)
+    if atrasados or antecipados:
+        linhas.append(f'\n📅 Prazos: {antecipados} antecipado(s), {atrasados} atrasado(s)')
+
     if sem_cadastro:
         linhas.append(f'\n⚠ Sem cadastro: {len({r["referencia"] for r in sem_cadastro})} referência(s)')
     return '\n'.join(linhas)
@@ -928,44 +1195,52 @@ def main():
     print(f'   Planilha: {url_planilha[:60]}...')
     print(f'   Workers:  {os.cpu_count() or 4} threads\n')
 
-    print('1/7 Conectando ao Google Sheets...')
+    print('1/8 Conectando ao Google Sheets...')
     gc          = conectar(credentials_path)
     spreadsheet = abrir_planilha(gc, url_planilha)
     print(f'  ✔ Conectado: "{spreadsheet.title}"')
 
-    print('2/7 Lendo pedidos...')
-    pedidos = ler_pedidos(spreadsheet)
+    print('2/8 Lendo data base e datas bloqueadas...')
+    data_base        = ler_data_base(spreadsheet)
+    datas_bloqueadas = ler_datas_bloqueadas(spreadsheet)
+    print(f'  ✔ Data base: {data_base.strftime("%d/%m/%Y")}')
+
+    print('3/8 Lendo pedidos...')
+    pedidos = ler_pedidos(spreadsheet, data_base, datas_bloqueadas)
     if not pedidos:
         print('❌ Nenhum pedido encontrado na aba PEDIDO.')
         sys.exit(1)
     print(f'  ✔ {len(pedidos)} pedidos.')
 
-    print('3/7 Lendo modelos de máquinas...')
+    print('4/8 Lendo modelos de máquinas...')
     modelos = ler_modelos(spreadsheet)
     if not modelos:
         print('❌ Nenhuma aba de máquina encontrada.')
         sys.exit(1)
     print(f'  ✔ {len(modelos)} modelo(s).')
 
-    print('4/7 Pré-computando estrutura numpy...')
+    print('5/8 Pré-computando estrutura numpy...')
     ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
     print(f'  ✔ {num_machines} máquinas físicas indexadas.')
 
-    print('5/7 Escolhendo melhor estratégia...')
+    print('6/8 Escolhendo melhor estratégia...')
     grupos = agrupar_por_prioridade(pedidos)
     melhor, ranking = escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     print(f'  ✔ {melhor["decisao"]}')
 
-    print('6/7 Gerando distribuição otimizada...')
+    print('7/8 Gerando distribuição otimizada...')
     resultado, sem_cadastro = otimizar_distribuicao(
-        melhor['ordenados'], modelos, ref_data, num_machines, ridx_map
+        melhor['ordenados'], modelos, ref_data, num_machines, ridx_map,
+        data_base, datas_bloqueadas
     )
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
 
-    print('7/7 Salvando nas abas DISTRIBUIÇÃO e COMPARATIVO...')
+    print('8/8 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
     salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos))
+    salvar_relatorio(spreadsheet, resultado, melhor)
+    escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
 
     tempo_total = time.time() - t0
     print(f'\n✅ Concluído em {tempo_total:.1f}s')
