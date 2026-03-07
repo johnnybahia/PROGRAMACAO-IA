@@ -432,7 +432,8 @@ def ler_modelos(spreadsheet) -> dict:
             for linha in rows[1:]:
                 if len(linha) < 7:
                     continue
-                ref       = ' '.join(linha[6].split())    # Coluna G (normaliza espaços internos)
+                ref       = ' '.join(linha[6].split())    # Coluna G = REFERENCIA
+                cor_maq   = ' '.join(linha[5].split()) if len(linha) > 5 else ''  # Coluna F = COR
                 tempo_str = linha[1].strip()    # Coluna B
                 if not ref:
                     continue
@@ -442,7 +443,8 @@ def ler_modelos(spreadsheet) -> dict:
                     continue
                 if tempo <= 0:
                     continue
-                referencias[ref] = tempo
+                chave = f"{ref} {cor_maq}" if cor_maq else ref
+                referencias[chave] = tempo
 
             if not referencias:
                 continue
@@ -1489,7 +1491,7 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
 
     print()
     print('   ➡  Abra a aba da máquina na planilha, adicione uma linha com:')
-    print('      coluna G = "referencia cor"  |  coluna B = tempo de produção (h)')
+    print('      coluna G = referencia  |  coluna F = cor  |  coluna B = tempo de produção (h)')
     print('─' * 60)
 
     # ── 4. Loop até detectar o cadastro real na planilha ─────────────────────
