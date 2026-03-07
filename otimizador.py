@@ -825,7 +825,7 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             if data_entrega:
                 delta       = (data_entrega - dt_termino.date()).days
                 prazo_delta = delta
-                prazo_str   = (f'+{delta} dias antecipado' if delta >= 0
+                prazo_str   = (f'{delta} dias antecipado' if delta >= 0
                                else f'{delta} dias atrasado')
 
             resultado.append({
