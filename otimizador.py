@@ -1254,19 +1254,12 @@ def _tempo_estimado_para_combined(combined: str, ref: str,
     return 0.0
 
 
-def analisar_cores_faltantes(pedidos: list, modelos: dict):
+def _detectar_lacunas(pedidos: list, modelos: dict) -> list:
     """
-    Para cada pedido com (referencia, cor) verifica quais máquinas conseguem
-    produzir a referência mas NÃO têm a cor específica cadastrada.
-    Simula o impacto de adicionar essas cores, exibe o resultado ao usuário e,
-    se ele confirmar, retorna modelos atualizados para recalcular tudo.
-
-    Retorna modelos_atualizados ou None (sem alteração).
+    Retorna lista de lacunas: máquinas que têm a ref mas não têm a cor do pedido.
     """
-    # ── 1. Detectar lacunas de cor por máquina ────────────────────────────────
     vistos    = set()
     sugestoes = []
-
     for p in pedidos:
         ref = p['referencia']
         cor = (p.get('cor') or '').strip()
@@ -1277,82 +1270,114 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict):
             continue
         vistos.add(chave)
 
-        combined = f"{ref} {cor}"
-
-        # Máquinas capazes: têm 'ref' genérica OU qualquer 'ref corX'
-        capazes       = _maquinas_capazes_para_ref(ref, modelos)
-        com_combined  = [a for a in capazes if combined in modelos[a]['referencias']]
-        faltando      = [a for a in capazes if a not in com_combined]
+        combined     = f"{ref} {cor}"
+        capazes      = _maquinas_capazes_para_ref(ref, modelos)
+        com_combined = [a for a in capazes if combined in modelos[a]['referencias']]
+        faltando     = [a for a in capazes if a not in com_combined]
 
         if not faltando:
-            continue  # todas as máquinas capazes já têm esta cor
+            continue
 
         tempo = _tempo_estimado_para_combined(combined, ref, faltando, com_combined, modelos)
         if tempo <= 0:
             continue
 
         sugestoes.append({
-            'ref':              ref,
-            'cor':              cor,
-            'combined':         combined,
+            'ref':               ref,
+            'cor':               cor,
+            'combined':          combined,
             'maquinas_faltando': faltando,
             'maquinas_com_cor':  com_combined,
-            'tempo_sugerido':   tempo,
+            'tempo_sugerido':    tempo,
         })
+    return sugestoes
 
+
+def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
+    """
+    Detecta lacunas de cor nas máquinas, simula o ganho e entra em loop
+    até o usuário cadastrar todas as cores na planilha ou optar por ignorar.
+
+    Retorna modelos atualizados (relidos da planilha) ou None (sem alteração).
+    """
+    # ── 1. Verificação inicial ────────────────────────────────────────────────
+    sugestoes = _detectar_lacunas(pedidos, modelos)
     if not sugestoes:
         return None
 
-    # ── 2. Simular com todas as cores adicionadas em memória ──────────────────
-    modelos_m = copy.deepcopy(modelos)
+    # ── 2. Simulação única para mostrar o ganho estimado ─────────────────────
+    modelos_sim = copy.deepcopy(modelos)
     for sug in sugestoes:
         for aba in sug['maquinas_faltando']:
-            modelos_m[aba]['referencias'][sug['combined']] = sug['tempo_sugerido']
+            modelos_sim[aba]['referencias'][sug['combined']] = sug['tempo_sugerido']
 
     ref_data_orig, num_orig, _ = precomputar_maquinas(modelos)
-    ref_data_m,    num_m,    _ = precomputar_maquinas(modelos_m)
+    ref_data_sim,  num_sim,  _ = precomputar_maquinas(modelos_sim)
+    termino_orig = simular_termino(pedidos, ref_data_orig, num_orig)
+    termino_sim  = simular_termino(pedidos, ref_data_sim,  num_sim)
+    melhoria_h   = _round(termino_orig - termino_sim)
+    melhoria_pct = _round((melhoria_h / termino_orig * 100) if termino_orig > 0 else 0)
 
-    termino_original  = simular_termino(pedidos, ref_data_orig, num_orig)
-    termino_melhorado = simular_termino(pedidos, ref_data_m,    num_m)
-
-    melhoria_h   = _round(termino_original - termino_melhorado)
-    melhoria_pct = _round((melhoria_h / termino_original * 100) if termino_original > 0 else 0)
-
-    # ── 3. Exibir análise ao usuário ──────────────────────────────────────────
+    # ── 3. Exibir análise completa ────────────────────────────────────────────
     print('\n' + '─' * 60)
     print('🎨 ANÁLISE DE CORES NÃO CADASTRADAS')
-    print(f'   {len(sugestoes)} combinação(ões) ref+cor encontrada(s) com lacuna:\n')
-
+    print(f'   {len(sugestoes)} combinação(ões) ref+cor com lacuna nas máquinas:\n')
     for sug in sugestoes:
-        nomes_faltando = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_faltando'])
-        nomes_tem      = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_com_cor']) or '(nenhuma)'
+        nomes_f = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_faltando'])
+        nomes_t = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_com_cor']) or '(nenhuma)'
         print(f'   Ref "{sug["ref"]}"  Cor "{sug["cor"]}"')
-        print(f'     Tem cadastro.....: {nomes_tem}')
-        print(f'     Falta cadastrar..: {nomes_faltando}')
+        print(f'     Já cadastrada em.: {nomes_t}')
+        print(f'     Falta cadastrar..: {nomes_f}')
         print(f'     Tempo estimado...: {sug["tempo_sugerido"]}h/máquina')
+        print()
 
-    print()
     if melhoria_h > 0:
-        print(f'   📈 Simulação com cores adicionadas:')
-        print(f'      Término atual:    {_round(termino_original)}h')
-        print(f'      Término estimado: {_round(termino_melhorado)}h  '
+        print(f'   📈 Ganho estimado ao cadastrar todas:')
+        print(f'      Término atual:    {_round(termino_orig)}h')
+        print(f'      Término estimado: {_round(termino_sim)}h  '
               f'(−{melhoria_h}h / {melhoria_pct}% mais rápido)')
     else:
-        print('   ℹ️  Com os tempos estimados, o término total não melhora nesta simulação.')
-        print('      Mesmo assim, cadastrar as cores permite uma distribuição mais precisa.')
+        print('   ℹ️  Os tempos estimados não reduzem o término total,')
+        print('      mas o cadastro garante uma distribuição mais precisa.')
 
     print()
-    print('   Para registrar: abra a aba da máquina e adicione uma linha com')
-    print('   "referencia cor" na coluna G e o tempo de produção na coluna B.')
+    print('   ➡  Abra a aba da máquina na planilha, adicione uma linha com:')
+    print('      coluna G = "referencia cor"  |  coluna B = tempo de produção (h)')
     print('─' * 60)
 
-    resp = input('   Cadastrou as cores acima? Recalcular com elas? (s/n): ').strip().lower()
-    if resp != 's':
-        print('   ↩  Continuando com os dados originais.\n')
-        return None
+    # ── 4. Loop até detectar o cadastro real na planilha ─────────────────────
+    tentativa = 0
+    while True:
+        tentativa += 1
+        resp = input(
+            f'   [{tentativa}] Cadastrou as cores acima na planilha? '
+            '(Enter para verificar / "pular" para ignorar): '
+        ).strip().lower()
 
-    print('   ✔ Recalculando com as novas cores em memória...\n')
-    return modelos_m
+        if resp == 'pular':
+            print('   ⚠  Pulando análise de cores. Calculando com dados originais.\n')
+            return None
+
+        # Re-lê os modelos diretamente da planilha
+        print('   🔄 Verificando planilha...')
+        modelos_novo = ler_modelos(spreadsheet)
+
+        pendentes = _detectar_lacunas(pedidos, modelos_novo)
+
+        if not pendentes:
+            print('   ✔ Todas as cores foram cadastradas! Recalculando...\n')
+            return modelos_novo
+
+        # Mostra o que ainda falta
+        registradas = len(sugestoes) - len(pendentes)
+        print(f'   ⚠  {registradas}/{len(sugestoes)} cor(es) registrada(s). '
+              f'Ainda faltam {len(pendentes)}:\n')
+        for sug in pendentes:
+            nomes_f = ', '.join(modelos_novo[a]['nome_modelo']
+                                for a in sug['maquinas_faltando']
+                                if a in modelos_novo)
+            print(f'     • Ref "{sug["ref"]}"  Cor "{sug["cor"]}"  →  {nomes_f}')
+        print()
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
@@ -1401,7 +1426,7 @@ def main():
     ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
     print(f'  ✔ {num_machines} máquinas físicas indexadas.')
 
-    modelos_novos = analisar_cores_faltantes(pedidos, modelos)
+    modelos_novos = analisar_cores_faltantes(pedidos, modelos, spreadsheet)
     if modelos_novos is not None:
         modelos  = modelos_novos
         ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
