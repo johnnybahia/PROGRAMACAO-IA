@@ -490,6 +490,22 @@ def precomputar_maquinas(modelos: dict):
     return ref_data, num_machines, ridx_map
 
 
+# ── RESOLUÇÃO DE CHAVE (ref + cor com fallback para ref genérica) ─────────────
+def _chave_pedido(p: dict, ref_data: dict) -> str:
+    """
+    Retorna a chave a usar em ref_data para este pedido.
+    Tenta 'referencia cor' (específico por cor), cai para 'referencia' genérica.
+    Ex.: ref='M60109' cor='2410' → tenta 'M60109 2410', senão usa 'M60109'.
+    """
+    ref = p['referencia']
+    cor = (p.get('cor') or '').strip()
+    if cor and cor != '-':
+        combined = f"{ref} {cor}"
+        if combined in ref_data:
+            return combined
+    return ref
+
+
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
 def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     """
@@ -499,7 +515,7 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     filas = np.zeros(num_machines, dtype=np.float64)
     maior = 0.0
     for p in pedidos:
-        d = ref_data.get(p['referencia'])
+        d = ref_data.get(_chave_pedido(p, ref_data))
         if d is None:
             continue
         gidxs, tempos = d['gidxs'], d['tempos']
@@ -761,7 +777,7 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         ordem_compra = pedido.get('ordem_compra', '')
         linha_sheet  = pedido.get('linha_sheet')
 
-        d = ref_data.get(ref)
+        d = ref_data.get(_chave_pedido(pedido, ref_data))
         if d is None:
             sem_cadastro.append({
                 'referencia':           ref,
@@ -1191,18 +1207,64 @@ def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
 
 
 # ── ANÁLISE DE CORES FALTANTES ───────────────────────────────────────────────
+def _maquinas_capazes_para_ref(ref: str, modelos: dict) -> list:
+    """
+    Retorna as abas cujas máquinas conseguem produzir 'ref', seja pela chave
+    genérica ('M60109') ou por qualquer chave cor-específica ('M60109 2410').
+    """
+    prefix = f"{ref} "
+    return [
+        aba for aba, mod in modelos.items()
+        if ref in mod['referencias']
+        or any(k.startswith(prefix) for k in mod['referencias'])
+    ]
+
+
+def _tempo_estimado_para_combined(combined: str, ref: str,
+                                   maquinas_faltando: list,
+                                   maquinas_com_combined: list,
+                                   modelos: dict) -> float:
+    """
+    Estima o tempo de produção para a chave 'combined' nas máquinas faltando.
+    Prioridade: 1) melhor tempo de 'combined' em outras máquinas
+                2) melhor tempo da ref genérica nas próprias máquinas faltando
+                3) melhor tempo de qualquer cor da mesma ref em qualquer máquina
+    """
+    if maquinas_com_combined:
+        return min(modelos[a]['referencias'][combined] for a in maquinas_com_combined)
+
+    tempos_base = [
+        modelos[a]['referencias'][ref]
+        for a in maquinas_faltando
+        if ref in modelos[a]['referencias']
+    ]
+    if tempos_base:
+        return min(tempos_base)
+
+    prefix = f"{ref} "
+    tempos_similares = [
+        t
+        for mod in modelos.values()
+        for k, t in mod['referencias'].items()
+        if k.startswith(prefix)
+    ]
+    if tempos_similares:
+        return min(tempos_similares)
+
+    return 0.0
+
+
 def analisar_cores_faltantes(pedidos: list, modelos: dict):
     """
-    Verifica se há pedidos cujo par (referencia, cor) não está cadastrado em
-    alguma máquina que já possui a referência base.  Simula o impacto de
-    adicionar as cores faltantes e, se houver melhoria, pergunta ao usuário
-    se deseja recalcular usando os dados em memória.
+    Para cada pedido com (referencia, cor) verifica quais máquinas conseguem
+    produzir a referência mas NÃO têm a cor específica cadastrada.
+    Simula o impacto de adicionar essas cores, exibe o resultado ao usuário e,
+    se ele confirmar, retorna modelos atualizados para recalcular tudo.
 
-    Retorna (modelos_atualizados, pedidos_atualizados) se o usuário confirmar,
-    ou None caso contrário.
+    Retorna modelos_atualizados ou None (sem alteração).
     """
-    # ── 1. Identificar combinações (ref, cor) e quais máquinas têm / não têm ─
-    vistos   = set()
+    # ── 1. Detectar lacunas de cor por máquina ────────────────────────────────
+    vistos    = set()
     sugestoes = []
 
     for p in pedidos:
@@ -1217,88 +1279,80 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict):
 
         combined = f"{ref} {cor}"
 
-        maquinas_com_ref      = [a for a, m in modelos.items() if ref      in m['referencias']]
-        maquinas_com_combined = [a for a, m in modelos.items() if combined in m['referencias']]
-        maquinas_faltando     = [a for a in maquinas_com_ref if a not in maquinas_com_combined]
+        # Máquinas capazes: têm 'ref' genérica OU qualquer 'ref corX'
+        capazes       = _maquinas_capazes_para_ref(ref, modelos)
+        com_combined  = [a for a in capazes if combined in modelos[a]['referencias']]
+        faltando      = [a for a in capazes if a not in com_combined]
 
-        if not maquinas_faltando:
+        if not faltando:
+            continue  # todas as máquinas capazes já têm esta cor
+
+        tempo = _tempo_estimado_para_combined(combined, ref, faltando, com_combined, modelos)
+        if tempo <= 0:
             continue
-
-        # Tempo a usar para a combinação: melhor tempo já cadastrado para
-        # combined (em outra máquina) ou o tempo base da ref.
-        if maquinas_com_combined:
-            tempos_combined = [modelos[a]['referencias'][combined] for a in maquinas_com_combined]
-            tempo_sugerido  = min(tempos_combined)
-        else:
-            tempos_base    = [modelos[a]['referencias'][ref] for a in maquinas_faltando]
-            tempo_sugerido = min(tempos_base)
 
         sugestoes.append({
             'ref':              ref,
             'cor':              cor,
             'combined':         combined,
-            'maquinas_faltando': maquinas_faltando,
-            'tempo_sugerido':   tempo_sugerido,
+            'maquinas_faltando': faltando,
+            'maquinas_com_cor':  com_combined,
+            'tempo_sugerido':   tempo,
         })
 
     if not sugestoes:
         return None
 
-    # ── 2. Simular com modelos e pedidos melhorados (em memória) ──────────────
+    # ── 2. Simular com todas as cores adicionadas em memória ──────────────────
     modelos_m = copy.deepcopy(modelos)
     for sug in sugestoes:
         for aba in sug['maquinas_faltando']:
             modelos_m[aba]['referencias'][sug['combined']] = sug['tempo_sugerido']
 
-    # Pedidos que têm cor passam a usar a chave ref+cor
-    ref_data_m, num_m, _ = precomputar_maquinas(modelos_m)
-    pedidos_m = copy.deepcopy(pedidos)
-    for p in pedidos_m:
-        ref = p['referencia']
-        cor = (p.get('cor') or '').strip()
-        if not cor or cor == '-':
-            continue
-        combined = f"{ref} {cor}"
-        if combined in ref_data_m:
-            p['referencia'] = combined
-
-    # Término simulado com todos os pedidos
-    termino_melhorado = simular_termino(pedidos_m, ref_data_m, num_m)
-
     ref_data_orig, num_orig, _ = precomputar_maquinas(modelos)
-    termino_original  = simular_termino(pedidos,   ref_data_orig, num_orig)
+    ref_data_m,    num_m,    _ = precomputar_maquinas(modelos_m)
+
+    termino_original  = simular_termino(pedidos, ref_data_orig, num_orig)
+    termino_melhorado = simular_termino(pedidos, ref_data_m,    num_m)
 
     melhoria_h   = _round(termino_original - termino_melhorado)
     melhoria_pct = _round((melhoria_h / termino_original * 100) if termino_original > 0 else 0)
 
-    # ── 3. Informar usuário ───────────────────────────────────────────────────
+    # ── 3. Exibir análise ao usuário ──────────────────────────────────────────
     print('\n' + '─' * 60)
-    print('🎨 ANÁLISE DE CORES FALTANTES')
-    print(f'   {len(sugestoes)} combinação(ões) ref+cor identificada(s):')
+    print('🎨 ANÁLISE DE CORES NÃO CADASTRADAS')
+    print(f'   {len(sugestoes)} combinação(ões) ref+cor encontrada(s) com lacuna:\n')
+
     for sug in sugestoes:
-        nomes_maq = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_faltando'])
-        print(f'   • Ref "{sug["ref"]}" + Cor "{sug["cor"]}" → faltando em: {nomes_maq}')
-        print(f'     Tempo sugerido para cadastro: {sug["tempo_sugerido"]}h/máquina')
+        nomes_faltando = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_faltando'])
+        nomes_tem      = ', '.join(modelos[a]['nome_modelo'] for a in sug['maquinas_com_cor']) or '(nenhuma)'
+        print(f'   Ref "{sug["ref"]}"  Cor "{sug["cor"]}"')
+        print(f'     Tem cadastro.....: {nomes_tem}')
+        print(f'     Falta cadastrar..: {nomes_faltando}')
+        print(f'     Tempo estimado...: {sug["tempo_sugerido"]}h/máquina')
 
-    if melhoria_h <= 0:
-        print('   ℹ️  Adicionar as cores não reduziria o término total nesta simulação.')
-        print('─' * 60)
-        return None
-
-    print(f'\n   📈 Estimativa de melhoria: -{melhoria_h}h ({melhoria_pct}% mais rápido)')
-    print(f'   ⏱  Término atual:    {_round(termino_original)}h')
-    print(f'   ⏱  Término estimado: {_round(termino_melhorado)}h')
     print()
-    print('   Para efeito permanente cadastre as cores nas abas de máquina (coluna G).')
+    if melhoria_h > 0:
+        print(f'   📈 Simulação com cores adicionadas:')
+        print(f'      Término atual:    {_round(termino_original)}h')
+        print(f'      Término estimado: {_round(termino_melhorado)}h  '
+              f'(−{melhoria_h}h / {melhoria_pct}% mais rápido)')
+    else:
+        print('   ℹ️  Com os tempos estimados, o término total não melhora nesta simulação.')
+        print('      Mesmo assim, cadastrar as cores permite uma distribuição mais precisa.')
+
+    print()
+    print('   Para registrar: abra a aba da máquina e adicione uma linha com')
+    print('   "referencia cor" na coluna G e o tempo de produção na coluna B.')
     print('─' * 60)
 
-    resp = input('   Recalcular agora com as cores adicionadas em memória? (s/n): ').strip().lower()
+    resp = input('   Cadastrou as cores acima? Recalcular com elas? (s/n): ').strip().lower()
     if resp != 's':
-        print('   ↩  Continuando com os dados originais.')
+        print('   ↩  Continuando com os dados originais.\n')
         return None
 
-    print('   ✔ Recalculando com cores adicionadas...')
-    return modelos_m, pedidos_m
+    print('   ✔ Recalculando com as novas cores em memória...\n')
+    return modelos_m
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
@@ -1347,9 +1401,9 @@ def main():
     ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
     print(f'  ✔ {num_machines} máquinas físicas indexadas.')
 
-    resultado_cores = analisar_cores_faltantes(pedidos, modelos)
-    if resultado_cores is not None:
-        modelos, pedidos = resultado_cores
+    modelos_novos = analisar_cores_faltantes(pedidos, modelos)
+    if modelos_novos is not None:
+        modelos  = modelos_novos
         ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
         print(f'  ✔ Reindexado: {num_machines} máquinas físicas.')
 
