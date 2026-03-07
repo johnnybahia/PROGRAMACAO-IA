@@ -8,15 +8,16 @@ Sem limite de tempo. Simulações em paralelo com numpy.
 
 Estrutura da aba PEDIDO:
   Col A: Data Inicial Especial (opcional — força início a partir desta data)
-  Col B: Produto
-  Col C: Referência
-  Col D: Cor
-  Col E: Quantidade de Máquinas
-  Col F: Cliente
-  Col G: Ordem de Compra
-  Col H: Data de Entrega da OC (deadline)
-  Col I: Data Finalização do Pedido  ← preenchida pelo código
-  Col J: Prazo                       ← preenchida pelo código (+X antecipado / -X atrasado)
+  Col B: Máquina Especial (opcional — nome L1 da aba de máquina; restringe alocação a esse modelo)
+  Col C: Produto
+  Col D: Referência
+  Col E: Cor
+  Col F: Quantidade de Máquinas
+  Col G: Cliente
+  Col H: Ordem de Compra
+  Col I: Data de Entrega da OC (deadline)
+  Col J: Data Finalização do Pedido  ← preenchida pelo código
+  Col K: Prazo                       ← preenchida pelo código (X dias antecipado / -X dias atrasado)
   Cel L1: Data base de início do planejamento
 
 Aba opcional 'DATAS FORA DE PROGRAMAÇÃO':
@@ -335,9 +336,9 @@ def ler_datas_bloqueadas(spreadsheet) -> set:
 def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
     """
     Lê a aba PEDIDO com a estrutura:
-      A: Data Inicial Especial  B: Produto  C: Referência  D: Cor
-      E: Qtd Máquinas  F: Cliente  G: Ordem de Compra  H: Data de Entrega
-      I: Data Finalização (saída)  J: Prazo (saída)
+      A: Data Inicial Especial  B: Máquina Especial  C: Produto  D: Referência  E: Cor
+      F: Qtd Máquinas  G: Cliente  H: Ordem de Compra  I: Data de Entrega
+      J: Data Finalização (saída)  K: Prazo (saída)
       L1: Data base (lida separadamente por ler_data_base)
     """
     ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
@@ -345,17 +346,18 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
     pedidos = []
 
     for i, linha in enumerate(rows[1:], start=2):   # i = linha real no sheet
-        if len(linha) < 5:
+        if len(linha) < 6:
             continue
         try:
-            data_esp_str = linha[0].strip() if linha[0].strip() else ''
-            produto      = linha[1].strip() if len(linha) > 1 else ''
-            ref          = linha[2].strip() if len(linha) > 2 else ''
-            cor          = linha[3].strip() if len(linha) > 3 else ''
-            qtd_str      = linha[4].strip() if len(linha) > 4 else ''
-            cliente      = linha[5].strip() if len(linha) > 5 else ''
-            ordem_compra = linha[6].strip() if len(linha) > 6 else ''
-            data_ent_str = linha[7].strip() if len(linha) > 7 else ''
+            data_esp_str    = linha[0].strip() if linha[0].strip() else ''
+            maquina_especial = linha[1].strip() if len(linha) > 1 else ''
+            produto         = linha[2].strip() if len(linha) > 2 else ''
+            ref             = linha[3].strip() if len(linha) > 3 else ''
+            cor             = linha[4].strip() if len(linha) > 4 else ''
+            qtd_str         = linha[5].strip() if len(linha) > 5 else ''
+            cliente         = linha[6].strip() if len(linha) > 6 else ''
+            ordem_compra    = linha[7].strip() if len(linha) > 7 else ''
+            data_ent_str    = linha[8].strip() if len(linha) > 8 else ''
         except IndexError:
             continue
 
@@ -393,6 +395,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             'deadline_horas':       deadline_horas,
             'data_especial':        data_esp,
             'min_start':            min_start,
+            'maquina_especial':     maquina_especial,
             'prioridade':           1,          # mantido para compatibilidade interna
         })
 
@@ -777,6 +780,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         ordem_compra = pedido.get('ordem_compra', '')
         linha_sheet  = pedido.get('linha_sheet')
 
+        maquina_especial = (pedido.get('maquina_especial') or '').strip()
+
         d = ref_data.get(_chave_pedido(pedido, ref_data))
         if d is None:
             sem_cadastro.append({
@@ -792,6 +797,19 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             continue
 
         gidxs, tempos, aba_idx = d['gidxs'], d['tempos'], d['aba_idx']
+
+        # Se o pedido tem máquina especial, restringe a alocação ao modelo cujo L1 coincide
+        if maquina_especial:
+            mask = np.array([
+                modelos[aba]['nome_modelo'] == maquina_especial
+                for aba, _ in aba_idx
+            ])
+            if mask.any():
+                gidxs   = gidxs[mask]
+                tempos  = tempos[mask]
+                aba_idx = [ai for ai, m in zip(aba_idx, mask) if m]
+            else:
+                print(f'  ⚠ Máquina especial "{maquina_especial}" não encontrada para ref "{ref}" — usando todas as máquinas disponíveis.')
         por_modelo = {}
 
         for _ in range(slots):
@@ -912,9 +930,9 @@ def calcular_sugestoes(modelos: dict) -> list:
     return sugestoes
 
 
-# ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas I e J) ──────────────────────────
+# ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas J e K) ──────────────────────────
 def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
-    """Preenche colunas I (data finalização) e J (prazo) na aba PEDIDO."""
+    """Preenche colunas J (data finalização) e K (prazo) na aba PEDIDO."""
     ws = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
 
     # Para cada pedido, pega o termino mais tardio entre as alocações
@@ -928,22 +946,22 @@ def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
 
     cell_list = []
     for ln, r in por_linha.items():
-        val_i = r['dt_termino'].strftime('%d/%m/%Y')
-        val_j = r['prazo_str'] if r['prazo_str'] else '—'
-        cell_list.append(gspread.Cell(ln, 9, val_i))
+        val_j = r['dt_termino'].strftime('%d/%m/%Y')
+        val_k = r['prazo_str'] if r['prazo_str'] else '—'
         cell_list.append(gspread.Cell(ln, 10, val_j))
+        cell_list.append(gspread.Cell(ln, 11, val_k))
 
-    # Items sem cadastro: informa na coluna I, J vazia
+    # Items sem cadastro: informa na coluna J, K vazia
     for r in sem_cadastro:
         ln = r.get('linha_sheet')
         if ln is None or ln in por_linha:
             continue
-        cell_list.append(gspread.Cell(ln, 9, 'Sem cadastro'))
-        cell_list.append(gspread.Cell(ln, 10, '—'))
+        cell_list.append(gspread.Cell(ln, 10, 'Sem cadastro'))
+        cell_list.append(gspread.Cell(ln, 11, '—'))
 
     if cell_list:
         ws.update_cells(cell_list, value_input_option='RAW')
-        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (I e J).')
+        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (J e K).')
 
 
 # ── SALVAR RESULTADO ─────────────────────────────────────────────────────────
