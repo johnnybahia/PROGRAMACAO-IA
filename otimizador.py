@@ -432,7 +432,8 @@ def ler_modelos(spreadsheet) -> dict:
             for linha in rows[1:]:
                 if len(linha) < 7:
                     continue
-                ref       = linha[6].strip()    # Coluna G
+                ref       = ' '.join(linha[6].split())    # Coluna G = REFERENCIA
+                cor_maq   = ' '.join(linha[5].split()) if len(linha) > 5 else ''  # Coluna F = COR
                 tempo_str = linha[1].strip()    # Coluna B
                 if not ref:
                     continue
@@ -442,7 +443,8 @@ def ler_modelos(spreadsheet) -> dict:
                     continue
                 if tempo <= 0:
                     continue
-                referencias[ref] = tempo
+                chave = f"{ref} {cor_maq}" if cor_maq else ref
+                referencias[chave] = tempo
 
             if not referencias:
                 continue
@@ -551,8 +553,8 @@ def _chave_pedido(p: dict, ref_data: dict) -> str:
     Tenta 'referencia cor' (específico por cor), cai para 'referencia' genérica.
     Ex.: ref='M60109' cor='2410' → tenta 'M60109 2410', senão usa 'M60109'.
     """
-    ref = p['referencia']
-    cor = (p.get('cor') or '').strip()
+    ref = ' '.join((p['referencia'] or '').split())
+    cor = ' '.join((p.get('cor') or '').split())
     if cor and cor != '-':
         combined = f"{ref} {cor}"
         if combined in ref_data:
@@ -1408,8 +1410,8 @@ def _detectar_lacunas(pedidos: list, modelos: dict) -> list:
     vistos    = set()
     sugestoes = []
     for p in pedidos:
-        ref = p['referencia']
-        cor = (p.get('cor') or '').strip()
+        ref = ' '.join((p['referencia'] or '').split())
+        cor = ' '.join((p.get('cor') or '').split())
         if not cor or cor == '-':
             continue
         chave = (ref, cor)
@@ -1489,7 +1491,7 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
 
     print()
     print('   ➡  Abra a aba da máquina na planilha, adicione uma linha com:')
-    print('      coluna G = "referencia cor"  |  coluna B = tempo de produção (h)')
+    print('      coluna G = referencia  |  coluna F = cor  |  coluna B = tempo de produção (h)')
     print('─' * 60)
 
     # ── 4. Loop até detectar o cadastro real na planilha ─────────────────────
