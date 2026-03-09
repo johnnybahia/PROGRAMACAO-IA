@@ -122,6 +122,65 @@ function carregarDadosCadastro() {
 }
 
 /**
+ * Retorna todos os dados vinculados a uma referência:
+ * cores únicas, larguras únicas, todas as combinações (cor+larg→tempos por aba)
+ * e temposGerais (primeiro tempo encontrado por aba, independente de cor/larg).
+ * Usado para pré-carregar o formulário ao digitar a referência.
+ */
+function buscarDadosPorReferencia(ref) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abas = ss.getSheets();
+  var refN = ref.trim().toUpperCase();
+
+  var coresSet    = {};
+  var largurasSet = {};
+  var combinacoes = {};   // chave: "COR||LARG"
+  var temposGerais = {};  // primeiro tempo por aba (qualquer cor/larg)
+
+  for (var i = 0; i < abas.length; i++) {
+    var aba  = abas[i];
+    var nome = aba.getName().trim();
+    if (nome.indexOf(PREFIXO_DADOS) !== 0) continue;
+
+    var dados = aba.getDataRange().getValues();
+    for (var r = 1; r < dados.length; r++) {
+      var linha  = dados[r];
+      var lCor   = String(linha[5] || "").trim();
+      var lRef   = String(linha[6] || "").trim().toUpperCase();
+      var lLarg  = String(linha[7] || "").trim();
+      var lTempo = linha[8];
+
+      if (lRef !== refN) continue;
+
+      if (lCor)  coresSet[lCor]    = true;
+      if (lLarg) largurasSet[lLarg] = true;
+
+      if (lTempo === "" || lTempo === null) continue;
+      var tv = parseFloat(String(lTempo).replace(",", "."));
+      if (isNaN(tv)) continue;
+
+      // temposGerais: primeiro encontrado por aba
+      if (!temposGerais[nome]) temposGerais[nome] = tv;
+
+      // combinações cor+larg por aba
+      var key = lCor + "||" + lLarg;
+      if (!combinacoes[key]) combinacoes[key] = { cor: lCor, larg: lLarg, tempos: {} };
+      if (!combinacoes[key].tempos[nome]) combinacoes[key].tempos[nome] = tv;
+    }
+  }
+
+  var combArray = [];
+  for (var k in combinacoes) combArray.push(combinacoes[k]);
+
+  return {
+    cores:        Object.keys(coresSet).sort(),
+    larguras:     Object.keys(largurasSet).sort(),
+    combinacoes:  combArray,
+    temposGerais: temposGerais
+  };
+}
+
+/**
  * Busca os tempos (coluna I) já cadastrados para ref+cor+larg em cada aba DADOS_*.
  * Retorna objeto {nomeAba: tempo} apenas onde encontrado.
  */
