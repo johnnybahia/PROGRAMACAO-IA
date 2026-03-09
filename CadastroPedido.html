@@ -288,41 +288,48 @@ function carregarTemposPorCombinacao() {
   var cor  = document.getElementById('inputCor').value.trim().toUpperCase();
   var larg = document.getElementById('inputLarg').value.trim().toUpperCase();
 
+  var corExiste  = cor  && dadosRef.cores.some(function(c)    { return c.toUpperCase() === cor;  });
+  var largExiste = larg && dadosRef.larguras.some(function(l) { return l.toUpperCase() === larg; });
+
+  // Largura nova (não existe na ref) → tudo em branco para o usuário preencher
+  if (larg && !largExiste) {
+    renderizarTabela(dadosServidor.maquinas, {}, {});
+    return;
+  }
+
+  // Sem cor e sem larg → tempos gerais da referência
   if (!cor && !larg) {
     renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
     return;
   }
 
-  // Verifica se a cor digitada já existe nesta referência
-  var corExiste = dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
-
-  // temposExatos: combinação cor+larg exata (para marcar "Existente")
-  var temposExatos = {};
-  // temposSugeridos: qualquer cor com essa larg (sugestão quando cor é nova)
-  var temposSugeridos = {};
+  var temposExibir = {};  // o que aparece nos campos
+  var temposExatos = {};  // combinação exata cor+larg (badge Existente / checkbox marcada)
 
   dadosRef.combinacoes.forEach(function(c) {
     var cCor  = c.cor.toUpperCase();
     var cLarg = c.larg.toUpperCase();
-    var corOk  = !cor  || cCor  === cor;
-    var largOk = !larg || cLarg === larg;
 
-    if (corOk && largOk) {
+    // Filtro cor: se cor existe na ref → filtra por ela; cor nova → ignora (mostra tudo)
+    var passaCor  = !cor  || !corExiste || cCor  === cor;
+    // Filtro larg: se larg informada → filtra; senão passa tudo
+    var passaLarg = !larg || cLarg === larg;
+
+    if (passaCor && passaLarg) {
+      for (var aba in c.tempos) {
+        if (!temposExibir[aba]) temposExibir[aba] = c.tempos[aba];
+      }
+    }
+
+    // Exato: ambos fornecidos, ambos existem e batem
+    if (corExiste && largExiste && cCor === cor && cLarg === larg) {
       for (var aba in c.tempos) {
         if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba];
       }
     }
-    // Quando cor é nova: busca tempos por larg em qualquer cor (sugestão)
-    if (!corExiste && largOk) {
-      for (var aba in c.tempos) {
-        if (!temposSugeridos[aba]) temposSugeridos[aba] = c.tempos[aba];
-      }
-    }
   });
 
-  // Se cor existente: usa tempos exatos; se cor nova: usa sugestão por larg
-  var temposParaExibir = corExiste ? temposExatos : temposSugeridos;
-  renderizarTabela(dadosServidor.maquinas, temposParaExibir, temposExatos);
+  renderizarTabela(dadosServidor.maquinas, temposExibir, temposExatos);
 }
 
 function atualizarHintLarg() {
