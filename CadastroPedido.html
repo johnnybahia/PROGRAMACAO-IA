@@ -41,6 +41,13 @@
     tr:last-child td { border-bottom: none; }
     tr:nth-child(even) td { background: #fafafa; }
 
+    .badge {
+      display: inline-block; padding: 2px 7px; border-radius: 10px;
+      font-size: 10px; font-weight: bold; letter-spacing: 0.3px;
+    }
+    .badge-existente { background: #d4edda; color: #155724; border: 1px solid #b8dfc5; }
+    .badge-novo      { background: #fff3cd; color: #856404; border: 1px solid #ffe4a0; }
+
     input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
     input.tempo-input {
       width: 80px; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px;
@@ -100,12 +107,13 @@
   <thead>
     <tr>
       <th>Máquina</th>
+      <th style="width:75px;text-align:center;">Status</th>
       <th style="width:80px;text-align:center;">Selecionar</th>
       <th style="width:90px;text-align:center;">Tempo (horas)</th>
     </tr>
   </thead>
   <tbody id="tbodyMaquinas">
-    <tr><td colspan="3" style="text-align:center;color:#999;padding:16px;">Carregando...</td></tr>
+    <tr><td colspan="4" style="text-align:center;color:#999;padding:16px;">Carregando...</td></tr>
   </tbody>
 </table>
 
@@ -243,6 +251,15 @@ document.getElementById('inputRef').addEventListener('change', buscarTempos);
 document.getElementById('inputCor').addEventListener('change', buscarTempos);
 document.getElementById('inputLarg').addEventListener('change', buscarTempos);
 
+// Busca automática ao digitar a referência (com debounce de 400ms)
+var _debounceRef = null;
+document.getElementById('inputRef').addEventListener('input', function() {
+  clearTimeout(_debounceRef);
+  var val = document.getElementById('inputRef').value.trim();
+  if (val.length < 2) return; // aguarda ao menos 2 caracteres
+  _debounceRef = setTimeout(buscarTempos, 400);
+});
+
 // ── Buscar tempos existentes ────────────────────────────────
 function buscarTempos() {
   var ref  = document.getElementById('inputRef').value.trim();
@@ -265,7 +282,7 @@ function buscarTempos() {
 function renderizarTabela(maquinas, tempos) {
   var tbody = document.getElementById('tbodyMaquinas');
   if (!maquinas || maquinas.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#999;padding:16px;">Nenhuma máquina encontrada.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#999;padding:16px;">Nenhuma máquina encontrada.</td></tr>';
     return;
   }
 
@@ -275,9 +292,13 @@ function renderizarTabela(maquinas, tempos) {
     var temExt = tempo !== '';
     var checkedAttr = temExt ? 'checked' : '';
     var classTempo = temExt ? ' preenchido' : '';
+    var badge = temExt
+      ? '<span class="badge badge-existente">Existente</span>'
+      : '<span class="badge badge-novo">Novo</span>';
 
     html += '<tr>';
     html += '<td>' + escapeHtml(m.nomeMaquina) + '</td>';
+    html += '<td style="text-align:center;">' + badge + '</td>';
     html += '<td style="text-align:center;"><input type="checkbox" class="chk-maquina" data-aba="' + escapeHtml(m.nomeAba) + '" ' + checkedAttr + '></td>';
     html += '<td style="text-align:center;"><input type="text" class="tempo-input' + classTempo + '" data-aba="' + escapeHtml(m.nomeAba) + '" value="' + escapeHtml(String(tempo)) + '" placeholder="Tempo"></td>';
     html += '</tr>';
