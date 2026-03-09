@@ -297,37 +297,29 @@ function carregarTemposPorCombinacao() {
     return;
   }
 
-  // Sem cor e sem larg → tempos gerais da referência
-  if (!cor && !larg) {
-    renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
-    return;
+  // temposExibir: SEMPRE baseado na referência inteira, filtrado só por larg (se informada)
+  // A cor NÃO filtra temposExibir — a tabela mostra todas as máquinas onde a ref existe
+  var temposExibir = !larg
+    ? (dadosRef.temposGerais || {})   // sem larg → tempos gerais da ref
+    : (function() {                    // com larg → filtra por larg em qualquer cor
+        var t = {};
+        dadosRef.combinacoes.forEach(function(c) {
+          if (c.larg.toUpperCase() === larg) {
+            for (var aba in c.tempos) { if (!t[aba]) t[aba] = c.tempos[aba]; }
+          }
+        });
+        return t;
+      })();
+
+  // temposExatos: só quando cor+larg exatos existem (badge "Existente" + checkbox marcada)
+  var temposExatos = {};
+  if (corExiste && largExiste) {
+    dadosRef.combinacoes.forEach(function(c) {
+      if (c.cor.toUpperCase() === cor && c.larg.toUpperCase() === larg) {
+        for (var aba in c.tempos) { if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba]; }
+      }
+    });
   }
-
-  var temposExibir = {};  // o que aparece nos campos
-  var temposExatos = {};  // combinação exata cor+larg (badge Existente / checkbox marcada)
-
-  dadosRef.combinacoes.forEach(function(c) {
-    var cCor  = c.cor.toUpperCase();
-    var cLarg = c.larg.toUpperCase();
-
-    // Filtro cor: se cor existe na ref → filtra por ela; cor nova → ignora (mostra tudo)
-    var passaCor  = !cor  || !corExiste || cCor  === cor;
-    // Filtro larg: se larg informada → filtra; senão passa tudo
-    var passaLarg = !larg || cLarg === larg;
-
-    if (passaCor && passaLarg) {
-      for (var aba in c.tempos) {
-        if (!temposExibir[aba]) temposExibir[aba] = c.tempos[aba];
-      }
-    }
-
-    // Exato: ambos fornecidos, ambos existem e batem
-    if (corExiste && largExiste && cCor === cor && cLarg === larg) {
-      for (var aba in c.tempos) {
-        if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba];
-      }
-    }
-  });
 
   renderizarTabela(dadosServidor.maquinas, temposExibir, temposExatos);
 }
