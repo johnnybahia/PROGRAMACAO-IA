@@ -152,7 +152,9 @@ function optsRef()  { return dadosServidor.referencias; }
 function optsCor()  { return dadosRef.cores.length  > 0 ? dadosRef.cores  : dadosServidor.cores;  }
 function optsLarg() {
   var cor = document.getElementById('inputCor').value.trim().toUpperCase();
-  if (cor && dadosRef.combinacoes.length > 0) {
+  var corExiste = cor && dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
+  // Só filtra por cor se ela existir na referência; cor nova → mostra todas as larguras da ref
+  if (corExiste && dadosRef.combinacoes.length > 0) {
     var set = {};
     dadosRef.combinacoes.forEach(function(c) {
       if (c.cor.toUpperCase() === cor) set[c.larg] = true;
@@ -272,8 +274,8 @@ function buscarPorReferencia() {
       setHint('hintLarg', dadosRef.larguras.length  > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
 
       // Mostra tempos gerais (sem filtrar por cor/larg) enquanto o usuário escolhe
-      temposExistentes = dadosRef.temposGerais || {};
-      renderizarTabela(dadosServidor.maquinas, temposExistentes);
+      // temposExatos = {} porque ainda não há cor+larg selecionados
+      renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
     })
     .withFailureHandler(function(e) {
       mostrarStatus('Erro ao buscar referência: ' + e.message, 'erro');
@@ -287,35 +289,49 @@ function carregarTemposPorCombinacao() {
   var larg = document.getElementById('inputLarg').value.trim().toUpperCase();
 
   if (!cor && !larg) {
-    // Nada selecionado: mostra tempos gerais
-    temposExistentes = dadosRef.temposGerais || {};
-    renderizarTabela(dadosServidor.maquinas, temposExistentes);
+    renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
     return;
   }
 
-  // Procura nas combinações já carregadas
-  var tempos = {};
+  // Verifica se a cor digitada já existe nesta referência
+  var corExiste = dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
+
+  // temposExatos: combinação cor+larg exata (para marcar "Existente")
+  var temposExatos = {};
+  // temposSugeridos: qualquer cor com essa larg (sugestão quando cor é nova)
+  var temposSugeridos = {};
+
   dadosRef.combinacoes.forEach(function(c) {
-    var corOk  = !cor  || c.cor.toUpperCase()  === cor;
-    var largOk = !larg || c.larg.toUpperCase() === larg;
+    var cCor  = c.cor.toUpperCase();
+    var cLarg = c.larg.toUpperCase();
+    var corOk  = !cor  || cCor  === cor;
+    var largOk = !larg || cLarg === larg;
+
     if (corOk && largOk) {
       for (var aba in c.tempos) {
-        if (!tempos[aba]) tempos[aba] = c.tempos[aba];
+        if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba];
+      }
+    }
+    // Quando cor é nova: busca tempos por larg em qualquer cor (sugestão)
+    if (!corExiste && largOk) {
+      for (var aba in c.tempos) {
+        if (!temposSugeridos[aba]) temposSugeridos[aba] = c.tempos[aba];
       }
     }
   });
 
-  temposExistentes = tempos;
-  renderizarTabela(dadosServidor.maquinas, temposExistentes);
+  // Se cor existente: usa tempos exatos; se cor nova: usa sugestão por larg
+  var temposParaExibir = corExiste ? temposExatos : temposSugeridos;
+  renderizarTabela(dadosServidor.maquinas, temposParaExibir, temposExatos);
 }
 
 function atualizarHintLarg() {
   var cor = document.getElementById('inputCor').value.trim().toUpperCase();
-  var largs = optsLarg();
-  if (cor && largs.length > 0 && dadosRef.combinacoes.length > 0) {
-    setHint('hintLarg', largs.length + ' largura(s) para essa cor');
-  } else if (dadosRef.larguras.length > 0) {
-    setHint('hintLarg', dadosRef.larguras.length + ' largura(s) disponível(is)');
+  var corExiste = dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
+  // Quando cor é nova: mostra todas as larguras da referência
+  var largs = corExiste ? optsLarg() : dadosRef.larguras;
+  if (largs.length > 0) {
+    setHint('hintLarg', largs.length + ' largura(s) disponível(is)' + (corExiste ? ' para essa cor' : ' na referência'));
   } else {
     setHint('hintLarg', '');
   }
@@ -327,7 +343,10 @@ function setHint(id, txt) {
 }
 
 // ── Renderizar tabela de máquinas ───────────────────────────
-function renderizarTabela(maquinas, tempos) {
+// tempos: valores a exibir nos campos (podem ser sugestões de outra cor)
+// temposExatos: combinação cor+larg exata — define badge "Existente" e checkbox marcada
+function renderizarTabela(maquinas, tempos, temposExatos) {
+  temposExatos = temposExatos || {};
   var tbody = document.getElementById('tbodyMaquinas');
   if (!maquinas || maquinas.length === 0) {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#999;padding:16px;">Nenhuma máquina encontrada.</td></tr>';
@@ -335,14 +354,18 @@ function renderizarTabela(maquinas, tempos) {
   }
   var html = '';
   maquinas.forEach(function(m) {
-    var tempo    = tempos[m.nomeAba] !== undefined ? tempos[m.nomeAba] : '';
-    var temExt   = tempo !== '';
-    var badge    = temExt ? '<span class="badge badge-existente">Existente</span>' : '<span class="badge badge-novo">Novo</span>';
+    var tempo  = tempos[m.nomeAba]      !== undefined ? tempos[m.nomeAba]      : '';
+    var exato  = temposExatos[m.nomeAba] !== undefined;  // combinação exata existe
+    var badge  = exato
+      ? '<span class="badge badge-existente">Existente</span>'
+      : '<span class="badge badge-novo">Novo</span>';
+    // Checkbox marcada apenas quando combinação exata existe; senão o usuário escolhe
+    var checked = exato ? 'checked' : '';
     html += '<tr>';
     html += '<td>' + escapeHtml(m.nomeMaquina) + '</td>';
     html += '<td style="text-align:center;">' + badge + '</td>';
-    html += '<td style="text-align:center;"><input type="checkbox" class="chk-maquina" data-aba="' + escapeHtml(m.nomeAba) + '" ' + (temExt ? 'checked' : '') + '></td>';
-    html += '<td style="text-align:center;"><input type="text" class="tempo-input' + (temExt ? ' preenchido' : '') + '" data-aba="' + escapeHtml(m.nomeAba) + '" value="' + escapeHtml(String(tempo)) + '" placeholder="Tempo"></td>';
+    html += '<td style="text-align:center;"><input type="checkbox" class="chk-maquina" data-aba="' + escapeHtml(m.nomeAba) + '" ' + checked + '></td>';
+    html += '<td style="text-align:center;"><input type="text" class="tempo-input' + (tempo !== '' ? ' preenchido' : '') + '" data-aba="' + escapeHtml(m.nomeAba) + '" value="' + escapeHtml(String(tempo)) + '" placeholder="Tempo"></td>';
     html += '</tr>';
   });
   tbody.innerHTML = html;
