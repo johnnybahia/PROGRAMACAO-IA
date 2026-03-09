@@ -46,6 +46,8 @@ const CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("📦 Produção")
+    .addItem("➕ Cadastrar Produto", "abrirCadastroPedido")
+    .addSeparator()
     .addItem("▶ Analisar Distribuição", "analisarDistribuicao")
     .addItem("📊 Comparar Estratégias de Distribuição", "analisarDistribuicao")
     .addSeparator()
@@ -53,6 +55,217 @@ function onOpen() {
     .addSeparator()
     .addItem("🗑 Limpar aba Distribuição", "limparDistribuicao")
     .addToUi();
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// CADASTRO DE PRODUTOS
+// ═══════════════════════════════════════════════════════════
+
+// Prefixo que identifica abas de dados de máquinas
+var PREFIXO_DADOS = "DADOS_";
+// Nome parcial da aba FUSO 2X2 (para soma de N1)
+var FUSO_2X2_KEYWORD = "2X2";
+
+/**
+ * Abre o formulário de cadastro de produto
+ */
+function abrirCadastroPedido() {
+  var html = HtmlService.createHtmlOutputFromFile("CadastroPedido")
+    .setWidth(520)
+    .setHeight(620)
+    .setTitle("Cadastrar Produto");
+  SpreadsheetApp.getUi().showModalDialog(html, "Inserir Dados do Produto");
+}
+
+/**
+ * Retorna ao formulário HTML todos os dados necessários para autocomplete e tabela de máquinas.
+ * Chamado via google.script.run no carregamento do dialog.
+ */
+function carregarDadosCadastro() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abas = ss.getSheets();
+
+  var refsSet    = {};
+  var coresSet   = {};
+  var largurasSet = {};
+  var maquinas   = [];
+
+  for (var i = 0; i < abas.length; i++) {
+    var aba = abas[i];
+    var nome = aba.getName().trim();
+    if (nome.indexOf(PREFIXO_DADOS) !== 0) continue;
+
+    // Nome amigável da máquina: L1, senão nome da aba
+    var nomeMaquina = String(aba.getRange("L1").getValue()).trim() || nome;
+    maquinas.push({ nomeAba: nome, nomeMaquina: nomeMaquina });
+
+    // Lê dados a partir da linha 2
+    var dados = aba.getDataRange().getValues();
+    for (var r = 1; r < dados.length; r++) {
+      var linha = dados[r];
+      var cor  = String(linha[5] || "").trim();   // Coluna F (índice 5)
+      var ref  = String(linha[6] || "").trim();   // Coluna G (índice 6)
+      var larg = String(linha[7] || "").trim();   // Coluna H (índice 7)
+      if (ref)  refsSet[ref]     = true;
+      if (cor)  coresSet[cor]    = true;
+      if (larg) largurasSet[larg] = true;
+    }
+  }
+
+  return {
+    referencias: Object.keys(refsSet).sort(),
+    cores:       Object.keys(coresSet).sort(),
+    larguras:    Object.keys(largurasSet).sort(),
+    maquinas:    maquinas
+  };
+}
+
+/**
+ * Busca os tempos (coluna I) já cadastrados para ref+cor+larg em cada aba DADOS_*.
+ * Retorna objeto {nomeAba: tempo} apenas onde encontrado.
+ */
+function buscarTemposExistentes(ref, cor, larg) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abas = ss.getSheets();
+  var resultado = {};
+
+  var refN  = ref.trim().toUpperCase();
+  var corN  = cor.trim().toUpperCase();
+  var largN = larg.trim().toUpperCase();
+
+  for (var i = 0; i < abas.length; i++) {
+    var aba = abas[i];
+    var nome = aba.getName().trim();
+    if (nome.indexOf(PREFIXO_DADOS) !== 0) continue;
+
+    var dados = aba.getDataRange().getValues();
+    for (var r = 1; r < dados.length; r++) {
+      var linha = dados[r];
+      var lCor  = String(linha[5] || "").trim().toUpperCase();
+      var lRef  = String(linha[6] || "").trim().toUpperCase();
+      var lLarg = String(linha[7] || "").trim().toUpperCase();
+      var lTempo = linha[8]; // Coluna I (índice 8)
+
+      // Busca com/sem cor e largura para ser tolerante
+      if (lRef === refN) {
+        var corOk  = !corN  || lCor  === corN;
+        var largOk = !largN || lLarg === largN;
+        if (corOk && largOk && lTempo !== "" && lTempo !== null) {
+          resultado[nome] = parseFloat(String(lTempo).replace(",", ".")) || "";
+          break;
+        }
+      }
+    }
+  }
+
+  return resultado;
+}
+
+/**
+ * Insere o cadastro nas abas selecionadas.
+ * payload = { referencia, cor, largura, maquinas: [{nomeAba, tempo}] }
+ */
+function inserirCadastroPedido(payload) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ref  = String(payload.referencia || "").trim();
+  var cor  = String(payload.cor  || "").trim();
+  var larg = String(payload.largura || "").trim();
+  var maquinasSel = payload.maquinas || [];
+
+  if (!ref || !cor || !larg || maquinasSel.length === 0) {
+    return { ok: false, msg: "Dados incompletos." };
+  }
+
+  var descricaoItem = ref + " " + cor + " " + larg; // Coluna A
+  var inseridos = 0;
+  var erros = [];
+
+  for (var i = 0; i < maquinasSel.length; i++) {
+    var sel = maquinasSel[i];
+    var nomeAba = sel.nomeAba;
+    var tempoI  = parseFloat(String(sel.tempo).replace(",", "."));
+
+    if (isNaN(tempoI)) {
+      erros.push(nomeAba + ": tempo inválido");
+      continue;
+    }
+
+    var aba = ss.getSheetByName(nomeAba);
+    if (!aba) {
+      erros.push(nomeAba + ": aba não encontrada");
+      continue;
+    }
+
+    // Encontra primeira linha livre na coluna A (a partir da linha 2)
+    var ultimaLinha = aba.getLastRow();
+    var linhaLivre = -1;
+
+    if (ultimaLinha < 2) {
+      linhaLivre = 2;
+    } else {
+      var colA = aba.getRange(2, 1, ultimaLinha, 1).getValues();
+      for (var r = 0; r < colA.length; r++) {
+        if (String(colA[r][0]).trim() === "") {
+          linhaLivre = r + 2;
+          break;
+        }
+      }
+      if (linhaLivre === -1) linhaLivre = ultimaLinha + 1;
+    }
+
+    // Ler M1 e N1
+    var m1 = 0;
+    var n1 = 0;
+    try {
+      var m1Val = aba.getRange("M1").getValue();
+      m1 = parseFloat(String(m1Val).replace(",", ".")) || 0;
+    } catch(e) { m1 = 0; }
+
+    var eFuso2x2 = nomeAba.toUpperCase().indexOf(FUSO_2X2_KEYWORD) !== -1;
+    if (eFuso2x2) {
+      try {
+        var n1Val = aba.getRange("N1").getValue();
+        n1 = parseFloat(String(n1Val).replace(",", ".")) || 0;
+      } catch(e) { n1 = 0; }
+    }
+
+    // Verificar se a referência já está na aba (para decidir somar N1)
+    var refNaAba = false;
+    if (eFuso2x2) {
+      var dadosAba = aba.getDataRange().getValues();
+      for (var rr = 1; rr < dadosAba.length; rr++) {
+        if (String(dadosAba[rr][6] || "").trim().toUpperCase() === ref.toUpperCase()) {
+          refNaAba = true;
+          break;
+        }
+      }
+    }
+
+    // Coluna B: tempo de produção = I + M1 [+ N1 se fuso 2x2 e ref já existe]
+    var tempoProd = tempoI + m1;
+    if (eFuso2x2 && refNaAba) tempoProd += n1;
+
+    // Inserir valores
+    aba.getRange(linhaLivre, 1).setValue(descricaoItem);         // A: ITEM
+    aba.getRange(linhaLivre, 2).setValue(tempoProd);             // B: TEMPO DE PRODUÇÃO
+    aba.getRange(linhaLivre, 6).setValue(cor);                   // F: COR
+    aba.getRange(linhaLivre, 7).setValue(ref);                   // G: REFERENCIA
+    aba.getRange(linhaLivre, 8).setValue(larg);                  // H: LARGURA
+    aba.getRange(linhaLivre, 9).setValue(tempoI);                // I: TEMPO DE PRODUÇÃO (base)
+
+    inseridos++;
+  }
+
+  if (erros.length > 0 && inseridos === 0) {
+    return { ok: false, msg: "Erros: " + erros.join("; ") };
+  }
+
+  return {
+    ok: true,
+    inseridos: inseridos,
+    msg: erros.length > 0 ? "Inserido em " + inseridos + " aba(s). Erros: " + erros.join("; ") : ""
+  };
 }
 
 
