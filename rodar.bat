@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title Otimizador de Producao
 
-set URL_PLANILHA="https://docs.google.com/spreadsheets/d/COLE_O_ID_DA_PLANILHA_AQUI"
+set URL_PLANILHA="https://docs.google.com/spreadsheets/d/1TP1rN4V8nz2d7pTqPXXzK4I75ROkxDv-0GMQIx6R9SU/edit?usp=drive_link"
 set CREDENCIAIS="credenciais.json"
 
 echo Instalando dependencias...
