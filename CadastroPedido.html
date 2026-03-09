@@ -74,6 +74,7 @@
 
     .spinner { display: none; text-align: center; padding: 8px; color: #666; }
     .spinner.visible { display: block; }
+    .field-hint { font-size: 11px; color: #888; margin-top: 3px; min-height: 14px; }
   </style>
 </head>
 <body>
@@ -92,6 +93,7 @@
   <label for="inputCor">Cor:</label>
   <input type="text" id="inputCor" placeholder="Digite a cor..." autocomplete="off">
   <div class="autocomplete-list" id="listCor"></div>
+  <div class="field-hint" id="hintCor"></div>
 </div>
 
 <!-- Largura -->
@@ -99,6 +101,7 @@
   <label for="inputLarg">Largura:</label>
   <input type="text" id="inputLarg" placeholder="Digite a largura..." autocomplete="off">
   <div class="autocomplete-list" id="listLarg"></div>
+  <div class="field-hint" id="hintLarg"></div>
 </div>
 
 <!-- Tabela Máquinas -->
@@ -126,16 +129,10 @@
 </div>
 
 <script>
-// ── Dados carregados do servidor ────────────────────────────
-var dadosServidor = {
-  referencias: [],   // lista única de referências (col G de todas as abas DADOS_*)
-  cores: [],         // lista única de cores (col F)
-  larguras: [],      // lista única de larguras (col H)
-  maquinas: []       // [{nomeAba, nomeMaquina}]
-};
-
-// ── Estado atual ────────────────────────────────────────────
-var temposExistentes = {}; // {nomeAba: tempo} para ref+cor+larg atual
+// ── Estado ──────────────────────────────────────────────────
+var dadosServidor = { referencias: [], cores: [], larguras: [], maquinas: [] };
+var dadosRef      = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
+var temposExistentes = {};
 
 // ── Inicialização ───────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
@@ -150,6 +147,22 @@ document.addEventListener('DOMContentLoaded', function() {
     .carregarDadosCadastro();
 });
 
+// ── Fontes dinâmicas dos autocompletes ──────────────────────
+function optsRef()  { return dadosServidor.referencias; }
+function optsCor()  { return dadosRef.cores.length  > 0 ? dadosRef.cores  : dadosServidor.cores;  }
+function optsLarg() {
+  var cor = document.getElementById('inputCor').value.trim().toUpperCase();
+  if (cor && dadosRef.combinacoes.length > 0) {
+    var set = {};
+    dadosRef.combinacoes.forEach(function(c) {
+      if (c.cor.toUpperCase() === cor) set[c.larg] = true;
+    });
+    var filtradas = Object.keys(set).sort();
+    if (filtradas.length > 0) return filtradas;
+  }
+  return dadosRef.larguras.length > 0 ? dadosRef.larguras : dadosServidor.larguras;
+}
+
 // ── Autocomplete genérico ───────────────────────────────────
 function setupAutocomplete(inputId, listId, getOptions) {
   var inp = document.getElementById(inputId);
@@ -158,14 +171,11 @@ function setupAutocomplete(inputId, listId, getOptions) {
 
   inp.addEventListener('input', function() {
     var val = inp.value.trim().toUpperCase();
-    var opts = getOptions().filter(function(o) {
-      return o.toUpperCase().indexOf(val) !== -1;
-    });
-    // Ordena: começa com o digitado primeiro
+    var opts = getOptions().filter(function(o) { return o.toUpperCase().indexOf(val) !== -1; });
     opts.sort(function(a, b) {
-      var aStart = a.toUpperCase().startsWith(val) ? 0 : 1;
-      var bStart = b.toUpperCase().startsWith(val) ? 0 : 1;
-      return aStart - bStart || a.localeCompare(b);
+      var aS = a.toUpperCase().startsWith(val) ? 0 : 1;
+      var bS = b.toUpperCase().startsWith(val) ? 0 : 1;
+      return aS - bS || a.localeCompare(b);
     });
     renderList(lst, inp, opts, val);
     selectedIdx = -1;
@@ -173,49 +183,29 @@ function setupAutocomplete(inputId, listId, getOptions) {
 
   inp.addEventListener('keydown', function(e) {
     var items = lst.querySelectorAll('.autocomplete-item');
-    if (e.key === 'ArrowDown') {
-      selectedIdx = Math.min(selectedIdx + 1, items.length - 1);
-      atualizarSelecao(items, selectedIdx);
-      e.preventDefault();
-    } else if (e.key === 'ArrowUp') {
-      selectedIdx = Math.max(selectedIdx - 1, 0);
-      atualizarSelecao(items, selectedIdx);
-      e.preventDefault();
-    } else if (e.key === 'Enter' && selectedIdx >= 0) {
-      items[selectedIdx].click();
-      e.preventDefault();
-    } else if (e.key === 'Escape') {
-      fecharLista(lst);
-    }
+    if (e.key === 'ArrowDown')      { selectedIdx = Math.min(selectedIdx + 1, items.length - 1); atualizarSelecao(items, selectedIdx); e.preventDefault(); }
+    else if (e.key === 'ArrowUp')   { selectedIdx = Math.max(selectedIdx - 1, 0); atualizarSelecao(items, selectedIdx); e.preventDefault(); }
+    else if (e.key === 'Enter' && selectedIdx >= 0) { items[selectedIdx].click(); e.preventDefault(); }
+    else if (e.key === 'Escape')    { fecharLista(lst); }
   });
 
-  document.addEventListener('click', function(e) {
-    if (e.target !== inp) fecharLista(lst);
-  });
+  document.addEventListener('click', function(e) { if (e.target !== inp) fecharLista(lst); });
 }
 
 function renderList(lst, inp, opts, query) {
-  if (opts.length === 0 || !inp.value.trim()) {
-    fecharLista(lst);
-    return;
-  }
+  if (opts.length === 0 || !inp.value.trim()) { fecharLista(lst); return; }
   var html = '';
   opts.slice(0, 40).forEach(function(opt) {
-    var escapedOpt = escapeHtml(opt);
-    var highlighted = escapedOpt;
+    var esc = escapeHtml(opt);
+    var hi  = esc;
     if (query) {
       var idx = opt.toUpperCase().indexOf(query.toUpperCase());
-      if (idx !== -1) {
-        highlighted = escapeHtml(opt.substring(0, idx))
-          + '<mark>' + escapeHtml(opt.substring(idx, idx + query.length)) + '</mark>'
-          + escapeHtml(opt.substring(idx + query.length));
-      }
+      if (idx !== -1) hi = escapeHtml(opt.substring(0, idx)) + '<mark>' + escapeHtml(opt.substring(idx, idx + query.length)) + '</mark>' + escapeHtml(opt.substring(idx + query.length));
     }
-    html += '<div class="autocomplete-item" data-value="' + escapedOpt + '">' + highlighted + '</div>';
+    html += '<div class="autocomplete-item" data-value="' + esc + '">' + hi + '</div>';
   });
   lst.innerHTML = html;
   lst.classList.add('visible');
-
   lst.querySelectorAll('.autocomplete-item').forEach(function(item) {
     item.addEventListener('click', function() {
       inp.value = item.getAttribute('data-value');
@@ -226,60 +216,114 @@ function renderList(lst, inp, opts, query) {
 }
 
 function atualizarSelecao(items, idx) {
-  items.forEach(function(el, i) {
-    el.classList.toggle('selected', i === idx);
-  });
+  items.forEach(function(el, i) { el.classList.toggle('selected', i === idx); });
   if (items[idx]) items[idx].scrollIntoView({ block: 'nearest' });
 }
-
-function fecharLista(lst) {
-  lst.classList.remove('visible');
-  lst.innerHTML = '';
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+function fecharLista(lst) { lst.classList.remove('visible'); lst.innerHTML = ''; }
+function escapeHtml(str) { return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // ── Setup autocompletes ─────────────────────────────────────
-setupAutocomplete('inputRef', 'listRef', function() { return dadosServidor.referencias; });
-setupAutocomplete('inputCor', 'listCor', function() { return dadosServidor.cores; });
-setupAutocomplete('inputLarg', 'listLarg', function() { return dadosServidor.larguras; });
+setupAutocomplete('inputRef',  'listRef',  optsRef);
+setupAutocomplete('inputCor',  'listCor',  optsCor);
+setupAutocomplete('inputLarg', 'listLarg', optsLarg);
 
-// Ao mudar qualquer campo, recarrega tempos
-document.getElementById('inputRef').addEventListener('change', buscarTempos);
-document.getElementById('inputCor').addEventListener('change', buscarTempos);
-document.getElementById('inputLarg').addEventListener('change', buscarTempos);
+// ── Eventos ─────────────────────────────────────────────────
 
-// Busca automática ao digitar a referência (com debounce de 400ms)
-var _debounceRef = null;
+// Ref: busca dados ao digitar (debounce 400ms, mín. 2 caracteres)
+var _debRef = null;
 document.getElementById('inputRef').addEventListener('input', function() {
-  clearTimeout(_debounceRef);
-  var val = document.getElementById('inputRef').value.trim();
-  if (val.length < 2) return; // aguarda ao menos 2 caracteres
-  _debounceRef = setTimeout(buscarTempos, 400);
+  clearTimeout(_debRef);
+  var val = this.value.trim();
+  if (val.length < 2) {
+    dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
+    temposExistentes = {};
+    setHint('hintCor', ''); setHint('hintLarg', '');
+    renderizarTabela(dadosServidor.maquinas, {});
+    return;
+  }
+  _debRef = setTimeout(buscarPorReferencia, 400);
+});
+document.getElementById('inputRef').addEventListener('change', function() {
+  if (this.value.trim().length >= 2) buscarPorReferencia();
 });
 
-// ── Buscar tempos existentes ────────────────────────────────
-function buscarTempos() {
-  var ref  = document.getElementById('inputRef').value.trim();
-  var cor  = document.getElementById('inputCor').value.trim();
-  var larg = document.getElementById('inputLarg').value.trim();
+// Cor: atualiza hint de larguras e recarrega tempos
+document.getElementById('inputCor').addEventListener('change', function() {
+  atualizarHintLarg();
+  carregarTemposPorCombinacao();
+});
+
+// Largura: carrega tempos da combinação selecionada
+document.getElementById('inputLarg').addEventListener('change', function() {
+  carregarTemposPorCombinacao();
+});
+
+// ── Busca dados da referência (1 chamada ao servidor) ───────
+function buscarPorReferencia() {
+  var ref = document.getElementById('inputRef').value.trim();
   if (!ref) return;
 
   google.script.run
-    .withSuccessHandler(function(tempos) {
-      // Só substitui os tempos se encontrou algo, ou se a busca foi apenas por ref
-      // Isso evita que digitar cor/larg sem match apague os tempos já carregados
-      if (Object.keys(tempos).length > 0 || (!cor && !larg)) {
-        temposExistentes = tempos || {};
-        renderizarTabela(dadosServidor.maquinas, temposExistentes);
-      }
+    .withSuccessHandler(function(dados) {
+      dadosRef = dados || { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
+
+      // Hints de cor e largura
+      setHint('hintCor',  dadosRef.cores.length    > 0 ? dadosRef.cores.length    + ' cor(es) disponível(is)' : 'Cor nova');
+      setHint('hintLarg', dadosRef.larguras.length  > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
+
+      // Mostra tempos gerais (sem filtrar por cor/larg) enquanto o usuário escolhe
+      temposExistentes = dadosRef.temposGerais || {};
+      renderizarTabela(dadosServidor.maquinas, temposExistentes);
     })
     .withFailureHandler(function(e) {
-      mostrarStatus('Erro ao buscar tempos: ' + e.message, 'erro');
+      mostrarStatus('Erro ao buscar referência: ' + e.message, 'erro');
     })
-    .buscarTemposExistentes(ref, cor, larg);
+    .buscarDadosPorReferencia(ref);
+}
+
+// ── Carrega tempos para ref+cor+larg (sem nova chamada ao servidor) ──
+function carregarTemposPorCombinacao() {
+  var cor  = document.getElementById('inputCor').value.trim().toUpperCase();
+  var larg = document.getElementById('inputLarg').value.trim().toUpperCase();
+
+  if (!cor && !larg) {
+    // Nada selecionado: mostra tempos gerais
+    temposExistentes = dadosRef.temposGerais || {};
+    renderizarTabela(dadosServidor.maquinas, temposExistentes);
+    return;
+  }
+
+  // Procura nas combinações já carregadas
+  var tempos = {};
+  dadosRef.combinacoes.forEach(function(c) {
+    var corOk  = !cor  || c.cor.toUpperCase()  === cor;
+    var largOk = !larg || c.larg.toUpperCase() === larg;
+    if (corOk && largOk) {
+      for (var aba in c.tempos) {
+        if (!tempos[aba]) tempos[aba] = c.tempos[aba];
+      }
+    }
+  });
+
+  temposExistentes = tempos;
+  renderizarTabela(dadosServidor.maquinas, temposExistentes);
+}
+
+function atualizarHintLarg() {
+  var cor = document.getElementById('inputCor').value.trim().toUpperCase();
+  var largs = optsLarg();
+  if (cor && largs.length > 0 && dadosRef.combinacoes.length > 0) {
+    setHint('hintLarg', largs.length + ' largura(s) para essa cor');
+  } else if (dadosRef.larguras.length > 0) {
+    setHint('hintLarg', dadosRef.larguras.length + ' largura(s) disponível(is)');
+  } else {
+    setHint('hintLarg', '');
+  }
+}
+
+function setHint(id, txt) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = txt;
 }
 
 // ── Renderizar tabela de máquinas ───────────────────────────
@@ -289,30 +333,19 @@ function renderizarTabela(maquinas, tempos) {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#999;padding:16px;">Nenhuma máquina encontrada.</td></tr>';
     return;
   }
-
   var html = '';
   maquinas.forEach(function(m) {
-    var tempo = tempos[m.nomeAba] !== undefined ? tempos[m.nomeAba] : '';
-    var temExt = tempo !== '';
-    var checkedAttr = temExt ? 'checked' : '';
-    var classTempo = temExt ? ' preenchido' : '';
-    var badge = temExt
-      ? '<span class="badge badge-existente">Existente</span>'
-      : '<span class="badge badge-novo">Novo</span>';
-
+    var tempo    = tempos[m.nomeAba] !== undefined ? tempos[m.nomeAba] : '';
+    var temExt   = tempo !== '';
+    var badge    = temExt ? '<span class="badge badge-existente">Existente</span>' : '<span class="badge badge-novo">Novo</span>';
     html += '<tr>';
     html += '<td>' + escapeHtml(m.nomeMaquina) + '</td>';
     html += '<td style="text-align:center;">' + badge + '</td>';
-    html += '<td style="text-align:center;"><input type="checkbox" class="chk-maquina" data-aba="' + escapeHtml(m.nomeAba) + '" ' + checkedAttr + '></td>';
-    html += '<td style="text-align:center;"><input type="text" class="tempo-input' + classTempo + '" data-aba="' + escapeHtml(m.nomeAba) + '" value="' + escapeHtml(String(tempo)) + '" placeholder="Tempo"></td>';
+    html += '<td style="text-align:center;"><input type="checkbox" class="chk-maquina" data-aba="' + escapeHtml(m.nomeAba) + '" ' + (temExt ? 'checked' : '') + '></td>';
+    html += '<td style="text-align:center;"><input type="text" class="tempo-input' + (temExt ? ' preenchido' : '') + '" data-aba="' + escapeHtml(m.nomeAba) + '" value="' + escapeHtml(String(tempo)) + '" placeholder="Tempo"></td>';
     html += '</tr>';
   });
   tbody.innerHTML = html;
-
-  // Checkbox habilita/desabilita campo tempo
-  tbody.querySelectorAll('.chk-maquina').forEach(function(chk) {
-    // Não desabilitar — sempre editável, checkbox apenas marca se vai inserir
-  });
 }
 
 // ── Enviar dados ────────────────────────────────────────────
@@ -321,51 +354,32 @@ function enviarDados() {
   var cor  = document.getElementById('inputCor').value.trim();
   var larg = document.getElementById('inputLarg').value.trim();
 
-  if (!ref) { mostrarStatus('Informe a Referência do Produto.', 'erro'); return; }
-  if (!cor) { mostrarStatus('Informe a Cor.', 'erro'); return; }
+  if (!ref)  { mostrarStatus('Informe a Referência do Produto.', 'erro'); return; }
+  if (!cor)  { mostrarStatus('Informe a Cor.', 'erro'); return; }
   if (!larg) { mostrarStatus('Informe a Largura.', 'erro'); return; }
 
   var selecionadas = [];
+  var temErro = false;
   document.querySelectorAll('.chk-maquina:checked').forEach(function(chk) {
-    var nomeAba = chk.getAttribute('data-aba');
+    var nomeAba    = chk.getAttribute('data-aba');
     var tempoInput = document.querySelector('.tempo-input[data-aba="' + nomeAba + '"]');
-    var tempoVal = tempoInput ? tempoInput.value.trim().replace(',', '.') : '';
-    var tempo = parseFloat(tempoVal);
-
-    if (isNaN(tempo) || tempo <= 0) {
-      mostrarStatus('Informe um tempo válido para todas as máquinas selecionadas.', 'erro');
-      return;
-    }
+    var tempo      = parseFloat((tempoInput ? tempoInput.value.trim() : '').replace(',', '.'));
+    if (isNaN(tempo) || tempo <= 0) { temErro = true; return; }
     selecionadas.push({ nomeAba: nomeAba, tempo: tempo });
   });
 
-  if (selecionadas.length === 0) {
-    mostrarStatus('Selecione ao menos uma máquina.', 'erro');
-    return;
-  }
-
-  // Verificar erros de validação nos tempos
-  var temErro = false;
-  document.querySelectorAll('.chk-maquina:checked').forEach(function(chk) {
-    var nomeAba = chk.getAttribute('data-aba');
-    var tempoInput = document.querySelector('.tempo-input[data-aba="' + nomeAba + '"]');
-    var tempoVal = tempoInput ? tempoInput.value.trim().replace(',', '.') : '';
-    var tempo = parseFloat(tempoVal);
-    if (isNaN(tempo) || tempo <= 0) temErro = true;
-  });
-  if (temErro) return;
+  if (temErro) { mostrarStatus('Informe um tempo válido para todas as máquinas selecionadas.', 'erro'); return; }
+  if (selecionadas.length === 0) { mostrarStatus('Selecione ao menos uma máquina.', 'erro'); return; }
 
   document.getElementById('spinner').classList.add('visible');
   document.getElementById('statusMsg').className = 'status-msg';
-
-  var payload = { referencia: ref, cor: cor, largura: larg, maquinas: selecionadas };
 
   google.script.run
     .withSuccessHandler(function(resultado) {
       document.getElementById('spinner').classList.remove('visible');
       if (resultado.ok) {
-        mostrarStatus('✔ Cadastro realizado com sucesso em ' + resultado.inseridos + ' aba(s)!', 'ok');
-        setTimeout(function() { limparForm(); }, 2000);
+        mostrarStatus('✔ Cadastro realizado em ' + resultado.inseridos + ' aba(s)!', 'ok');
+        setTimeout(limparForm, 2000);
       } else {
         mostrarStatus('⚠ ' + resultado.msg, 'erro');
       }
@@ -374,14 +388,14 @@ function enviarDados() {
       document.getElementById('spinner').classList.remove('visible');
       mostrarStatus('Erro ao salvar: ' + e.message, 'erro');
     })
-    .inserirCadastroPedido(payload);
+    .inserirCadastroPedido({ referencia: ref, cor: cor, largura: larg, maquinas: selecionadas });
 }
 
 // ── Limpar formulário ───────────────────────────────────────
 function limparForm() {
-  document.getElementById('inputRef').value = '';
-  document.getElementById('inputCor').value = '';
-  document.getElementById('inputLarg').value = '';
+  ['inputRef','inputCor','inputLarg'].forEach(function(id) { document.getElementById(id).value = ''; });
+  ['hintCor','hintLarg'].forEach(function(id) { setHint(id, ''); });
+  dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
   temposExistentes = {};
   renderizarTabela(dadosServidor.maquinas, {});
   document.getElementById('statusMsg').className = 'status-msg';
