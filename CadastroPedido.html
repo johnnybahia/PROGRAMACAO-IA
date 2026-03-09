@@ -269,8 +269,12 @@ function buscarTempos() {
 
   google.script.run
     .withSuccessHandler(function(tempos) {
-      temposExistentes = tempos || {};
-      renderizarTabela(dadosServidor.maquinas, temposExistentes);
+      // Só substitui os tempos se encontrou algo, ou se a busca foi apenas por ref
+      // Isso evita que digitar cor/larg sem match apague os tempos já carregados
+      if (Object.keys(tempos).length > 0 || (!cor && !larg)) {
+        temposExistentes = tempos || {};
+        renderizarTabela(dadosServidor.maquinas, temposExistentes);
+      }
     })
     .withFailureHandler(function(e) {
       mostrarStatus('Erro ao buscar tempos: ' + e.message, 'erro');
