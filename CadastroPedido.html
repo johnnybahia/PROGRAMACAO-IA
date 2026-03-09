@@ -246,6 +246,7 @@ document.getElementById('inputRef').addEventListener('input', function() {
   _debRef = setTimeout(buscarPorReferencia, 400);
 });
 document.getElementById('inputRef').addEventListener('change', function() {
+  clearTimeout(_debRef);  // evita chamada dupla (debounce + change)
   if (this.value.trim().length >= 2) buscarPorReferencia();
 });
 
@@ -273,9 +274,10 @@ function buscarPorReferencia() {
       setHint('hintCor',  dadosRef.cores.length    > 0 ? dadosRef.cores.length    + ' cor(es) disponível(is)' : 'Cor nova');
       setHint('hintLarg', dadosRef.larguras.length  > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
 
-      // Mostra tempos gerais (sem filtrar por cor/larg) enquanto o usuário escolhe
-      // temposExatos = {} porque ainda não há cor+larg selecionados
-      renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
+      // Renderiza respeitando cor/larg já preenchidos pelo usuário (pode ter digitado
+      // antes da resposta chegar); se estiverem vazios, carregarTemposPorCombinacao
+      // cai no branch temposGerais normalmente
+      carregarTemposPorCombinacao();
     })
     .withFailureHandler(function(e) {
       mostrarStatus('Erro ao buscar referência: ' + e.message, 'erro');
