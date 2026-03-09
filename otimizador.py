@@ -770,6 +770,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
     Repete até não encontrar melhoria ou atingir 2OPT_PASSES passagens.
     Usa arrays pré-computados dos pedidos → respeita maquina_especial.
     Custo zero se a solução já estiver num ótimo local.
+
+    Restrição EDD: só aceita trocas onde o pedido que avança na fila tem
+    deadline ≤ ao pedido que recua. Isso garante que a otimização de
+    makespan nunca coloca um pedido menos urgente antes de um mais urgente.
     """
     n = len(ordenados)
     if n < 2:
@@ -787,6 +791,17 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
         )
         for a, b in pares:
+            pa = melhor[a]
+            pb = melhor[b]
+            # Respeita EDD: só permite troca se o pedido que vai para a posição
+            # anterior (b→a) tem deadline ≤ ao que vai para trás (a→b).
+            # None = sem prazo definido → tratado como infinito (menos urgente).
+            dl_a = pa.get('deadline_horas')
+            dl_b = pb.get('deadline_horas')
+            _dl_a = dl_a if dl_a is not None else float('inf')
+            _dl_b = dl_b if dl_b is not None else float('inf')
+            if _dl_b > _dl_a:
+                continue  # violaria EDD: ordem menos urgente iria para frente
             cand      = list(melhor)
             cand[a], cand[b] = cand[b], cand[a]
             t = simular_termino(cand, ref_data, num_machines)
