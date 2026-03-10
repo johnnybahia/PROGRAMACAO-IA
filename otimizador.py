@@ -651,6 +651,25 @@ def get_menor_tempo(ref: str, modelos: dict) -> float:
     return menor if menor != float('inf') else 9999
 
 
+def _sort_by_edd(pedidos: list) -> list:
+    """
+    Sort estável por deadline — chave primária obrigatória de todo o sistema.
+
+    "Estável" significa: pedidos com o MESMO deadline mantêm a ordem relativa
+    que veio da estratégia (desempate livre). Pedidos com deadlines diferentes
+    são reordenados de forma que o prazo mais curto sempre venha antes.
+
+    Pedidos sem deadline (None) são tratados como deadline = infinito
+    e ficam sempre no final da fila.
+
+    Esta função é aplicada ao resultado de TODA estratégia de ordenação,
+    garantindo que nenhuma delas possa violar a prioridade por prazo de entrega.
+    """
+    return sorted(pedidos, key=lambda p: (
+        p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+    ))
+
+
 def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
     """Cria as estratégias como closures sobre modelos e ref_data."""
 
@@ -731,8 +750,13 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         if n < 4:
             return list(edd(pedidos))
 
-        # Semente: melhor entre EDD, WSPT e Mais Rápido (usando custo com penalidade)
-        candidatos_ini = [list(edd(pedidos)), list(wspt(pedidos)), list(rapido(pedidos))]
+        # Semente: melhor entre EDD, WSPT e Mais Rápido — todos já ordenados por EDD.
+        # _sort_by_edd garante que mesmo wspt/rapido respeitam deadline como chave primária.
+        candidatos_ini = [
+            list(edd(pedidos)),
+            list(_sort_by_edd(wspt(pedidos))),
+            list(_sort_by_edd(rapido(pedidos))),
+        ]
         current = min(candidatos_ini,
                       key=lambda o: simular_custo(o, ref_data, num_machines))
         current_t = simular_custo(current, ref_data, num_machines)
@@ -766,30 +790,43 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
 
         return best
 
+    def _com_edd(fn):
+        """
+        Wrapper obrigatório: aplica a estratégia fn como critério de desempate
+        dentro de grupos de mesmo deadline.
+
+        Fluxo: fn(pedidos) → ordenação pela estratégia → sort estável por deadline.
+
+        O sort estável garante que pedidos com prazos diferentes seguem sempre
+        a ordem EDD no resultado final, enquanto pedidos com o MESMO prazo
+        mantêm a ordem que a estratégia definiu (otimização intra-grupo).
+        """
+        return lambda pedidos: _sort_by_edd(fn(pedidos))
+
     return [
         {'id': 'edd',          'nome': '✅ EDD — Prazo Mais Próximo Primeiro',
          'descricao': 'Prioriza a data de entrega — minimiza atrasos',
          'fn': edd},
         {'id': 'balanceamento','nome': '2 — Balanceamento por Modelo',
-         'descricao': 'Distribui equalizando carga entre modelos — operador focado',
-         'fn': balanceamento},
+         'descricao': 'Equilíbrio de carga entre modelos, respeitando EDD como prioridade',
+         'fn': _com_edd(balanceamento)},
         {'id': 'rapido',       'nome': '3 — Mais Rápido Primeiro',
-         'descricao': 'Menor tempo de produção primeiro — libera máquinas mais cedo',
-         'fn': rapido},
+         'descricao': 'Mais rápido como desempate dentro do mesmo prazo — libera máquinas cedo',
+         'fn': _com_edd(rapido)},
         {'id': 'menor_demanda','nome': '4 — Menor Demanda Primeiro',
-         'descricao': 'Menos máquinas necessárias primeiro — fecha muitos pedidos rapidamente',
-         'fn': menor_demanda},
+         'descricao': 'Menos máquinas como desempate dentro do mesmo prazo',
+         'fn': _com_edd(menor_demanda)},
         {'id': 'maior_demanda','nome': '5 — Maior Demanda Primeiro',
-         'descricao': 'Mais máquinas necessárias primeiro — resolve gargalos grandes logo',
-         'fn': maior_demanda},
+         'descricao': 'Mais máquinas como desempate dentro do mesmo prazo',
+         'fn': _com_edd(maior_demanda)},
         {'id': 'lento',        'nome': '6 — Mais Lento Primeiro',
-         'descricao': 'Maior tempo de produção primeiro — jobs longos entram antes',
-         'fn': lento},
+         'descricao': 'Maior tempo como desempate dentro do mesmo prazo',
+         'fn': _com_edd(lento)},
         {'id': 'wspt',         'nome': '7 — WSPT (Urgência × Velocidade)',
-         'descricao': 'Weighted Shortest Processing Time — regra ótima teórica para parallel machines',
-         'fn': wspt},
+         'descricao': 'WSPT como desempate dentro do mesmo prazo — regra ótima teórica',
+         'fn': _com_edd(wspt)},
         {'id': 'sa',           'nome': '8 — Simulated Annealing',
-         'descricao': f'Metaheurística guiada: {CONFIG["SA_ITER_MULT"]}× iterações vs Monte Carlo, sai de ótimos locais',
+         'descricao': f'Metaheurística: otimiza dentro da ordem EDD, {CONFIG["SA_ITER_MULT"]}× iterações',
          'fn': simulated_annealing},
     ]
 
