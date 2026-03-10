@@ -74,10 +74,15 @@ CONFIG = {
     },
     # Monte Carlo / SA base: > 1000 → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
-    # Simulated Annealing
+    # Simulated Annealing — ordenação de pedidos (dentro do mesmo prazo)
     'SA_ITER_MULT': 4,    # iterações SA = MC_iters × multiplicador
     'SA_T0_FRAC':   0.05, # temperatura inicial como fração do makespan atual
     'SA_COOLING':   0.995,
+    # Simulated Annealing — atribuição de máquinas (encaixes)
+    # Otimiza QUAL máquina recebe cada pedido para a ordem EDD fixa.
+    # Cada iteração testa uma combinação diferente de encaixe nas máquinas.
+    'SA_ENCAIXES_MULT':    6,     # iterações = MC_iters × multiplicador (mais que o de ordenação)
+    'SA_ENCAIXES_COOLING': 0.997, # resfria mais devagar — espaço de busca maior
     # 2-opt local search
     '2OPT_MAX_N':  300,   # busca exaustiva O(n²) se n ≤ este valor; acima → amostragem
     '2OPT_PASSES': 5,     # máximo de passagens por rodada
@@ -602,6 +607,67 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     return maior
 
 
+# ── SIMULAÇÃO COM GRAVAÇÃO / REPRODUÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────
+def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
+                            choices: list | None = None) -> tuple:
+    """
+    Versão do simulador que grava OU reproduz quais máquinas foram atribuídas.
+
+    choices=None  → modo greedy (comportamento padrão): a cada slot escolhe a
+                    máquina com menor tempo de término e grava a decisão.
+    choices=[...] → modo reprodução: usa os índices gravados (posição dentro do
+                    gidxs local de cada pedido) em vez de escolher pelo argmin.
+                    Se o índice for >= len(gidxs) do pedido, aplica módulo para
+                    garantir validade (pedido pode ter restrição de máquina).
+
+    Retorna (custo, choices_feitas) onde custo inclui penalidade de atraso
+    e choices_feitas é a lista de índices que permite reproduzir a simulação.
+
+    Thread-safe: todos os estados são locais.
+    """
+    filas           = np.zeros(num_machines, dtype=np.float64)
+    maior           = 0.0
+    total_tardiness = 0.0
+    choices_feitas  = []
+    ptr             = 0
+
+    for p in pedidos:
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
+        min_s      = float(p.get('min_start', 0.0))
+        pedido_fim = 0.0
+        ng         = len(gidxs)
+
+        for _ in range(p['maquinas_necessarias']):
+            available = np.maximum(filas[gidxs], min_s)
+            ft        = available + tempos
+            if choices is not None and ptr < len(choices):
+                k = int(choices[ptr]) % ng   # módulo garante índice válido
+            else:
+                k = int(np.argmin(ft))       # greedy
+            choices_feitas.append(k)
+            ptr += 1
+            fim = float(ft[k])
+            filas[gidxs[k]] = fim
+            if fim > maior:
+                maior = fim
+            if fim > pedido_fim:
+                pedido_fim = fim
+
+        dl = p.get('deadline_horas')
+        if dl is not None and pedido_fim > dl:
+            total_tardiness += pedido_fim - dl
+
+    custo = maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
+    return custo, choices_feitas
+
+
 # ── CUSTO COM PENALIDADE DE ATRASO ───────────────────────────────────────────
 def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
     """
@@ -905,6 +971,82 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
     return melhor, melhor_t
 
 
+# ── SA DE ENCAIXES — OTIMIZAÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────────────
+def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
+    """
+    Simulated Annealing sobre ATRIBUIÇÃO DE MÁQUINAS para ordem EDD fixa.
+
+    Problema que resolve:
+      A ordem dos pedidos já está fixada por EDD. Mas QUAL máquina recebe
+      cada pedido ainda é uma decisão: o greedy sempre escolhe a mais rápida
+      disponível no momento, o que pode ser subótimo globalmente.
+
+      Exemplo: dar a máquina mais rápida para o pedido A pode travar ela quando
+      o pedido B (mais urgente logo em seguida) precisar dela — um encaixe
+      alternativo poderia reduzir o makespan total.
+
+    Como funciona:
+      1. Parte da solução greedy (choices do argmin) como semente.
+      2. A cada iteração muta UMA escolha: sorteia um slot e troca para outra
+         máquina disponível para aquele pedido.
+      3. Avalia o custo com simular_com_atribuicao (reproduz exatamente o encaixe).
+      4. Aceita a mudança se melhorar, ou com probabilidade e^(-Δ/T) se piorar.
+      5. Temperatura esfria gradualmente (SA_ENCAIXES_COOLING).
+
+    Restrições sempre respeitadas:
+      - Ordem EDD: nunca alterada (só os encaixes mudam, não a sequência).
+      - maquina_especial: choices são índices dentro do gidxs já filtrado do pedido.
+      - min_start: aplicado dentro do simulador a cada avaliação.
+      - Deadline: penalidade de atraso incluída no custo de cada candidato.
+
+    Retorna a lista de choices (índices de máquina por slot) que produz o
+    menor custo encontrado, pronta para ser usada em otimizar_distribuicao.
+    """
+    # Semente greedy
+    current_t, current_choices = simular_com_atribuicao(pedidos, ref_data, num_machines)
+    best_t      = current_t
+    best_choices = list(current_choices)
+
+    n_slots = len(current_choices)
+    if n_slots == 0:
+        return best_choices
+
+    # Número de iterações — mesmo critério do SA de ordenação
+    n = len(pedidos)
+    for threshold, iters in CONFIG['MC_ITER']:
+        if n > threshold:
+            base_iters = iters
+            break
+    else:
+        base_iters = CONFIG['MC_ITER'][-1][1]
+    total_iters = base_iters * CONFIG['SA_ENCAIXES_MULT']
+
+    T       = current_t * CONFIG['SA_T0_FRAC']
+    cooling = CONFIG['SA_ENCAIXES_COOLING']
+
+    for _ in range(total_iters):
+        # Muta: sorteia um slot e troca para uma máquina diferente
+        idx      = random.randrange(n_slots)
+        neighbor = list(current_choices)
+        # Incrementa aleatoriamente entre 1 e 4 posições no gidxs local.
+        # O módulo em simular_com_atribuicao garante que o índice é válido.
+        neighbor[idx] = current_choices[idx] + random.randint(1, max(1, num_machines - 1))
+
+        neighbor_t, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor)
+        delta = neighbor_t - current_t
+
+        if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+            current_choices = neighbor
+            current_t       = neighbor_t
+            if current_t < best_t:
+                best_t       = current_t
+                best_choices = list(current_choices)
+
+        T *= cooling
+
+    return best_choices
+
+
 # ── ESCOLHA PARALELA DA MELHOR ESTRATÉGIA ────────────────────────────────────
 def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines):
     estrategias = make_estrategias(modelos, ref_data, num_machines)
@@ -1018,10 +1160,21 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
 
 # ── OTIMIZAR DISTRIBUIÇÃO ────────────────────────────────────────────────────
 def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map,
-                           data_base: date, datas_bloqueadas: set):
+                           data_base: date, datas_bloqueadas: set,
+                           choices: list | None = None):
+    """
+    Distribui pedidos nas máquinas e gera o resultado final.
+
+    choices: lista de índices retornada por sa_encaixes().
+      Quando fornecida, usa o encaixe otimizado pelo SA em vez de greedy.
+      Cada inteiro é o índice (dentro do gidxs local do pedido) da máquina
+      escolhida para aquele slot — exatamente o mesmo mecanismo do simulador.
+      None → comportamento greedy original.
+    """
     filas        = np.zeros(num_machines, dtype=np.float64)
     resultado    = []
     sem_cadastro = []
+    choice_ptr   = 0   # ponteiro na lista de choices do SA
 
     for pedido in pedidos_ordenados:
         ref          = pedido['referencia']
@@ -1053,11 +1206,17 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             continue
 
         por_modelo = {}
+        ng = len(gidxs)
 
         for _ in range(slots):
             available = np.maximum(filas[gidxs], min_s)
             ft    = available + tempos
-            best  = int(np.argmin(ft))
+            # Usa choice do SA se disponível, senão greedy
+            if choices is not None and choice_ptr < len(choices):
+                best = int(choices[choice_ptr]) % ng
+            else:
+                best = int(np.argmin(ft))
+            choice_ptr += 1
             fim   = float(ft[best])
             aba, _li = aba_idx[best]
             inicio = float(max(filas[gidxs[best]], min_s))
@@ -1719,10 +1878,24 @@ def main():
     else:
         print(f'  ✔ 2-opt: solução já estava em ótimo local')
 
-    print('7/8 Gerando distribuição otimizada...')
+    print('7/8 Otimizando encaixe de máquinas e gerando distribuição...')
+    print('  Buscando melhor atribuição de máquinas (SA encaixes)...')
+    melhores_choices = sa_encaixes(melhor['ordenados'], ref_data, num_machines)
+    t_encaixes, _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines, melhores_choices)
+    t_greedy,   _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines)
+    if t_encaixes < t_greedy - 1e-9:
+        ganho_enc = _round(((t_greedy - t_encaixes) / t_greedy) * 100)
+        print(f'  ✔ SA encaixes melhorou {ganho_enc}% → {_round(t_encaixes)}h (greedy era {_round(t_greedy)}h)')
+        melhor['terminoTotal'] = t_encaixes
+        melhor['terminoHoras'] = _round(t_encaixes)
+        melhor['decisao']     += f' → SA encaixes −{ganho_enc}%'
+    else:
+        melhores_choices = None   # greedy já era ótimo, usa o padrão
+        print(f'  ✔ SA encaixes: greedy já era o melhor encaixe')
+
     resultado, sem_cadastro = otimizar_distribuicao(
         melhor['ordenados'], modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas
+        data_base, datas_bloqueadas, choices=melhores_choices
     )
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
