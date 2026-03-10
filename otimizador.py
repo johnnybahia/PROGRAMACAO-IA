@@ -63,6 +63,10 @@ CONFIG = {
     'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
     'LIMIAR_TROCA_PERCENT': 10,
+    # Penalidade por atraso: cada hora de atraso em relação ao deadline equivale a
+    # PENALIDADE_ATRASO horas de makespan na função de custo. Isso garante que
+    # pedidos urgentes sejam priorizados em TODAS as estratégias e no SA.
+    'PENALIDADE_ATRASO':    5.0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
         'DATAS FORA DE PROGRAMAÇÃO',
@@ -70,10 +74,15 @@ CONFIG = {
     },
     # Monte Carlo / SA base: > 1000 → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
-    # Simulated Annealing
+    # Simulated Annealing — ordenação de pedidos (dentro do mesmo prazo)
     'SA_ITER_MULT': 4,    # iterações SA = MC_iters × multiplicador
     'SA_T0_FRAC':   0.05, # temperatura inicial como fração do makespan atual
     'SA_COOLING':   0.995,
+    # Simulated Annealing — atribuição de máquinas (encaixes)
+    # Otimiza QUAL máquina recebe cada pedido para a ordem EDD fixa.
+    # Cada iteração testa uma combinação diferente de encaixe nas máquinas.
+    'SA_ENCAIXES_MULT':    6,     # iterações = MC_iters × multiplicador (mais que o de ordenação)
+    'SA_ENCAIXES_COOLING': 0.997, # resfria mais devagar — espaço de busca maior
     # 2-opt local search
     '2OPT_MAX_N':  300,   # busca exaustiva O(n²) se n ≤ este valor; acima → amostragem
     '2OPT_PASSES': 5,     # máximo de passagens por rodada
@@ -598,6 +607,107 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     return maior
 
 
+# ── SIMULAÇÃO COM GRAVAÇÃO / REPRODUÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────
+def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
+                            choices: list | None = None) -> tuple:
+    """
+    Versão do simulador que grava OU reproduz quais máquinas foram atribuídas.
+
+    choices=None  → modo greedy (comportamento padrão): a cada slot escolhe a
+                    máquina com menor tempo de término e grava a decisão.
+    choices=[...] → modo reprodução: usa os índices gravados (posição dentro do
+                    gidxs local de cada pedido) em vez de escolher pelo argmin.
+                    Se o índice for >= len(gidxs) do pedido, aplica módulo para
+                    garantir validade (pedido pode ter restrição de máquina).
+
+    Retorna (custo, choices_feitas) onde custo inclui penalidade de atraso
+    e choices_feitas é a lista de índices que permite reproduzir a simulação.
+
+    Thread-safe: todos os estados são locais.
+    """
+    filas           = np.zeros(num_machines, dtype=np.float64)
+    maior           = 0.0
+    total_tardiness = 0.0
+    choices_feitas  = []
+    ptr             = 0
+
+    for p in pedidos:
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
+        min_s      = float(p.get('min_start', 0.0))
+        pedido_fim = 0.0
+        ng         = len(gidxs)
+
+        for _ in range(p['maquinas_necessarias']):
+            available = np.maximum(filas[gidxs], min_s)
+            ft        = available + tempos
+            if choices is not None and ptr < len(choices):
+                k = int(choices[ptr]) % ng   # módulo garante índice válido
+            else:
+                k = int(np.argmin(ft))       # greedy
+            choices_feitas.append(k)
+            ptr += 1
+            fim = float(ft[k])
+            filas[gidxs[k]] = fim
+            if fim > maior:
+                maior = fim
+            if fim > pedido_fim:
+                pedido_fim = fim
+
+        dl = p.get('deadline_horas')
+        if dl is not None and pedido_fim > dl:
+            total_tardiness += pedido_fim - dl
+
+    custo = maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
+    return custo, choices_feitas
+
+
+# ── CUSTO COM PENALIDADE DE ATRASO ───────────────────────────────────────────
+def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
+    """
+    Como simular_termino, mas penaliza atrasos em relação ao deadline de cada pedido.
+    Retorna: makespan + PENALIDADE_ATRASO × soma_dos_atrasos_em_horas
+
+    Isso garante que pedidos urgentes sejam priorizados em TODAS as estratégias,
+    no Simulated Annealing e no 2-opt — não apenas quando EDD é escolhida.
+    Thread-safe (cria 'filas' local).
+    """
+    filas           = np.zeros(num_machines, dtype=np.float64)
+    maior           = 0.0
+    total_tardiness = 0.0
+    for p in pedidos:
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
+        min_s      = float(p.get('min_start', 0.0))
+        pedido_fim = 0.0
+        for _ in range(p['maquinas_necessarias']):
+            available = np.maximum(filas[gidxs], min_s)
+            ft   = available + tempos
+            best = int(np.argmin(ft))
+            fim  = float(ft[best])
+            filas[gidxs[best]] = fim
+            if fim > maior:
+                maior = fim
+            if fim > pedido_fim:
+                pedido_fim = fim
+        dl = p.get('deadline_horas')
+        if dl is not None and pedido_fim > dl:
+            total_tardiness += pedido_fim - dl
+    return maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
+
+
 # ── ESTRATÉGIAS ──────────────────────────────────────────────────────────────
 def get_menor_tempo(ref: str, modelos: dict) -> float:
     menor = float('inf')
@@ -605,6 +715,25 @@ def get_menor_tempo(ref: str, modelos: dict) -> float:
         if ref in mod['referencias']:
             menor = min(menor, mod['referencias'][ref])
     return menor if menor != float('inf') else 9999
+
+
+def _sort_by_edd(pedidos: list) -> list:
+    """
+    Sort estável por deadline — chave primária obrigatória de todo o sistema.
+
+    "Estável" significa: pedidos com o MESMO deadline mantêm a ordem relativa
+    que veio da estratégia (desempate livre). Pedidos com deadlines diferentes
+    são reordenados de forma que o prazo mais curto sempre venha antes.
+
+    Pedidos sem deadline (None) são tratados como deadline = infinito
+    e ficam sempre no final da fila.
+
+    Esta função é aplicada ao resultado de TODA estratégia de ordenação,
+    garantindo que nenhuma delas possa violar a prioridade por prazo de entrega.
+    """
+    return sorted(pedidos, key=lambda p: (
+        p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+    ))
 
 
 def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
@@ -687,11 +816,16 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         if n < 4:
             return list(edd(pedidos))
 
-        # Semente: melhor entre EDD, WSPT e Mais Rápido
-        candidatos_ini = [list(edd(pedidos)), list(wspt(pedidos)), list(rapido(pedidos))]
+        # Semente: melhor entre EDD, WSPT e Mais Rápido — todos já ordenados por EDD.
+        # _sort_by_edd garante que mesmo wspt/rapido respeitam deadline como chave primária.
+        candidatos_ini = [
+            list(edd(pedidos)),
+            list(_sort_by_edd(wspt(pedidos))),
+            list(_sort_by_edd(rapido(pedidos))),
+        ]
         current = min(candidatos_ini,
-                      key=lambda o: simular_termino(o, ref_data, num_machines))
-        current_t = simular_termino(current, ref_data, num_machines)
+                      key=lambda o: simular_custo(o, ref_data, num_machines))
+        current_t = simular_custo(current, ref_data, num_machines)
         best, best_t = list(current), current_t
 
         T       = current_t * CONFIG['SA_T0_FRAC']
@@ -700,9 +834,17 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
 
         for _ in range(iters):
             a, b = random.sample(range(n), 2)
+            # Normaliza sempre early < late — mesma lógica do 2-opt.
+            # random.sample pode retornar a > b, então normalizamos antes de
+            # verificar a restrição EDD para evitar checar na direção errada.
+            early, late = (a, b) if a < b else (b, a)
+            _dl_early = current[early].get('deadline_horas') or float('inf')
+            _dl_late  = current[late].get('deadline_horas')  or float('inf')
+            if _dl_late > _dl_early:
+                continue  # pedido menos urgente iria para posição anterior → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
-            neighbor_t = simular_termino(neighbor, ref_data, num_machines)
+            neighbor_t = simular_custo(neighbor, ref_data, num_machines)
             delta = neighbor_t - current_t
             if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
                 current, current_t = neighbor, neighbor_t
@@ -710,32 +852,47 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                     best, best_t = list(current), current_t
             T *= cooling
 
-        return best
+        # Garante EDD obrigatório no resultado — sort estável preserva a ordem
+        # otimizada dentro de grupos de mesmo deadline.
+        return _sort_by_edd(best)
+
+    def _com_edd(fn):
+        """
+        Wrapper obrigatório: aplica a estratégia fn como critério de desempate
+        dentro de grupos de mesmo deadline.
+
+        Fluxo: fn(pedidos) → ordenação pela estratégia → sort estável por deadline.
+
+        O sort estável garante que pedidos com prazos diferentes seguem sempre
+        a ordem EDD no resultado final, enquanto pedidos com o MESMO prazo
+        mantêm a ordem que a estratégia definiu (otimização intra-grupo).
+        """
+        return lambda pedidos: _sort_by_edd(fn(pedidos))
 
     return [
         {'id': 'edd',          'nome': '✅ EDD — Prazo Mais Próximo Primeiro',
          'descricao': 'Prioriza a data de entrega — minimiza atrasos',
          'fn': edd},
         {'id': 'balanceamento','nome': '2 — Balanceamento por Modelo',
-         'descricao': 'Distribui equalizando carga entre modelos — operador focado',
-         'fn': balanceamento},
+         'descricao': 'Equilíbrio de carga entre modelos, respeitando EDD como prioridade',
+         'fn': _com_edd(balanceamento)},
         {'id': 'rapido',       'nome': '3 — Mais Rápido Primeiro',
-         'descricao': 'Menor tempo de produção primeiro — libera máquinas mais cedo',
-         'fn': rapido},
+         'descricao': 'Mais rápido como desempate dentro do mesmo prazo — libera máquinas cedo',
+         'fn': _com_edd(rapido)},
         {'id': 'menor_demanda','nome': '4 — Menor Demanda Primeiro',
-         'descricao': 'Menos máquinas necessárias primeiro — fecha muitos pedidos rapidamente',
-         'fn': menor_demanda},
+         'descricao': 'Menos máquinas como desempate dentro do mesmo prazo',
+         'fn': _com_edd(menor_demanda)},
         {'id': 'maior_demanda','nome': '5 — Maior Demanda Primeiro',
-         'descricao': 'Mais máquinas necessárias primeiro — resolve gargalos grandes logo',
-         'fn': maior_demanda},
+         'descricao': 'Mais máquinas como desempate dentro do mesmo prazo',
+         'fn': _com_edd(maior_demanda)},
         {'id': 'lento',        'nome': '6 — Mais Lento Primeiro',
-         'descricao': 'Maior tempo de produção primeiro — jobs longos entram antes',
-         'fn': lento},
+         'descricao': 'Maior tempo como desempate dentro do mesmo prazo',
+         'fn': _com_edd(lento)},
         {'id': 'wspt',         'nome': '7 — WSPT (Urgência × Velocidade)',
-         'descricao': 'Weighted Shortest Processing Time — regra ótima teórica para parallel machines',
-         'fn': wspt},
+         'descricao': 'WSPT como desempate dentro do mesmo prazo — regra ótima teórica',
+         'fn': _com_edd(wspt)},
         {'id': 'sa',           'nome': '8 — Simulated Annealing',
-         'descricao': f'Metaheurística guiada: {CONFIG["SA_ITER_MULT"]}× iterações vs Monte Carlo, sai de ótimos locais',
+         'descricao': f'Metaheurística: otimiza dentro da ordem EDD, {CONFIG["SA_ITER_MULT"]}× iterações',
          'fn': simulated_annealing},
     ]
 
@@ -777,10 +934,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
     """
     n = len(ordenados)
     if n < 2:
-        return list(ordenados), simular_termino(ordenados, ref_data, num_machines)
+        return list(ordenados), simular_custo(ordenados, ref_data, num_machines)
 
     melhor   = list(ordenados)
-    melhor_t = simular_termino(melhor, ref_data, num_machines)
+    melhor_t = simular_custo(melhor, ref_data, num_machines)
     max_n    = CONFIG['2OPT_MAX_N']
 
     for _ in range(CONFIG['2OPT_PASSES']):
@@ -791,20 +948,20 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
         )
         for a, b in pares:
-            pa = melhor[a]
-            pb = melhor[b]
-            # Respeita EDD: só permite troca se o pedido que vai para a posição
-            # anterior (b→a) tem deadline ≤ ao que vai para trás (a→b).
+            # Normaliza sempre early < late — garante que a verificação EDD seja
+            # correta independente da ordem em que o par foi gerado (random ou não).
+            early, late = (a, b) if a < b else (b, a)
+            # Após a troca: posição early recebe o pedido do late, e vice-versa.
+            # EDD só é respeitado se o deadline do pedido que vai para a posição
+            # anterior (late→early) for ≤ ao que vai para trás (early→late).
             # None = sem prazo definido → tratado como infinito (menos urgente).
-            dl_a = pa.get('deadline_horas')
-            dl_b = pb.get('deadline_horas')
-            _dl_a = dl_a if dl_a is not None else float('inf')
-            _dl_b = dl_b if dl_b is not None else float('inf')
-            if _dl_b > _dl_a:
-                continue  # violaria EDD: ordem menos urgente iria para frente
+            _dl_early = melhor[early].get('deadline_horas') or float('inf')
+            _dl_late  = melhor[late].get('deadline_horas')  or float('inf')
+            if _dl_late > _dl_early:
+                continue  # pedido menos urgente iria para posição anterior → viola EDD
             cand      = list(melhor)
-            cand[a], cand[b] = cand[b], cand[a]
-            t = simular_termino(cand, ref_data, num_machines)
+            cand[early], cand[late] = cand[late], cand[early]
+            t = simular_custo(cand, ref_data, num_machines)
             if t < melhor_t - 1e-9:
                 melhor, melhor_t = cand, t
                 melhorou = True
@@ -812,6 +969,82 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             break
 
     return melhor, melhor_t
+
+
+# ── SA DE ENCAIXES — OTIMIZAÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────────────
+def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
+    """
+    Simulated Annealing sobre ATRIBUIÇÃO DE MÁQUINAS para ordem EDD fixa.
+
+    Problema que resolve:
+      A ordem dos pedidos já está fixada por EDD. Mas QUAL máquina recebe
+      cada pedido ainda é uma decisão: o greedy sempre escolhe a mais rápida
+      disponível no momento, o que pode ser subótimo globalmente.
+
+      Exemplo: dar a máquina mais rápida para o pedido A pode travar ela quando
+      o pedido B (mais urgente logo em seguida) precisar dela — um encaixe
+      alternativo poderia reduzir o makespan total.
+
+    Como funciona:
+      1. Parte da solução greedy (choices do argmin) como semente.
+      2. A cada iteração muta UMA escolha: sorteia um slot e troca para outra
+         máquina disponível para aquele pedido.
+      3. Avalia o custo com simular_com_atribuicao (reproduz exatamente o encaixe).
+      4. Aceita a mudança se melhorar, ou com probabilidade e^(-Δ/T) se piorar.
+      5. Temperatura esfria gradualmente (SA_ENCAIXES_COOLING).
+
+    Restrições sempre respeitadas:
+      - Ordem EDD: nunca alterada (só os encaixes mudam, não a sequência).
+      - maquina_especial: choices são índices dentro do gidxs já filtrado do pedido.
+      - min_start: aplicado dentro do simulador a cada avaliação.
+      - Deadline: penalidade de atraso incluída no custo de cada candidato.
+
+    Retorna a lista de choices (índices de máquina por slot) que produz o
+    menor custo encontrado, pronta para ser usada em otimizar_distribuicao.
+    """
+    # Semente greedy
+    current_t, current_choices = simular_com_atribuicao(pedidos, ref_data, num_machines)
+    best_t      = current_t
+    best_choices = list(current_choices)
+
+    n_slots = len(current_choices)
+    if n_slots == 0:
+        return best_choices
+
+    # Número de iterações — mesmo critério do SA de ordenação
+    n = len(pedidos)
+    for threshold, iters in CONFIG['MC_ITER']:
+        if n > threshold:
+            base_iters = iters
+            break
+    else:
+        base_iters = CONFIG['MC_ITER'][-1][1]
+    total_iters = base_iters * CONFIG['SA_ENCAIXES_MULT']
+
+    T       = current_t * CONFIG['SA_T0_FRAC']
+    cooling = CONFIG['SA_ENCAIXES_COOLING']
+
+    for _ in range(total_iters):
+        # Muta: sorteia um slot e troca para uma máquina diferente
+        idx      = random.randrange(n_slots)
+        neighbor = list(current_choices)
+        # Incrementa aleatoriamente entre 1 e 4 posições no gidxs local.
+        # O módulo em simular_com_atribuicao garante que o índice é válido.
+        neighbor[idx] = current_choices[idx] + random.randint(1, max(1, num_machines - 1))
+
+        neighbor_t, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor)
+        delta = neighbor_t - current_t
+
+        if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+            current_choices = neighbor
+            current_t       = neighbor_t
+            if current_t < best_t:
+                best_t       = current_t
+                best_choices = list(current_choices)
+
+        T *= cooling
+
+    return best_choices
 
 
 # ── ESCOLHA PARALELA DA MELHOR ESTRATÉGIA ────────────────────────────────────
@@ -828,12 +1061,12 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         ord_g = [est['fn'](g['pedidos']) for est in estrategias]
         group_orderings.append(ord_g)
 
-    # Ranking individual (todos os pedidos juntos)
+    # Ranking individual (todos os pedidos juntos) — usa custo com penalidade de atraso
     print('  Calculando ranking individual das estratégias...')
     ranking = []
     for est in estrategias:
         ordenados = est['fn'](pedidos)
-        t = simular_termino(ordenados, ref_data, num_machines)
+        t = simular_custo(ordenados, ref_data, num_machines)
         ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t), 'ordenados': ordenados})
     t_ref_rank = next(r for r in ranking if r['id'] == 'edd')['terminoTotal']
     for r in ranking:
@@ -841,10 +1074,10 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         r['percentual'] = _round(((r['terminoTotal'] - t_ref_rank) / t_ref_rank) * 100) if t_ref_rank > 0 else 0
     ranking.sort(key=lambda r: r['terminoTotal'])
 
-    # Referência: EDD em todos os grupos
+    # Referência: EDD em todos os grupos — usa custo com penalidade de atraso
     comb_ref      = [idx_ref] * num_grupos
     ordenados_ref = [p for g_idx, g in enumerate(grupos) for p in group_orderings[g_idx][idx_ref]]
-    tempo_ref     = simular_termino(ordenados_ref, ref_data, num_machines)
+    tempo_ref     = simular_custo(ordenados_ref, ref_data, num_machines)
 
     # Testa TODAS as combinações em paralelo
     combinacoes = gerar_combinacoes(num_grupos, len(estrategias))
@@ -856,7 +1089,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
 
     def _eval(comb):
         ordenados = [p for g_i, g in enumerate(grupos) for p in group_orderings[g_i][comb[g_i]]]
-        return simular_termino(ordenados, ref_data, num_machines), comb, ordenados
+        return simular_custo(ordenados, ref_data, num_machines), comb, ordenados
 
     workers = min(os.cpu_count() or 4, len(combinacoes))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -927,10 +1160,21 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
 
 # ── OTIMIZAR DISTRIBUIÇÃO ────────────────────────────────────────────────────
 def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map,
-                           data_base: date, datas_bloqueadas: set):
+                           data_base: date, datas_bloqueadas: set,
+                           choices: list | None = None):
+    """
+    Distribui pedidos nas máquinas e gera o resultado final.
+
+    choices: lista de índices retornada por sa_encaixes().
+      Quando fornecida, usa o encaixe otimizado pelo SA em vez de greedy.
+      Cada inteiro é o índice (dentro do gidxs local do pedido) da máquina
+      escolhida para aquele slot — exatamente o mesmo mecanismo do simulador.
+      None → comportamento greedy original.
+    """
     filas        = np.zeros(num_machines, dtype=np.float64)
     resultado    = []
     sem_cadastro = []
+    choice_ptr   = 0   # ponteiro na lista de choices do SA
 
     for pedido in pedidos_ordenados:
         ref          = pedido['referencia']
@@ -962,11 +1206,17 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             continue
 
         por_modelo = {}
+        ng = len(gidxs)
 
         for _ in range(slots):
             available = np.maximum(filas[gidxs], min_s)
             ft    = available + tempos
-            best  = int(np.argmin(ft))
+            # Usa choice do SA se disponível, senão greedy
+            if choices is not None and choice_ptr < len(choices):
+                best = int(choices[choice_ptr]) % ng
+            else:
+                best = int(np.argmin(ft))
+            choice_ptr += 1
             fim   = float(ft[best])
             aba, _li = aba_idx[best]
             inicio = float(max(filas[gidxs[best]], min_s))
@@ -1628,10 +1878,24 @@ def main():
     else:
         print(f'  ✔ 2-opt: solução já estava em ótimo local')
 
-    print('7/8 Gerando distribuição otimizada...')
+    print('7/8 Otimizando encaixe de máquinas e gerando distribuição...')
+    print('  Buscando melhor atribuição de máquinas (SA encaixes)...')
+    melhores_choices = sa_encaixes(melhor['ordenados'], ref_data, num_machines)
+    t_encaixes, _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines, melhores_choices)
+    t_greedy,   _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines)
+    if t_encaixes < t_greedy - 1e-9:
+        ganho_enc = _round(((t_greedy - t_encaixes) / t_greedy) * 100)
+        print(f'  ✔ SA encaixes melhorou {ganho_enc}% → {_round(t_encaixes)}h (greedy era {_round(t_greedy)}h)')
+        melhor['terminoTotal'] = t_encaixes
+        melhor['terminoHoras'] = _round(t_encaixes)
+        melhor['decisao']     += f' → SA encaixes −{ganho_enc}%'
+    else:
+        melhores_choices = None   # greedy já era ótimo, usa o padrão
+        print(f'  ✔ SA encaixes: greedy já era o melhor encaixe')
+
     resultado, sem_cadastro = otimizar_distribuicao(
         melhor['ordenados'], modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas
+        data_base, datas_bloqueadas, choices=melhores_choices
     )
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
