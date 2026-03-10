@@ -225,6 +225,7 @@ setupAutocomplete('inputLarg', 'listLarg', optsLarg);
 
 // Ref: busca dados ao digitar (debounce 400ms, mín. 2 caracteres)
 var _debRef = null;
+var _refToken = 0;  // token de versão: descarta respostas de chamadas antigas
 document.getElementById('inputRef').addEventListener('input', function() {
   clearTimeout(_debRef);
   var val = this.value.trim();
@@ -260,20 +261,21 @@ function buscarPorReferencia() {
   var ref = document.getElementById('inputRef').value.trim();
   if (!ref) return;
 
+  var token = ++_refToken;  // cada chamada tem seu token único
+
   google.script.run
     .withSuccessHandler(function(dados) {
+      if (token !== _refToken) return;  // resposta de chamada antiga — descarta
+
       dadosRef = dados || { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
 
-      // Hints de cor e largura
-      setHint('hintCor',  dadosRef.cores.length    > 0 ? dadosRef.cores.length    + ' cor(es) disponível(is)' : 'Cor nova');
-      setHint('hintLarg', dadosRef.larguras.length  > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
+      setHint('hintCor',  dadosRef.cores.length   > 0 ? dadosRef.cores.length   + ' cor(es) disponível(is)' : 'Cor nova');
+      setHint('hintLarg', dadosRef.larguras.length > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
 
-      // Renderiza respeitando cor/larg já preenchidos pelo usuário (pode ter digitado
-      // antes da resposta chegar); se estiverem vazios, carregarTemposPorCombinacao
-      // cai no branch temposGerais normalmente
       carregarTemposPorCombinacao();
     })
     .withFailureHandler(function(e) {
+      if (token !== _refToken) return;
       mostrarStatus('Erro ao buscar referência: ' + e.message, 'erro');
     })
     .buscarDadosPorReferencia(ref);
