@@ -133,6 +133,8 @@
 var dadosServidor = { referencias: [], cores: [], larguras: [], maquinas: [] };
 var dadosRef      = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
 var temposExistentes = {};
+// Valores de tempo digitados manualmente pelo usuário (preservados entre re-renders)
+var temposUsuario = {};
 
 // ── Inicialização ───────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
@@ -239,10 +241,12 @@ document.getElementById('inputRef').addEventListener('input', function() {
   if (val.length < 2) {
     dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
     temposExistentes = {};
+    temposUsuario = {};
     setHint('hintCor', ''); setHint('hintLarg', '');
     renderizarTabela(dadosServidor.maquinas, {});
     return;
   }
+  temposUsuario = {};
   _debRef = setTimeout(buscarPorReferencia, 400);
 });
 document.getElementById('inputRef').addEventListener('change', function() {
@@ -256,8 +260,9 @@ document.getElementById('inputCor').addEventListener('change', function() {
   carregarTemposPorCombinacao();
 });
 
-// Largura: carrega tempos da combinação selecionada
+// Largura: carrega tempos da combinação selecionada (nova largura = limpa valores manuais)
 document.getElementById('inputLarg').addEventListener('change', function() {
+  temposUsuario = {};
   carregarTemposPorCombinacao();
 });
 
@@ -355,7 +360,9 @@ function renderizarTabela(maquinas, tempos, temposExatos) {
   }
   var html = '';
   maquinas.forEach(function(m) {
-    var tempo  = tempos[m.nomeAba]      !== undefined ? tempos[m.nomeAba]      : '';
+    // Prioridade: valor digitado pelo usuário > sugestão do banco > vazio
+    var tempoSugestao = tempos[m.nomeAba] !== undefined ? tempos[m.nomeAba] : '';
+    var tempo = temposUsuario[m.nomeAba] !== undefined ? temposUsuario[m.nomeAba] : tempoSugestao;
     var exato  = temposExatos[m.nomeAba] !== undefined;  // combinação exata existe
     var badge  = exato
       ? '<span class="badge badge-existente">Existente</span>'
@@ -370,6 +377,14 @@ function renderizarTabela(maquinas, tempos, temposExatos) {
     html += '</tr>';
   });
   tbody.innerHTML = html;
+
+  // Captura qualquer digitação no campo de tempo para não perder ao re-renderizar
+  tbody.querySelectorAll('.tempo-input').forEach(function(inp) {
+    inp.addEventListener('input', function() {
+      temposUsuario[this.getAttribute('data-aba')] = this.value;
+      this.classList.toggle('preenchido', this.value.trim() !== '');
+    });
+  });
 }
 
 // ── Enviar dados ────────────────────────────────────────────
@@ -421,6 +436,7 @@ function limparForm() {
   ['hintCor','hintLarg'].forEach(function(id) { setHint(id, ''); });
   dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
   temposExistentes = {};
+  temposUsuario = {};
   renderizarTabela(dadosServidor.maquinas, {});
   document.getElementById('statusMsg').className = 'status-msg';
 }
