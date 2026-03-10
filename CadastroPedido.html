@@ -1,4 +1,30 @@
 <!DOCTYPE html>
+<!--
+  ════════════════════════════════════════════════════════════════
+  PADRÃO OBRIGATÓRIO — LOADING STATE (leia antes de editar)
+  ════════════════════════════════════════════════════════════════
+  TODA chamada a google.script.run DEVE seguir este padrão:
+
+    setCarregando(true);   // ou setAguarde(true, "msg") se houver overlay
+    google.script.run
+      .withSuccessHandler(function(resultado) {
+        setCarregando(false);
+        // ... tratar resultado
+      })
+      .withFailureHandler(function(e) {
+        setCarregando(false);
+        mostrarStatus('Erro: ' + e.message, 'erro');
+      })
+      .nomeDaFuncaoNoServidor(args);
+
+  Neste arquivo o padrão usa:
+    setCarregando(sim)  → exibe "Aguarde, carregando..." e desabilita campos
+    spinner #spinner    → exibe "⏳ Processando..." durante o envio final
+
+  NUNCA remova este padrão. O Google Apps Script pode demorar
+  vários segundos por chamada — o usuário PRECISA do feedback visual.
+  ════════════════════════════════════════════════════════════════
+-->
 <html>
 <head>
   <meta charset="UTF-8">
