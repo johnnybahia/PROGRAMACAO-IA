@@ -51,6 +51,8 @@ function onOpen() {
     .addItem("▶ Analisar Distribuição", "analisarDistribuicao")
     .addItem("📊 Comparar Estratégias de Distribuição", "analisarDistribuicao")
     .addSeparator()
+    .addItem("📅 Datas Fora de Programação", "abrirGestaoDatas")
+    .addSeparator()
     .addItem("🔍 Diagnóstico — Ver abas reconhecidas", "diagnosticoModelos")
     .addSeparator()
     .addItem("🗑 Limpar aba Distribuição", "limparDistribuicao")
@@ -1445,6 +1447,81 @@ function diagnosticoModelos() {
     `─── Detalhes ───\n${log}`;
 
   ui.alert("🔍 Diagnóstico de Modelos", msg, ui.ButtonSet.OK);
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// GESTÃO DE DATAS FORA DE PROGRAMAÇÃO
+// ═══════════════════════════════════════════════════════════
+
+const ABA_DATAS = "DATAS FORA DE PROGRAMAÇÃO";
+
+/**
+ * Abre o dialog de gestão de datas bloqueadas
+ */
+function abrirGestaoDatas() {
+  var html = HtmlService.createHtmlOutputFromFile("GestaoDatas")
+    .setWidth(580)
+    .setHeight(680)
+    .setTitle("Datas Fora de Programação");
+  SpreadsheetApp.getUi().showModalDialog(html, "📅 Datas Fora de Programação");
+}
+
+/**
+ * Lê todas as datas bloqueadas da aba (col A), retorna array de strings DD/MM/YYYY
+ */
+function lerDatasBlockeadas() {
+  var ss  = SpreadsheetApp.getActiveSpreadsheet();
+  var aba = ss.getSheetByName(ABA_DATAS);
+  if (!aba || aba.getLastRow() === 0) return [];
+
+  var vals = aba.getRange(1, 1, aba.getLastRow(), 1).getValues();
+  var datas = [];
+  var tz    = Session.getScriptTimeZone();
+
+  for (var i = 0; i < vals.length; i++) {
+    var v = vals[i][0];
+    if (!v && v !== 0) continue;
+    var s;
+    if (typeof v === "string") {
+      s = v.trim();
+    } else if (v instanceof Date) {
+      s = Utilities.formatDate(v, tz, "dd/MM/yyyy");
+    } else {
+      s = String(v).trim();
+    }
+    if (s) datas.push(s);
+  }
+  return datas;
+}
+
+/**
+ * Substitui toda a lista de datas bloqueadas na aba (col A)
+ */
+function salvarDatasBlockeadas(datas) {
+  var ss  = SpreadsheetApp.getActiveSpreadsheet();
+  var aba = ss.getSheetByName(ABA_DATAS);
+  if (!aba) {
+    aba = ss.insertSheet(ABA_DATAS);
+  }
+  aba.clearContents();
+  if (!datas || datas.length === 0) return { ok: true, total: 0 };
+
+  // Ordena DD/MM/YYYY cronologicamente antes de salvar
+  datas.sort(function(a, b) {
+    return _parseDMY(a) - _parseDMY(b);
+  });
+
+  var vals = datas.map(function(d) { return [d]; });
+  aba.getRange(1, 1, vals.length, 1).setValues(vals);
+  return { ok: true, total: vals.length };
+}
+
+/** Converte DD/MM/YYYY em Date para comparação */
+function _parseDMY(s) {
+  var p = s.split("/");
+  if (p.length !== 3) return new Date(0);
+  return new Date(parseInt(p[2]), parseInt(p[1]) - 1, parseInt(p[0]));
 }
 
 

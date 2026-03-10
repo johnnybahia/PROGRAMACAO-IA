@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, sans-serif; font-size: 13px; color: #202124; background: #fff; padding: 16px; }
+
+  h2 { font-size: 15px; font-weight: 600; color: #1a73e8; margin-bottom: 14px; }
+  h3 { font-size: 13px; font-weight: 600; color: #444; margin-bottom: 8px; }
+
+  .card {
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: #fafafa;
+  }
+
+  .row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+  label { display: block; font-size: 12px; color: #555; margin-bottom: 3px; }
+
+  input[type="date"], select {
+    height: 32px;
+    border: 1px solid #c5c8cc;
+    border-radius: 4px;
+    padding: 0 8px;
+    font-size: 13px;
+    outline: none;
+  }
+  input[type="date"]:focus, select:focus { border-color: #1a73e8; }
+
+  .btn {
+    height: 32px;
+    padding: 0 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-primary { background: #1a73e8; color: #fff; }
+  .btn-primary:hover { background: #1558b0; }
+  .btn-danger  { background: #ea4335; color: #fff; font-size: 11px; padding: 0 8px; height: 26px; border-radius: 3px; border: none; cursor: pointer; }
+  .btn-danger:hover { background: #c5221f; }
+
+  /* Lista de datas */
+  #lista-wrap {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid #dadce0;
+    border-radius: 6px;
+    background: #fff;
+  }
+  #lista-vazia {
+    padding: 18px;
+    text-align: center;
+    color: #888;
+    font-style: italic;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    position: sticky; top: 0; background: #f1f3f4;
+    font-size: 11px; font-weight: 600; color: #555;
+    padding: 6px 10px; text-align: left;
+    border-bottom: 1px solid #dadce0;
+  }
+  td { padding: 5px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8f9fa; }
+
+  .badge-fim  { background: #e8f0fe; color: #1a73e8; padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+  .badge-fer  { background: #fce8e6; color: #c5221f; padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+
+  /* Checkboxes */
+  .chk-row { display: flex; gap: 16px; margin-top: 6px; }
+  .chk-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: #333; cursor: pointer; margin: 0; }
+
+  /* Status bar */
+  #status { margin-top: 10px; font-size: 12px; min-height: 18px; }
+  .ok  { color: #1e8e3e; }
+  .err { color: #c5221f; }
+
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #1a73e8; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 4px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .footer { display: flex; justify-content: flex-end; margin-top: 10px; }
+  .btn-close { background: #f1f3f4; color: #444; border: 1px solid #dadce0; }
+  .btn-close:hover { background: #e8eaed; }
+</style>
+</head>
+<body>
+
+<h2>📅 Datas Fora de Programação</h2>
+
+<!-- Adicionar data específica -->
+<div class="card">
+  <h3>Adicionar data específica</h3>
+  <div class="row" style="margin-top:6px;">
+    <div>
+      <label>Data</label>
+      <input type="date" id="inp-data">
+    </div>
+    <button class="btn btn-primary" onclick="adicionarDataEspecifica()">Adicionar</button>
+  </div>
+</div>
+
+<!-- Bloquear finais de semana -->
+<div class="card">
+  <h3>Bloquear finais de semana por ano</h3>
+  <div class="row" style="margin-top:6px;">
+    <div>
+      <label>Ano</label>
+      <select id="sel-ano"></select>
+    </div>
+    <div>
+      <label>&nbsp;</label>
+      <div class="chk-row">
+        <label><input type="checkbox" id="chk-sab" checked> Sábados</label>
+        <label><input type="checkbox" id="chk-dom" checked> Domingos</label>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="adicionarFimDeSemana()">Bloquear</button>
+  </div>
+</div>
+
+<!-- Lista de datas bloqueadas -->
+<div class="card" style="padding-bottom:10px;">
+  <h3>Datas já bloqueadas <span id="contador" style="font-weight:400;color:#888;"></span></h3>
+  <div id="lista-wrap" style="margin-top:8px;">
+    <div id="lista-vazia">Carregando...</div>
+  </div>
+</div>
+
+<div id="status"></div>
+
+<div class="footer">
+  <button class="btn btn-close" onclick="google.script.host.close()">Fechar</button>
+</div>
+
+<script>
+  var _datas = []; // array de strings DD/MM/YYYY (estado local)
+
+  // Nomes dos dias
+  var DIAS = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+
+  // Popula selector de anos (atual-2 até atual+3)
+  (function() {
+    var anoAtual = new Date().getFullYear();
+    var sel = document.getElementById("sel-ano");
+    for (var a = anoAtual - 2; a <= anoAtual + 3; a++) {
+      var opt = document.createElement("option");
+      opt.value = a;
+      opt.textContent = a;
+      if (a === anoAtual) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    // Define data mínima como hoje
+    document.getElementById("inp-data").value = toInputDate(new Date());
+  })();
+
+  // Carrega datas ao abrir
+  google.script.run
+    .withSuccessHandler(function(lista) { _datas = lista || []; renderLista(); })
+    .withFailureHandler(mostrarErro)
+    .lerDatasBlockeadas();
+
+  /* ─── helpers ─────────────────────────────────────────────── */
+
+  function toInputDate(d) {
+    var mm = String(d.getMonth()+1).padStart(2,"0");
+    var dd = String(d.getDate()).padStart(2,"0");
+    return d.getFullYear() + "-" + mm + "-" + dd;
+  }
+
+  function toDMY(isoStr) {
+    // "YYYY-MM-DD" → "DD/MM/YYYY"
+    var p = isoStr.split("-");
+    return p[2] + "/" + p[1] + "/" + p[0];
+  }
+
+  function parseDMY(s) {
+    var p = s.split("/");
+    return new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
+  }
+
+  function diaSemana(s) {
+    return DIAS[parseDMY(s).getDay()];
+  }
+
+  function anoDeData(s) {
+    return s.split("/")[2];
+  }
+
+  /* ─── renderizar lista ────────────────────────────────────── */
+
+  function renderLista() {
+    var wrap = document.getElementById("lista-wrap");
+    document.getElementById("contador").textContent = _datas.length > 0
+      ? "(" + _datas.length + " data" + (_datas.length > 1 ? "s" : "") + ")"
+      : "";
+
+    if (_datas.length === 0) {
+      wrap.innerHTML = '<div id="lista-vazia">Nenhuma data bloqueada.</div>';
+      return;
+    }
+
+    var html = '<table><thead><tr>'
+      + '<th>Data</th><th>Dia da Semana</th><th>Ano</th><th>Tipo</th><th></th>'
+      + '</tr></thead><tbody>';
+
+    _datas.forEach(function(d, idx) {
+      var dia  = diaSemana(d);
+      var ano  = anoDeData(d);
+      var fim  = (dia === "Sábado" || dia === "Domingo");
+      var badge = fim
+        ? '<span class="badge-fim">' + dia + '</span>'
+        : '<span class="badge-fer">Feriado/Especial</span>';
+
+      html += '<tr>'
+        + '<td><b>' + d + '</b></td>'
+        + '<td>' + dia + '</td>'
+        + '<td>' + ano + '</td>'
+        + '<td>' + badge + '</td>'
+        + '<td><button class="btn-danger" onclick="excluirData(' + idx + ')">Excluir</button></td>'
+        + '</tr>';
+    });
+
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  }
+
+  /* ─── adicionar data específica ──────────────────────────── */
+
+  function adicionarDataEspecifica() {
+    var val = document.getElementById("inp-data").value;
+    if (!val) { mostrarErro("Selecione uma data."); return; }
+    var dmy = toDMY(val);
+    if (_datas.indexOf(dmy) !== -1) { mostrarErro("Data " + dmy + " já está na lista."); return; }
+    _datas.push(dmy);
+    salvar("Data " + dmy + " adicionada.");
+  }
+
+  /* ─── bloquear finais de semana ──────────────────────────── */
+
+  function adicionarFimDeSemana() {
+    var ano   = parseInt(document.getElementById("sel-ano").value);
+    var sab   = document.getElementById("chk-sab").checked;
+    var dom   = document.getElementById("chk-dom").checked;
+    if (!sab && !dom) { mostrarErro("Selecione pelo menos Sábado ou Domingo."); return; }
+
+    var adicionadas = 0;
+    var d = new Date(ano, 0, 1);
+    while (d.getFullYear() === ano) {
+      var dow = d.getDay(); // 0=Dom, 6=Sab
+      if ((dow === 6 && sab) || (dow === 0 && dom)) {
+        var dd  = String(d.getDate()).padStart(2,"0");
+        var mm  = String(d.getMonth()+1).padStart(2,"0");
+        var dmy = dd + "/" + mm + "/" + ano;
+        if (_datas.indexOf(dmy) === -1) {
+          _datas.push(dmy);
+          adicionadas++;
+        }
+      }
+      d.setDate(d.getDate() + 1);
+    }
+
+    if (adicionadas === 0) {
+      mostrarErro("Todos os " + (sab && dom ? "sábados e domingos" : sab ? "sábados" : "domingos") + " de " + ano + " já estão na lista.");
+      return;
+    }
+    salvar(adicionadas + " dia(s) de fim de semana de " + ano + " adicionados.");
+  }
+
+  /* ─── excluir data ───────────────────────────────────────── */
+
+  function excluirData(idx) {
+    var d = _datas[idx];
+    _datas.splice(idx, 1);
+    salvar("Data " + d + " removida.");
+  }
+
+  /* ─── salvar (chama servidor e re-renderiza) ─────────────── */
+
+  function salvar(msg) {
+    setStatus('<span class="spinner"></span> Salvando...');
+    // Envia cópia ordenada para o servidor
+    var copia = _datas.slice();
+    google.script.run
+      .withSuccessHandler(function(res) {
+        // Recarrega a lista do servidor para garantir consistência
+        google.script.run
+          .withSuccessHandler(function(lista) {
+            _datas = lista || [];
+            renderLista();
+            setStatus('<span class="ok">✔ ' + msg + '</span>');
+          })
+          .withFailureHandler(mostrarErro)
+          .lerDatasBlockeadas();
+      })
+      .withFailureHandler(mostrarErro)
+      .salvarDatasBlockeadas(copia);
+  }
+
+  /* ─── status / erro ──────────────────────────────────────── */
+
+  function setStatus(html) {
+    document.getElementById("status").innerHTML = html;
+  }
+
+  function mostrarErro(e) {
+    setStatus('<span class="err">⚠ ' + (e.message || e) + '</span>');
+  }
+</script>
+</body>
+</html>
