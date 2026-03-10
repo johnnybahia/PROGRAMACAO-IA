@@ -254,10 +254,10 @@ document.getElementById('inputRef').addEventListener('change', function() {
   if (this.value.trim().length >= 2) buscarPorReferencia();
 });
 
-// Cor: atualiza hint de larguras e recarrega tempos
+// Cor: atualiza hint e badges — não recarrega tempos (cor não altera sugestões de tempo)
 document.getElementById('inputCor').addEventListener('change', function() {
   atualizarHintLarg();
-  carregarTemposPorCombinacao();
+  atualizarBadges();
 });
 
 // Largura: carrega tempos da combinação selecionada (nova largura = limpa valores manuais)
@@ -304,21 +304,27 @@ function carregarTemposPorCombinacao() {
     return;
   }
 
-  // temposExibir: SEMPRE baseado na referência inteira, filtrado só por larg (se informada)
-  // A cor NÃO filtra temposExibir — a tabela mostra todas as máquinas onde a ref existe
+  // temposExibir: baseado em ref+larg, priorizando a cor selecionada como sugestão
   var temposExibir = !larg
     ? (dadosRef.temposGerais || {})   // sem larg → tempos gerais da ref
-    : (function() {                    // com larg → filtra por larg em qualquer cor
+    : (function() {
         var t = {};
+        // 1º passo: tempos da cor selecionada (sugestão mais relevante)
+        dadosRef.combinacoes.forEach(function(c) {
+          if (c.larg.toUpperCase() === larg && c.cor.toUpperCase() === cor) {
+            for (var aba in c.tempos) { t[aba] = c.tempos[aba]; }
+          }
+        });
+        // 2º passo: preenche máquinas sem tempo ainda (qualquer cor, mesma ref+larg)
         dadosRef.combinacoes.forEach(function(c) {
           if (c.larg.toUpperCase() === larg) {
-            for (var aba in c.tempos) { if (!t[aba]) t[aba] = c.tempos[aba]; }
+            for (var aba in c.tempos) { if (t[aba] === undefined) t[aba] = c.tempos[aba]; }
           }
         });
         return t;
       })();
 
-  // temposExatos: só quando cor+larg exatos existem (badge "Existente" + checkbox marcada)
+  // temposExatos: badge "Existente" + checkbox marcada apenas quando cor+larg exatos existem
   var temposExatos = {};
   if (corExiste && largExiste) {
     dadosRef.combinacoes.forEach(function(c) {
@@ -329,6 +335,34 @@ function carregarTemposPorCombinacao() {
   }
 
   renderizarTabela(dadosServidor.maquinas, temposExibir, temposExatos);
+}
+
+// ── Atualiza badges e checkboxes sem recriar a tabela ───────
+// Chamado quando a cor muda (os tempos de sugestão não mudam com a cor, só o status exato)
+function atualizarBadges() {
+  var cor  = document.getElementById('inputCor').value.trim().toUpperCase();
+  var larg = document.getElementById('inputLarg').value.trim().toUpperCase();
+  var corExiste  = cor  && dadosRef.cores.some(function(c)    { return c.toUpperCase() === cor;  });
+  var largExiste = larg && dadosRef.larguras.some(function(l) { return l.toUpperCase() === larg; });
+
+  var temposExatos = {};
+  if (corExiste && largExiste) {
+    dadosRef.combinacoes.forEach(function(c) {
+      if (c.cor.toUpperCase() === cor && c.larg.toUpperCase() === larg) {
+        for (var aba in c.tempos) { if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba]; }
+      }
+    });
+  }
+
+  document.querySelectorAll('#tbodyMaquinas tr').forEach(function(tr) {
+    var chk     = tr.querySelector('.chk-maquina');
+    var badgeEl = tr.querySelector('.badge');
+    if (!chk || !badgeEl) return;
+    var exato = temposExatos[chk.getAttribute('data-aba')] !== undefined;
+    badgeEl.className   = 'badge ' + (exato ? 'badge-existente' : 'badge-novo');
+    badgeEl.textContent = exato ? 'Existente' : 'Novo';
+    chk.checked = exato;
+  });
 }
 
 function atualizarHintLarg() {
