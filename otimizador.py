@@ -768,16 +768,14 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
 
         for _ in range(iters):
             a, b = random.sample(range(n), 2)
-            # Restrição EDD: só permite troca se o pedido que avança na fila
-            # tem deadline ≤ ao que recua. Garante que pedidos urgentes nunca
-            # fiquem atrás de pedidos menos urgentes durante a busca.
-            pa, pb = current[a], current[b]
-            dl_a = pa.get('deadline_horas')
-            dl_b = pb.get('deadline_horas')
-            _dl_a = dl_a if dl_a is not None else float('inf')
-            _dl_b = dl_b if dl_b is not None else float('inf')
-            if _dl_b > _dl_a:
-                continue  # violaria EDD: pedido menos urgente iria para frente
+            # Normaliza sempre early < late — mesma lógica do 2-opt.
+            # random.sample pode retornar a > b, então normalizamos antes de
+            # verificar a restrição EDD para evitar checar na direção errada.
+            early, late = (a, b) if a < b else (b, a)
+            _dl_early = current[early].get('deadline_horas') or float('inf')
+            _dl_late  = current[late].get('deadline_horas')  or float('inf')
+            if _dl_late > _dl_early:
+                continue  # pedido menos urgente iria para posição anterior → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
             neighbor_t = simular_custo(neighbor, ref_data, num_machines)
@@ -788,7 +786,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                     best, best_t = list(current), current_t
             T *= cooling
 
-        return best
+        # Garante EDD obrigatório no resultado — sort estável preserva a ordem
+        # otimizada dentro de grupos de mesmo deadline.
+        return _sort_by_edd(best)
 
     def _com_edd(fn):
         """
@@ -882,19 +882,19 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
         )
         for a, b in pares:
-            pa = melhor[a]
-            pb = melhor[b]
-            # Respeita EDD: só permite troca se o pedido que vai para a posição
-            # anterior (b→a) tem deadline ≤ ao que vai para trás (a→b).
+            # Normaliza sempre early < late — garante que a verificação EDD seja
+            # correta independente da ordem em que o par foi gerado (random ou não).
+            early, late = (a, b) if a < b else (b, a)
+            # Após a troca: posição early recebe o pedido do late, e vice-versa.
+            # EDD só é respeitado se o deadline do pedido que vai para a posição
+            # anterior (late→early) for ≤ ao que vai para trás (early→late).
             # None = sem prazo definido → tratado como infinito (menos urgente).
-            dl_a = pa.get('deadline_horas')
-            dl_b = pb.get('deadline_horas')
-            _dl_a = dl_a if dl_a is not None else float('inf')
-            _dl_b = dl_b if dl_b is not None else float('inf')
-            if _dl_b > _dl_a:
-                continue  # violaria EDD: ordem menos urgente iria para frente
+            _dl_early = melhor[early].get('deadline_horas') or float('inf')
+            _dl_late  = melhor[late].get('deadline_horas')  or float('inf')
+            if _dl_late > _dl_early:
+                continue  # pedido menos urgente iria para posição anterior → viola EDD
             cand      = list(melhor)
-            cand[a], cand[b] = cand[b], cand[a]
+            cand[early], cand[late] = cand[late], cand[early]
             t = simular_custo(cand, ref_data, num_machines)
             if t < melhor_t - 1e-9:
                 melhor, melhor_t = cand, t
