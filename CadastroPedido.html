@@ -75,6 +75,10 @@
     .spinner { display: none; text-align: center; padding: 8px; color: #666; }
     .spinner.visible { display: block; }
     .field-hint { font-size: 11px; color: #888; margin-top: 3px; min-height: 14px; }
+    .field-hint.carregando { color: #4a90d9; font-style: italic; }
+    input[type="text"]:disabled {
+      background: #f0f0f0; color: #aaa; cursor: not-allowed; border-color: #ddd;
+    }
   </style>
 </head>
 <body>
@@ -86,6 +90,7 @@
   <label for="inputRef">Referência do Produto:</label>
   <input type="text" id="inputRef" placeholder="Digite a referência..." autocomplete="off">
   <div class="autocomplete-list" id="listRef"></div>
+  <div class="field-hint" id="hintRef"></div>
 </div>
 
 <!-- Cor -->
@@ -152,18 +157,8 @@ document.addEventListener('DOMContentLoaded', function() {
 // ── Fontes dinâmicas dos autocompletes ──────────────────────
 function optsRef()  { return dadosServidor.referencias; }
 function optsCor()  { return dadosRef.cores.length  > 0 ? dadosRef.cores  : dadosServidor.cores;  }
+// Larguras da referência (cor não influencia — tempo é de ref+larg, não ref+cor+larg)
 function optsLarg() {
-  var cor = document.getElementById('inputCor').value.trim().toUpperCase();
-  var corExiste = cor && dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
-  // Só filtra por cor se ela existir na referência; cor nova → mostra todas as larguras da ref
-  if (corExiste && dadosRef.combinacoes.length > 0) {
-    var set = {};
-    dadosRef.combinacoes.forEach(function(c) {
-      if (c.cor.toUpperCase() === cor) set[c.larg] = true;
-    });
-    var filtradas = Object.keys(set).sort();
-    if (filtradas.length > 0) return filtradas;
-  }
   return dadosRef.larguras.length > 0 ? dadosRef.larguras : dadosServidor.larguras;
 }
 
@@ -235,10 +230,13 @@ setupAutocomplete('inputLarg', 'listLarg', optsLarg);
 
 // Ref: busca dados ao digitar (debounce 400ms, mín. 2 caracteres)
 var _debRef = null;
+var _refToken = 0;  // token de versão: descarta respostas de chamadas antigas
 document.getElementById('inputRef').addEventListener('input', function() {
   clearTimeout(_debRef);
   var val = this.value.trim();
   if (val.length < 2) {
+    ++_refToken;           // invalida qualquer chamada em andamento
+    setCarregando(false);  // garante que o aviso de aguarde suma
     dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
     temposExistentes = {};
     temposUsuario = {};
@@ -254,10 +252,9 @@ document.getElementById('inputRef').addEventListener('change', function() {
   if (this.value.trim().length >= 2) buscarPorReferencia();
 });
 
-// Cor: atualiza hint de larguras e recarrega tempos
+// Cor: cor não tem relação com tempos nem com badges — só atualiza hint de larguras
 document.getElementById('inputCor').addEventListener('change', function() {
   atualizarHintLarg();
-  carregarTemposPorCombinacao();
 });
 
 // Largura: carrega tempos da combinação selecionada (nova largura = limpa valores manuais)
@@ -266,81 +263,85 @@ document.getElementById('inputLarg').addEventListener('change', function() {
   carregarTemposPorCombinacao();
 });
 
+// ── Bloqueia/libera campos durante carregamento da referência ──
+function setCarregando(sim) {
+  var hintRef = document.getElementById('hintRef');
+  var cor  = document.getElementById('inputCor');
+  var larg = document.getElementById('inputLarg');
+  if (sim) {
+    hintRef.textContent = 'Aguarde, carregando dados da referência...';
+    hintRef.className = 'field-hint carregando';
+    cor.disabled  = true;
+    larg.disabled = true;
+  } else {
+    hintRef.textContent = '';
+    hintRef.className = 'field-hint';
+    cor.disabled  = false;
+    larg.disabled = false;
+  }
+}
+
 // ── Busca dados da referência (1 chamada ao servidor) ───────
 function buscarPorReferencia() {
   var ref = document.getElementById('inputRef').value.trim();
   if (!ref) return;
 
+  var token = ++_refToken;  // cada chamada tem seu token único
+  setCarregando(true);
+
   google.script.run
     .withSuccessHandler(function(dados) {
+      if (token !== _refToken) return;  // resposta de chamada antiga — descarta
+      setCarregando(false);
+
       dadosRef = dados || { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
 
-      // Hints de cor e largura
-      setHint('hintCor',  dadosRef.cores.length    > 0 ? dadosRef.cores.length    + ' cor(es) disponível(is)' : 'Cor nova');
-      setHint('hintLarg', dadosRef.larguras.length  > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
+      setHint('hintCor',  dadosRef.cores.length   > 0 ? dadosRef.cores.length   + ' cor(es) disponível(is)' : 'Cor nova');
+      setHint('hintLarg', dadosRef.larguras.length > 0 ? dadosRef.larguras.length + ' largura(s) disponível(is)' : 'Largura nova');
 
-      // Renderiza respeitando cor/larg já preenchidos pelo usuário (pode ter digitado
-      // antes da resposta chegar); se estiverem vazios, carregarTemposPorCombinacao
-      // cai no branch temposGerais normalmente
       carregarTemposPorCombinacao();
     })
     .withFailureHandler(function(e) {
+      if (token !== _refToken) return;
+      setCarregando(false);
       mostrarStatus('Erro ao buscar referência: ' + e.message, 'erro');
     })
     .buscarDadosPorReferencia(ref);
 }
 
-// ── Carrega tempos para ref+cor+larg (sem nova chamada ao servidor) ──
+// ── Carrega tempos para ref+larg (cor não tem relação com o tempo) ──
 function carregarTemposPorCombinacao() {
-  var cor  = document.getElementById('inputCor').value.trim().toUpperCase();
   var larg = document.getElementById('inputLarg').value.trim().toUpperCase();
-
-  var corExiste  = cor  && dadosRef.cores.some(function(c)    { return c.toUpperCase() === cor;  });
   var largExiste = larg && dadosRef.larguras.some(function(l) { return l.toUpperCase() === larg; });
 
-  // Largura nova (não existe na ref) → tudo em branco para o usuário preencher
-  if (larg && !largExiste) {
+  // Sem largura → mostra tempos gerais da referência
+  if (!larg) {
+    renderizarTabela(dadosServidor.maquinas, dadosRef.temposGerais || {}, {});
+    return;
+  }
+
+  // Largura nova (não existe na ref) → campos em branco para o usuário preencher
+  if (!largExiste) {
     renderizarTabela(dadosServidor.maquinas, {}, {});
     return;
   }
 
-  // temposExibir: SEMPRE baseado na referência inteira, filtrado só por larg (se informada)
-  // A cor NÃO filtra temposExibir — a tabela mostra todas as máquinas onde a ref existe
-  var temposExibir = !larg
-    ? (dadosRef.temposGerais || {})   // sem larg → tempos gerais da ref
-    : (function() {                    // com larg → filtra por larg em qualquer cor
-        var t = {};
-        dadosRef.combinacoes.forEach(function(c) {
-          if (c.larg.toUpperCase() === larg) {
-            for (var aba in c.tempos) { if (!t[aba]) t[aba] = c.tempos[aba]; }
-          }
-        });
-        return t;
-      })();
+  // Largura existente → coleta todos os tempos para ref+larg (de qualquer cor)
+  // Badge "Existente" = ref+larg já cadastrada naquela máquina (cor não importa)
+  var t = {};
+  dadosRef.combinacoes.forEach(function(c) {
+    if (c.larg.toUpperCase() === larg) {
+      for (var aba in c.tempos) { if (t[aba] === undefined) t[aba] = c.tempos[aba]; }
+    }
+  });
 
-  // temposExatos: só quando cor+larg exatos existem (badge "Existente" + checkbox marcada)
-  var temposExatos = {};
-  if (corExiste && largExiste) {
-    dadosRef.combinacoes.forEach(function(c) {
-      if (c.cor.toUpperCase() === cor && c.larg.toUpperCase() === larg) {
-        for (var aba in c.tempos) { if (!temposExatos[aba]) temposExatos[aba] = c.tempos[aba]; }
-      }
-    });
-  }
-
-  renderizarTabela(dadosServidor.maquinas, temposExibir, temposExatos);
+  // temposExatos = mesmos que temposExibir: existência é baseada em ref+larg
+  renderizarTabela(dadosServidor.maquinas, t, t);
 }
 
 function atualizarHintLarg() {
-  var cor = document.getElementById('inputCor').value.trim().toUpperCase();
-  var corExiste = dadosRef.cores.some(function(c) { return c.toUpperCase() === cor; });
-  // Quando cor é nova: mostra todas as larguras da referência
-  var largs = corExiste ? optsLarg() : dadosRef.larguras;
-  if (largs.length > 0) {
-    setHint('hintLarg', largs.length + ' largura(s) disponível(is)' + (corExiste ? ' para essa cor' : ' na referência'));
-  } else {
-    setHint('hintLarg', '');
-  }
+  var n = dadosRef.larguras.length;
+  setHint('hintLarg', n > 0 ? n + ' largura(s) disponível(is) na referência' : '');
 }
 
 function setHint(id, txt) {
@@ -432,8 +433,9 @@ function enviarDados() {
 
 // ── Limpar formulário ───────────────────────────────────────
 function limparForm() {
+  setCarregando(false);
   ['inputRef','inputCor','inputLarg'].forEach(function(id) { document.getElementById(id).value = ''; });
-  ['hintCor','hintLarg'].forEach(function(id) { setHint(id, ''); });
+  ['hintRef','hintCor','hintLarg'].forEach(function(id) { setHint(id, ''); });
   dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
   temposExistentes = {};
   temposUsuario = {};
