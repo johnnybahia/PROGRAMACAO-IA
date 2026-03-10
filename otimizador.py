@@ -63,6 +63,10 @@ CONFIG = {
     'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
     'LIMIAR_TROCA_PERCENT': 10,
+    # Penalidade por atraso: cada hora de atraso em relação ao deadline equivale a
+    # PENALIDADE_ATRASO horas de makespan na função de custo. Isso garante que
+    # pedidos urgentes sejam priorizados em TODAS as estratégias e no SA.
+    'PENALIDADE_ATRASO':    5.0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
         'DATAS FORA DE PROGRAMAÇÃO',
@@ -598,6 +602,46 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
     return maior
 
 
+# ── CUSTO COM PENALIDADE DE ATRASO ───────────────────────────────────────────
+def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
+    """
+    Como simular_termino, mas penaliza atrasos em relação ao deadline de cada pedido.
+    Retorna: makespan + PENALIDADE_ATRASO × soma_dos_atrasos_em_horas
+
+    Isso garante que pedidos urgentes sejam priorizados em TODAS as estratégias,
+    no Simulated Annealing e no 2-opt — não apenas quando EDD é escolhida.
+    Thread-safe (cria 'filas' local).
+    """
+    filas           = np.zeros(num_machines, dtype=np.float64)
+    maior           = 0.0
+    total_tardiness = 0.0
+    for p in pedidos:
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
+        min_s      = float(p.get('min_start', 0.0))
+        pedido_fim = 0.0
+        for _ in range(p['maquinas_necessarias']):
+            available = np.maximum(filas[gidxs], min_s)
+            ft   = available + tempos
+            best = int(np.argmin(ft))
+            fim  = float(ft[best])
+            filas[gidxs[best]] = fim
+            if fim > maior:
+                maior = fim
+            if fim > pedido_fim:
+                pedido_fim = fim
+        dl = p.get('deadline_horas')
+        if dl is not None and pedido_fim > dl:
+            total_tardiness += pedido_fim - dl
+    return maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
+
+
 # ── ESTRATÉGIAS ──────────────────────────────────────────────────────────────
 def get_menor_tempo(ref: str, modelos: dict) -> float:
     menor = float('inf')
@@ -687,11 +731,11 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         if n < 4:
             return list(edd(pedidos))
 
-        # Semente: melhor entre EDD, WSPT e Mais Rápido
+        # Semente: melhor entre EDD, WSPT e Mais Rápido (usando custo com penalidade)
         candidatos_ini = [list(edd(pedidos)), list(wspt(pedidos)), list(rapido(pedidos))]
         current = min(candidatos_ini,
-                      key=lambda o: simular_termino(o, ref_data, num_machines))
-        current_t = simular_termino(current, ref_data, num_machines)
+                      key=lambda o: simular_custo(o, ref_data, num_machines))
+        current_t = simular_custo(current, ref_data, num_machines)
         best, best_t = list(current), current_t
 
         T       = current_t * CONFIG['SA_T0_FRAC']
@@ -700,9 +744,19 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
 
         for _ in range(iters):
             a, b = random.sample(range(n), 2)
+            # Restrição EDD: só permite troca se o pedido que avança na fila
+            # tem deadline ≤ ao que recua. Garante que pedidos urgentes nunca
+            # fiquem atrás de pedidos menos urgentes durante a busca.
+            pa, pb = current[a], current[b]
+            dl_a = pa.get('deadline_horas')
+            dl_b = pb.get('deadline_horas')
+            _dl_a = dl_a if dl_a is not None else float('inf')
+            _dl_b = dl_b if dl_b is not None else float('inf')
+            if _dl_b > _dl_a:
+                continue  # violaria EDD: pedido menos urgente iria para frente
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
-            neighbor_t = simular_termino(neighbor, ref_data, num_machines)
+            neighbor_t = simular_custo(neighbor, ref_data, num_machines)
             delta = neighbor_t - current_t
             if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
                 current, current_t = neighbor, neighbor_t
@@ -777,10 +831,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
     """
     n = len(ordenados)
     if n < 2:
-        return list(ordenados), simular_termino(ordenados, ref_data, num_machines)
+        return list(ordenados), simular_custo(ordenados, ref_data, num_machines)
 
     melhor   = list(ordenados)
-    melhor_t = simular_termino(melhor, ref_data, num_machines)
+    melhor_t = simular_custo(melhor, ref_data, num_machines)
     max_n    = CONFIG['2OPT_MAX_N']
 
     for _ in range(CONFIG['2OPT_PASSES']):
@@ -804,7 +858,7 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
                 continue  # violaria EDD: ordem menos urgente iria para frente
             cand      = list(melhor)
             cand[a], cand[b] = cand[b], cand[a]
-            t = simular_termino(cand, ref_data, num_machines)
+            t = simular_custo(cand, ref_data, num_machines)
             if t < melhor_t - 1e-9:
                 melhor, melhor_t = cand, t
                 melhorou = True
@@ -828,12 +882,12 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         ord_g = [est['fn'](g['pedidos']) for est in estrategias]
         group_orderings.append(ord_g)
 
-    # Ranking individual (todos os pedidos juntos)
+    # Ranking individual (todos os pedidos juntos) — usa custo com penalidade de atraso
     print('  Calculando ranking individual das estratégias...')
     ranking = []
     for est in estrategias:
         ordenados = est['fn'](pedidos)
-        t = simular_termino(ordenados, ref_data, num_machines)
+        t = simular_custo(ordenados, ref_data, num_machines)
         ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t), 'ordenados': ordenados})
     t_ref_rank = next(r for r in ranking if r['id'] == 'edd')['terminoTotal']
     for r in ranking:
@@ -841,10 +895,10 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         r['percentual'] = _round(((r['terminoTotal'] - t_ref_rank) / t_ref_rank) * 100) if t_ref_rank > 0 else 0
     ranking.sort(key=lambda r: r['terminoTotal'])
 
-    # Referência: EDD em todos os grupos
+    # Referência: EDD em todos os grupos — usa custo com penalidade de atraso
     comb_ref      = [idx_ref] * num_grupos
     ordenados_ref = [p for g_idx, g in enumerate(grupos) for p in group_orderings[g_idx][idx_ref]]
-    tempo_ref     = simular_termino(ordenados_ref, ref_data, num_machines)
+    tempo_ref     = simular_custo(ordenados_ref, ref_data, num_machines)
 
     # Testa TODAS as combinações em paralelo
     combinacoes = gerar_combinacoes(num_grupos, len(estrategias))
@@ -856,7 +910,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
 
     def _eval(comb):
         ordenados = [p for g_i, g in enumerate(grupos) for p in group_orderings[g_i][comb[g_i]]]
-        return simular_termino(ordenados, ref_data, num_machines), comb, ordenados
+        return simular_custo(ordenados, ref_data, num_machines), comb, ordenados
 
     workers = min(os.cpu_count() or 4, len(combinacoes))
     with ThreadPoolExecutor(max_workers=workers) as ex:
