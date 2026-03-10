@@ -73,6 +73,18 @@
   .badge-fim  { background: #e8f0fe; color: #1a73e8; padding: 1px 6px; border-radius: 10px; font-size: 11px; }
   .badge-fer  { background: #fce8e6; color: #c5221f; padding: 1px 6px; border-radius: 10px; font-size: 11px; }
 
+  /* Resultado da busca */
+  #busca-resultado {
+    margin-top: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    display: none;
+  }
+  #busca-resultado.encontrada  { background: #e6f4ea; color: #1e8e3e; border: 1px solid #a8d5b5; }
+  #busca-resultado.nao-encontrada { background: #fce8e6; color: #c5221f; border: 1px solid #f5b7b1; }
+
   /* Checkboxes */
   .chk-row { display: flex; gap: 16px; margin-top: 6px; }
   .chk-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: #333; cursor: pointer; margin: 0; }
@@ -123,6 +135,19 @@
     </div>
     <button class="btn btn-primary" onclick="adicionarFimDeSemana()">Bloquear</button>
   </div>
+</div>
+
+<!-- Consultar data -->
+<div class="card">
+  <h3>🔍 Consultar se uma data está bloqueada</h3>
+  <div class="row" style="margin-top:6px;">
+    <div>
+      <label>Data para consultar</label>
+      <input type="date" id="inp-busca" oninput="consultarData()">
+    </div>
+    <button class="btn btn-primary" onclick="consultarData()">Consultar</button>
+  </div>
+  <div id="busca-resultado"></div>
 </div>
 
 <!-- Lista de datas bloqueadas -->
@@ -196,6 +221,8 @@
   /* ─── renderizar lista ────────────────────────────────────── */
 
   function renderLista() {
+    // Revalida a busca ativa após atualização da lista
+    if (document.getElementById("inp-busca").value) consultarData();
     var wrap = document.getElementById("lista-wrap");
     document.getElementById("contador").textContent = _datas.length > 0
       ? "(" + _datas.length + " data" + (_datas.length > 1 ? "s" : "") + ")"
@@ -271,6 +298,36 @@
       return;
     }
     salvar(adicionadas + " dia(s) de fim de semana de " + ano + " adicionados.");
+  }
+
+  /* ─── consultar data ─────────────────────────────────────── */
+
+  function consultarData() {
+    var val = document.getElementById("inp-busca").value;
+    var res = document.getElementById("busca-resultado");
+
+    if (!val) {
+      res.style.display = "none";
+      return;
+    }
+
+    var dmy  = toDMY(val);
+    var dia  = diaSemana(dmy);
+    var ano  = anoDeData(dmy);
+    var idx  = _datas.indexOf(dmy);
+    var fim  = (dia === "Sábado" || dia === "Domingo");
+
+    res.style.display = "block";
+
+    if (idx !== -1) {
+      res.className = "encontrada";
+      res.innerHTML = "✅ <b>" + dmy + "</b> (" + dia + ", " + ano + ") — "
+        + (fim ? "Fim de semana bloqueado" : "Feriado / data especial bloqueada")
+        + " &nbsp;<button class=\"btn-danger\" onclick=\"excluirData(" + idx + ");document.getElementById('busca-resultado').style.display='none';\">Excluir</button>";
+    } else {
+      res.className = "nao-encontrada";
+      res.innerHTML = "❌ <b>" + dmy + "</b> (" + dia + ", " + ano + ") — <b>não está</b> na lista de datas bloqueadas.";
+    }
   }
 
   /* ─── excluir data ───────────────────────────────────────── */
