@@ -1,4 +1,31 @@
 <!DOCTYPE html>
+<!--
+  ════════════════════════════════════════════════════════════════
+  PADRÃO OBRIGATÓRIO — LOADING STATE (leia antes de editar)
+  ════════════════════════════════════════════════════════════════
+  TODA chamada a google.script.run DEVE seguir este padrão:
+
+    setAguarde(true, "mensagem ao usuário...");
+    google.script.run
+      .withSuccessHandler(function(resultado) {
+        setAguarde(false);
+        // ... tratar resultado
+      })
+      .withFailureHandler(function(e) {
+        setAguarde(false);
+        mostrarErro(e);
+      })
+      .nomeDaFuncaoNoServidor(args);
+
+  setAguarde(sim, msg):
+    - true  → exibe overlay "⏳ Aguarde..." cobrindo todo o dialog
+               e desabilita todos os botões de ação
+    - false → remove overlay e reabilita botões
+
+  NUNCA remova este padrão. O Google Apps Script pode demorar
+  vários segundos por chamada — o usuário PRECISA do feedback visual.
+  ════════════════════════════════════════════════════════════════
+-->
 <html>
 <head>
 <meta charset="UTF-8">
@@ -41,23 +68,43 @@
     white-space: nowrap;
   }
   .btn-primary { background: #1a73e8; color: #fff; }
-  .btn-primary:hover { background: #1558b0; }
+  .btn-primary:hover:not(:disabled) { background: #1558b0; }
+  .btn-primary:disabled { background: #a8c7fa; cursor: not-allowed; }
   .btn-danger  { background: #ea4335; color: #fff; font-size: 11px; padding: 0 8px; height: 26px; border-radius: 3px; border: none; cursor: pointer; }
   .btn-danger:hover { background: #c5221f; }
 
+  /* ── Overlay de aguarde ────────────────────────────────── */
+  #overlay-aguarde {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(255,255,255,0.82);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #overlay-aguarde.visivel { display: flex; }
+  #overlay-aguarde .ov-spinner {
+    width: 36px; height: 36px;
+    border: 4px solid #c5cae9;
+    border-top-color: #1a73e8;
+    border-radius: 50%;
+    animation: spin .75s linear infinite;
+  }
+  #overlay-aguarde .ov-msg {
+    font-size: 14px; font-weight: 600; color: #1a73e8;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* Lista de datas */
   #lista-wrap {
-    max-height: 260px;
+    max-height: 230px;
     overflow-y: auto;
     border: 1px solid #dadce0;
     border-radius: 6px;
     background: #fff;
-  }
-  #lista-vazia {
-    padding: 18px;
-    text-align: center;
-    color: #888;
-    font-style: italic;
   }
   table { width: 100%; border-collapse: collapse; }
   th {
@@ -75,14 +122,10 @@
 
   /* Resultado da busca */
   #busca-resultado {
-    margin-top: 8px;
-    padding: 8px 12px;
-    border-radius: 6px;
-    font-size: 13px;
-    font-weight: 600;
-    display: none;
+    margin-top: 8px; padding: 8px 12px;
+    border-radius: 6px; font-size: 13px; font-weight: 600; display: none;
   }
-  #busca-resultado.encontrada  { background: #e6f4ea; color: #1e8e3e; border: 1px solid #a8d5b5; }
+  #busca-resultado.encontrada     { background: #e6f4ea; color: #1e8e3e; border: 1px solid #a8d5b5; }
   #busca-resultado.nao-encontrada { background: #fce8e6; color: #c5221f; border: 1px solid #f5b7b1; }
 
   /* Checkboxes */
@@ -90,12 +133,9 @@
   .chk-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: #333; cursor: pointer; margin: 0; }
 
   /* Status bar */
-  #status { margin-top: 10px; font-size: 12px; min-height: 18px; }
+  #status { margin-top: 8px; font-size: 12px; min-height: 18px; }
   .ok  { color: #1e8e3e; }
   .err { color: #c5221f; }
-
-  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #1a73e8; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 4px; }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   .footer { display: flex; justify-content: flex-end; margin-top: 10px; }
   .btn-close { background: #f1f3f4; color: #444; border: 1px solid #dadce0; }
@@ -103,6 +143,12 @@
 </style>
 </head>
 <body>
+
+<!-- ── Overlay de aguarde (padrão obrigatório — ver comentário no topo) ── -->
+<div id="overlay-aguarde">
+  <div class="ov-spinner"></div>
+  <div class="ov-msg" id="overlay-msg">Aguarde...</div>
+</div>
 
 <h2>📅 Datas Fora de Programação</h2>
 
@@ -114,7 +160,7 @@
       <label>Data</label>
       <input type="date" id="inp-data">
     </div>
-    <button class="btn btn-primary" onclick="adicionarDataEspecifica()">Adicionar</button>
+    <button class="btn btn-primary" id="btn-adicionar" onclick="adicionarDataEspecifica()">Adicionar</button>
   </div>
 </div>
 
@@ -133,7 +179,7 @@
         <label><input type="checkbox" id="chk-dom" checked> Domingos</label>
       </div>
     </div>
-    <button class="btn btn-primary" onclick="adicionarFimDeSemana()">Bloquear</button>
+    <button class="btn btn-primary" id="btn-bloquear" onclick="adicionarFimDeSemana()">Bloquear</button>
   </div>
 </div>
 
@@ -154,42 +200,65 @@
 <div class="card" style="padding-bottom:10px;">
   <h3>Datas já bloqueadas <span id="contador" style="font-weight:400;color:#888;"></span></h3>
   <div id="lista-wrap" style="margin-top:8px;">
-    <div id="lista-vazia">Carregando...</div>
+    <div style="padding:18px;text-align:center;color:#888;font-style:italic;">Carregando...</div>
   </div>
 </div>
 
 <div id="status"></div>
 
 <div class="footer">
-  <button class="btn btn-close" onclick="google.script.host.close()">Fechar</button>
+  <button class="btn btn-close" id="btn-fechar" onclick="google.script.host.close()">Fechar</button>
 </div>
 
 <script>
   var _datas = []; // array de strings DD/MM/YYYY (estado local)
+  var DIAS   = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
 
-  // Nomes dos dias
-  var DIAS = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+  // IDs dos botões de ação que devem ser bloqueados durante carregamento
+  var BTNS_ACAO = ["btn-adicionar", "btn-bloquear", "btn-fechar"];
 
-  // Popula selector de anos (atual-2 até atual+3)
+  // ── Popula selector de anos ─────────────────────────────────
   (function() {
     var anoAtual = new Date().getFullYear();
     var sel = document.getElementById("sel-ano");
     for (var a = anoAtual - 2; a <= anoAtual + 3; a++) {
       var opt = document.createElement("option");
-      opt.value = a;
-      opt.textContent = a;
+      opt.value = a; opt.textContent = a;
       if (a === anoAtual) opt.selected = true;
       sel.appendChild(opt);
     }
-    // Define data mínima como hoje
     document.getElementById("inp-data").value = toInputDate(new Date());
   })();
 
-  // Carrega datas ao abrir
+  // ── Carga inicial ────────────────────────────────────────────
+  // (padrão obrigatório: setAguarde antes, setAguarde(false) nos handlers)
+  setAguarde(true, "Carregando datas bloqueadas...");
   google.script.run
-    .withSuccessHandler(function(lista) { _datas = lista || []; renderLista(); })
-    .withFailureHandler(mostrarErro)
+    .withSuccessHandler(function(lista) {
+      setAguarde(false);
+      _datas = lista || [];
+      renderLista();
+    })
+    .withFailureHandler(function(e) {
+      setAguarde(false);
+      mostrarErro(e);
+    })
     .lerDatasBlockeadas();
+
+  /* ─── overlay de aguarde ─────────────────────────────────────
+   * PADRÃO OBRIGATÓRIO — chamar em TODA google.script.run
+   * sim=true  → exibe overlay + desabilita botões
+   * sim=false → oculta overlay + reabilita botões
+   */
+  function setAguarde(sim, msg) {
+    var overlay = document.getElementById("overlay-aguarde");
+    overlay.classList.toggle("visivel", sim);
+    if (msg) document.getElementById("overlay-msg").textContent = msg;
+    BTNS_ACAO.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.disabled = sim;
+    });
+  }
 
   /* ─── helpers ─────────────────────────────────────────────── */
 
@@ -200,7 +269,6 @@
   }
 
   function toDMY(isoStr) {
-    // "YYYY-MM-DD" → "DD/MM/YYYY"
     var p = isoStr.split("-");
     return p[2] + "/" + p[1] + "/" + p[0];
   }
@@ -210,18 +278,12 @@
     return new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
   }
 
-  function diaSemana(s) {
-    return DIAS[parseDMY(s).getDay()];
-  }
-
-  function anoDeData(s) {
-    return s.split("/")[2];
-  }
+  function diaSemana(s) { return DIAS[parseDMY(s).getDay()]; }
+  function anoDeData(s)  { return s.split("/")[2]; }
 
   /* ─── renderizar lista ────────────────────────────────────── */
 
   function renderLista() {
-    // Revalida a busca ativa após atualização da lista
     if (document.getElementById("inp-busca").value) consultarData();
     var wrap = document.getElementById("lista-wrap");
     document.getElementById("contador").textContent = _datas.length > 0
@@ -229,7 +291,7 @@
       : "";
 
     if (_datas.length === 0) {
-      wrap.innerHTML = '<div id="lista-vazia">Nenhuma data bloqueada.</div>';
+      wrap.innerHTML = '<div style="padding:18px;text-align:center;color:#888;font-style:italic;">Nenhuma data bloqueada.</div>';
       return;
     }
 
@@ -272,23 +334,20 @@
   /* ─── bloquear finais de semana ──────────────────────────── */
 
   function adicionarFimDeSemana() {
-    var ano   = parseInt(document.getElementById("sel-ano").value);
-    var sab   = document.getElementById("chk-sab").checked;
-    var dom   = document.getElementById("chk-dom").checked;
+    var ano = parseInt(document.getElementById("sel-ano").value);
+    var sab = document.getElementById("chk-sab").checked;
+    var dom = document.getElementById("chk-dom").checked;
     if (!sab && !dom) { mostrarErro("Selecione pelo menos Sábado ou Domingo."); return; }
 
     var adicionadas = 0;
     var d = new Date(ano, 0, 1);
     while (d.getFullYear() === ano) {
-      var dow = d.getDay(); // 0=Dom, 6=Sab
+      var dow = d.getDay();
       if ((dow === 6 && sab) || (dow === 0 && dom)) {
         var dd  = String(d.getDate()).padStart(2,"0");
         var mm  = String(d.getMonth()+1).padStart(2,"0");
         var dmy = dd + "/" + mm + "/" + ano;
-        if (_datas.indexOf(dmy) === -1) {
-          _datas.push(dmy);
-          adicionadas++;
-        }
+        if (_datas.indexOf(dmy) === -1) { _datas.push(dmy); adicionadas++; }
       }
       d.setDate(d.getDate() + 1);
     }
@@ -305,20 +364,15 @@
   function consultarData() {
     var val = document.getElementById("inp-busca").value;
     var res = document.getElementById("busca-resultado");
+    if (!val) { res.style.display = "none"; return; }
 
-    if (!val) {
-      res.style.display = "none";
-      return;
-    }
-
-    var dmy  = toDMY(val);
-    var dia  = diaSemana(dmy);
-    var ano  = anoDeData(dmy);
-    var idx  = _datas.indexOf(dmy);
-    var fim  = (dia === "Sábado" || dia === "Domingo");
+    var dmy = toDMY(val);
+    var dia = diaSemana(dmy);
+    var ano = anoDeData(dmy);
+    var idx = _datas.indexOf(dmy);
+    var fim = (dia === "Sábado" || dia === "Domingo");
 
     res.style.display = "block";
-
     if (idx !== -1) {
       res.className = "encontrada";
       res.innerHTML = "✅ <b>" + dmy + "</b> (" + dia + ", " + ano + ") — "
@@ -338,33 +392,40 @@
     salvar("Data " + d + " removida.");
   }
 
-  /* ─── salvar (chama servidor e re-renderiza) ─────────────── */
-
+  /* ─── salvar ─────────────────────────────────────────────────
+   * (padrão obrigatório: setAguarde antes, setAguarde(false) nos handlers)
+   */
   function salvar(msg) {
-    setStatus('<span class="spinner"></span> Salvando...');
-    // Envia cópia ordenada para o servidor
+    setStatus("");
+    setAguarde(true, "Salvando...");
     var copia = _datas.slice();
     google.script.run
-      .withSuccessHandler(function(res) {
-        // Recarrega a lista do servidor para garantir consistência
+      .withSuccessHandler(function() {
+        // Recarrega do servidor para garantir consistência
+        setAguarde(true, "Atualizando lista...");
         google.script.run
           .withSuccessHandler(function(lista) {
+            setAguarde(false);
             _datas = lista || [];
             renderLista();
             setStatus('<span class="ok">✔ ' + msg + '</span>');
           })
-          .withFailureHandler(mostrarErro)
+          .withFailureHandler(function(e) {
+            setAguarde(false);
+            mostrarErro(e);
+          })
           .lerDatasBlockeadas();
       })
-      .withFailureHandler(mostrarErro)
+      .withFailureHandler(function(e) {
+        setAguarde(false);
+        mostrarErro(e);
+      })
       .salvarDatasBlockeadas(copia);
   }
 
   /* ─── status / erro ──────────────────────────────────────── */
 
-  function setStatus(html) {
-    document.getElementById("status").innerHTML = html;
-  }
+  function setStatus(html) { document.getElementById("status").innerHTML = html; }
 
   function mostrarErro(e) {
     setStatus('<span class="err">⚠ ' + (e.message || e) + '</span>');
