@@ -235,6 +235,8 @@ document.getElementById('inputRef').addEventListener('input', function() {
   clearTimeout(_debRef);
   var val = this.value.trim();
   if (val.length < 2) {
+    ++_refToken;           // invalida qualquer chamada em andamento
+    setCarregando(false);  // garante que o aviso de aguarde suma
     dadosRef = { cores: [], larguras: [], combinacoes: [], temposGerais: {} };
     temposExistentes = {};
     temposUsuario = {};
