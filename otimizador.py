@@ -304,11 +304,24 @@ def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -
     """
     Converte uma data alvo em offset de horas virtuais a partir de base_date,
     excluindo dias bloqueados da contagem.
+
+    Retorna valor negativo quando target_date < base_date, preservando a ordem
+    relativa de prazos vencidos — essencial para que o EDD continue funcionando
+    corretamente mesmo quando a data de entrega já passou.
     """
-    if target_date <= base_date:
+    hpd = CONFIG['HORAS_POR_DIA']
+    if target_date == base_date:
         return 0.0
-    hpd       = CONFIG['HORAS_POR_DIA']
-    dias      = 0
+    if target_date < base_date:
+        # Contagem regressiva: resultado negativo preserva a ordem EDD para prazos vencidos
+        dias = 0
+        data_atual = target_date
+        while data_atual < base_date:
+            data_atual += timedelta(days=1)
+            if data_atual not in datas_bloqueadas:
+                dias += 1
+        return -float(dias * hpd)
+    dias = 0
     data_atual = base_date
     while data_atual < target_date:
         data_atual += timedelta(days=1)
