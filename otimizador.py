@@ -913,10 +913,14 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         """
         def _folga(p):
             dl     = p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+            min_s  = float(p.get('min_start', 0.0))
             tempos = p.get('_tempos')
             t_min  = (float(np.min(tempos)) if tempos is not None and len(tempos) > 0
                       else get_menor_tempo(p['referencia'], modelos))
-            folga  = dl - t_min
+            # Folga real = janela disponível após o início permitido menos o tempo de produção.
+            # Subtrai min_start para que pedidos com data mínima de início não tenham
+            # sua urgência subestimada (a janela deles é menor do que o deadline sugere).
+            folga  = (dl - min_s - t_min) if dl != float('inf') else float('inf')
             return (folga, dl, p.get('cor', ''))
         return sorted(pedidos, key=_folga)
 
