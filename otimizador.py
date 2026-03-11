@@ -869,6 +869,26 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         # otimizada dentro de grupos de mesmo deadline.
         return _sort_by_edd(best)
 
+    def mdd_rapido(pedidos):
+        """
+        Mais Atrasado + Mais Rápido — ordena do pedido mais atrasado/urgente para
+        o mais distante no prazo; dentro do mesmo prazo, favorece o menor tempo de
+        produção (libera máquinas mais cedo para os próximos pedidos urgentes).
+
+        Diferença em relação ao EDD puro: usa o menor tempo de processamento real
+        (tempos pré-computados por máquina quando disponíveis) como critério de
+        desempate explícito — não apenas a data de entrega.
+        Diferença em relação ao 'Mais Rápido': a velocidade é secundária; o prazo
+        é sempre chave primária, nunca abre mão da ordem de urgência.
+        """
+        def _key(p):
+            dl    = p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+            tempos = p.get('_tempos')
+            t_min  = (float(np.min(tempos)) if tempos is not None and len(tempos) > 0
+                      else get_menor_tempo(p['referencia'], modelos))
+            return (dl, t_min, p.get('cor', ''))
+        return sorted(pedidos, key=_key)
+
     def _com_edd(fn):
         """
         Wrapper obrigatório: aplica a estratégia fn como critério de desempate
@@ -907,6 +927,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         {'id': 'sa',           'nome': '8 — Simulated Annealing',
          'descricao': f'Metaheurística: otimiza dentro da ordem EDD, {CONFIG["SA_ITER_MULT"]}× iterações',
          'fn': simulated_annealing},
+        {'id': 'mdd_rapido',   'nome': '9 — Mais Atrasado + Mais Rápido',
+         'descricao': 'Prazo mais urgente/atrasado primeiro; desempate pelo menor tempo de produção na máquina',
+         'fn': mdd_rapido},
     ]
 
 
@@ -1148,9 +1171,9 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     todo_ref = is_todo_ref(comb_final)
 
     def _nome_res(n):
-        return n.replace('✅ ', '').replace('2 — ', '').replace('3 — ', '') \
-                .replace('4 — ', '').replace('5 — ', '').replace('6 — ', '') \
-                .replace('7 — ', '')[:22]
+        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — '):
+            n = n.replace(prefix, '')
+        return n[:22]
 
     nome_est = (estrategias[idx_ref]['nome'] if todo_ref
                 else ' | '.join(f"G{g['grupo']}: {_nome_res(g['estrategia']['nome'])}"
