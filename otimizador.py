@@ -294,11 +294,17 @@ def parse_data(s: str):
     return None
 
 
+def _dia_util(d: date, datas_bloqueadas: set) -> bool:
+    """Retorna True se o dia é útil: segunda a sexta e não está em datas_bloqueadas."""
+    return d.weekday() < 5 and d not in datas_bloqueadas
+
+
 def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set) -> datetime:
     """
-    Converte offset em horas virtuais (excluindo dias bloqueados) para datetime real.
+    Converte offset em horas virtuais (excluindo fins de semana e dias bloqueados)
+    para datetime real.
     base_date é o dia 0 do planejamento (hora 0).
-    Dias bloqueados são pulados — não contam para o offset.
+    Apenas dias úteis (seg–sex) que não estejam em datas_bloqueadas contam.
     """
     hpd = CONFIG['HORAS_POR_DIA']
     if horas_offset <= 0:
@@ -311,7 +317,7 @@ def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set)
     dias_contados = 0
     while dias_contados < dias_completos:
         data_atual += timedelta(days=1)
-        if data_atual not in datas_bloqueadas:
+        if _dia_util(data_atual, datas_bloqueadas):
             dias_contados += 1
 
     return datetime.combine(data_atual, datetime.min.time()) + timedelta(hours=horas_restantes)
@@ -320,7 +326,7 @@ def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set)
 def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -> float:
     """
     Converte uma data alvo em offset de horas virtuais a partir de base_date,
-    excluindo dias bloqueados da contagem.
+    contando apenas dias úteis (seg–sex) que não estejam em datas_bloqueadas.
 
     Retorna valor negativo quando target_date < base_date, preservando a ordem
     relativa de prazos vencidos — essencial para que o EDD continue funcionando
@@ -335,14 +341,14 @@ def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -
         data_atual = target_date
         while data_atual < base_date:
             data_atual += timedelta(days=1)
-            if data_atual not in datas_bloqueadas:
+            if _dia_util(data_atual, datas_bloqueadas):
                 dias += 1
         return -float(dias * hpd)
     dias = 0
     data_atual = base_date
     while data_atual < target_date:
         data_atual += timedelta(days=1)
-        if data_atual not in datas_bloqueadas:
+        if _dia_util(data_atual, datas_bloqueadas):
             dias += 1
     return float(dias * hpd)
 
@@ -813,6 +819,10 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             p.get('min_start', 0.0),
         ))
 
+    def _dl(p):
+        """Chave de deadline para sort: prazos vencidos (negativos) primeiro."""
+        return p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+
     def balanceamento(pedidos):
         grupos = {}
         for p in pedidos:
@@ -824,6 +834,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                         best_t   = t
                         best_aba = aba
             grupos.setdefault(best_aba, []).append(p)
+        # Ordena cada grupo por prazo antes do interleave
+        for k in grupos:
+            grupos[k].sort(key=_dl)
         chaves  = list(grupos.keys())
         result  = []
         while any(grupos[k] for k in chaves):
@@ -834,18 +847,20 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
 
     def rapido(pedidos):
         return sorted(pedidos, key=lambda p: (
+            _dl(p),
             get_menor_tempo(p['referencia'], modelos),
             p['referencia'], p.get('cor', ''),
         ))
 
     def menor_demanda(pedidos):
-        return sorted(pedidos, key=lambda p: (p['maquinas_necessarias'], p.get('cor', '')))
+        return sorted(pedidos, key=lambda p: (_dl(p), p['maquinas_necessarias'], p.get('cor', '')))
 
     def maior_demanda(pedidos):
-        return sorted(pedidos, key=lambda p: (-p['maquinas_necessarias'], p.get('cor', '')))
+        return sorted(pedidos, key=lambda p: (_dl(p), -p['maquinas_necessarias'], p.get('cor', '')))
 
     def lento(pedidos):
         return sorted(pedidos, key=lambda p: (
+            _dl(p),
             -get_menor_tempo(p['referencia'], modelos), p.get('cor', ''),
         ))
 
