@@ -62,11 +62,15 @@ CONFIG = {
     'ABA_RESULTADO':        'DISTRIBUIÇÃO',
     'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
-    'LIMIAR_TROCA_PERCENT': 10,
-    # Penalidade por atraso: cada hora de atraso em relação ao deadline equivale a
-    # PENALIDADE_ATRASO horas de makespan na função de custo. Isso garante que
-    # pedidos urgentes sejam priorizados em TODAS as estratégias e no SA.
-    'PENALIDADE_ATRASO':    5.0,
+    # Limiar 0 → qualquer estratégia que reduza o custo total (mesmo por margem mínima)
+    # vence o EDD. Com a função de custo priorizando atrasos, isso garante que o
+    # algoritmo sempre escolha o caminho com menor latência, sem preferência por makespan.
+    'LIMIAR_TROCA_PERCENT': 0,
+    # Penalidade por atraso: 50× faz cada hora de atraso pesar 50 horas de makespan.
+    # Com makespan típico de 300–500h, atrasar 1 pedido em 10h eleva o custo tanto
+    # quanto aumentar o makespan total em 500h — ou seja, entregar no prazo é objetivo
+    # dominante; o makespan só desempata quando todos os prazos já estão cumpridos.
+    'PENALIDADE_ATRASO':    50.0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
         'DATAS FORA DE PROGRAMAÇÃO',
@@ -717,7 +721,17 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
                 pedido_fim = fim
         dl = p.get('deadline_horas')
         if dl is not None and pedido_fim > dl:
-            total_tardiness += pedido_fim - dl
+            tardiness = pedido_fim - dl
+            # Peso de urgência: pedidos que já estavam atrasados no início do planejamento
+            # (deadline_horas negativo) recebem peso maior — cada dia de atraso pré-existente
+            # adiciona 1 ao peso base, tornando pedidos mais atrasados proporcionalmente
+            # mais custosos de atrasar ainda mais.
+            # Exemplos: já 0 dias atrasado → peso 1.0
+            #           já 2 dias atrasado → peso 3.0 (3× mais importante)
+            #           já 5 dias atrasado → peso 6.0
+            dias_ja_atrasado = max(0.0, -dl) / 24.0
+            urgencia = 1.0 + dias_ja_atrasado
+            total_tardiness += urgencia * tardiness
     return maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
 
 
