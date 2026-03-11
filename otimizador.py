@@ -328,6 +328,14 @@ def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -
     return float(dias * hpd)
 
 
+def _semana_id(data_entrega) -> int | None:
+    """Retorna identificador único de semana ISO (ano*100 + semana) ou None."""
+    if data_entrega is None:
+        return None
+    iso = data_entrega.isocalendar()
+    return int(iso[0]) * 100 + int(iso[1])
+
+
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
 def ler_data_base(spreadsheet) -> date:
     """Lê a data base de início (célula M1) da aba PEDIDO."""
@@ -431,6 +439,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             'maquinas_necessarias': total_maq,
             'data_entrega':         data_entrega,
             'deadline_horas':       deadline_horas,
+            '_semana':              _semana_id(data_entrega),
             'data_especial':        data_esp,
             'min_start':            min_start,
             'maquina_especial':     maquina_especial,
@@ -874,10 +883,15 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             # random.sample pode retornar a > b, então normalizamos antes de
             # verificar a restrição EDD para evitar checar na direção errada.
             early, late = (a, b) if a < b else (b, a)
-            _dl_early = current[early].get('deadline_horas') or float('inf')
-            _dl_late  = current[late].get('deadline_horas')  or float('inf')
-            if _dl_late > _dl_early:
-                continue  # pedido menos urgente iria para posição anterior → viola EDD
+            _dl_early  = current[early].get('deadline_horas') or float('inf')
+            _dl_late   = current[late].get('deadline_horas')  or float('inf')
+            _wk_early  = current[early].get('_semana')
+            _wk_late   = current[late].get('_semana')
+            # Mesma semana ISO → troca livre (custo guia para menos atraso/makespan).
+            # Semanas diferentes → respeita EDD estrito.
+            mesma_semana = (_wk_early is not None and _wk_early == _wk_late)
+            if not mesma_semana and _dl_late > _dl_early:
+                continue  # semanas diferentes e pedido menos urgente iria para frente → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
             neighbor_t  = simular_custo(neighbor, ref_data, num_machines)
@@ -1063,8 +1077,11 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             # None = sem prazo definido → tratado como infinito (menos urgente).
             _dl_early = melhor[early].get('deadline_horas') or float('inf')
             _dl_late  = melhor[late].get('deadline_horas')  or float('inf')
-            if _dl_late > _dl_early:
-                continue  # pedido menos urgente iria para posição anterior → viola EDD
+            _wk_early = melhor[early].get('_semana')
+            _wk_late  = melhor[late].get('_semana')
+            mesma_semana = (_wk_early is not None and _wk_early == _wk_late)
+            if not mesma_semana and _dl_late > _dl_early:
+                continue  # semanas diferentes e pedido menos urgente iria para frente → viola EDD
             cand      = list(melhor)
             cand[early], cand[late] = cand[late], cand[early]
             t = simular_custo(cand, ref_data, num_machines)
