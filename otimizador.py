@@ -563,6 +563,27 @@ def precomputar_maquinas(modelos: dict):
                 ref_data[ref]['tempos'].append(tempo)
                 ref_data[ref]['aba_idx'].append((aba, i))
 
+    # Máquinas com ref genérica ("M60109") devem participar de pedidos com cor específica
+    # ("M60109 2410"). Sem isso, uma máquina que aceita qualquer cor fica excluída quando
+    # outra máquina tem a cor exata cadastrada — o _chave_pedido usa a chave combinada e
+    # a máquina genérica nunca aparece nela.
+    for combined_key, combined_entry in list(ref_data.items()):
+        already_abas = {ai[0] for ai in combined_entry['aba_idx']}
+        for aba, mod in modelos.items():
+            if aba in already_abas:
+                continue
+            # Verifica se alguma chave genérica desta aba é prefixo da chave combinada.
+            # Ex.: ref_k="M60109", combined_key="M60109 2410" → startswith("M60109 ") = True
+            for ref_k, tempo in mod['referencias'].items():
+                if combined_key.startswith(ref_k + ' '):
+                    # Esta aba produz a ref em qualquer cor — inclui nas combinadas
+                    for i in range(mod['total_maquinas']):
+                        gi = gidx_map[(aba, i)]
+                        combined_entry['gidxs'].append(gi)
+                        combined_entry['tempos'].append(tempo)
+                        combined_entry['aba_idx'].append((aba, i))
+                    break   # uma ref_k por aba é suficiente
+
     for ref in ref_data:
         ref_data[ref]['gidxs']  = np.array(ref_data[ref]['gidxs'],  dtype=np.int32)
         ref_data[ref]['tempos'] = np.array(ref_data[ref]['tempos'], dtype=np.float64)
