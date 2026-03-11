@@ -739,7 +739,14 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
 
         dl = p.get('deadline_horas')
         if dl is not None and pedido_fim > dl:
-            total_tardiness += pedido_fim - dl
+            tardiness = pedido_fim - dl
+            # Mesmo peso de urgência do simular_custo: pedidos já atrasados no
+            # início valem mais — sem isso o SA de encaixes trata pedidos com 64
+            # dias de atraso igual a pedidos com prazo futuro e pode dar as
+            # máquinas mais rápidas a pedidos menos urgentes.
+            dias_ja_atrasado = max(0.0, -dl) / 24.0
+            urgencia = 1.0 + dias_ja_atrasado
+            total_tardiness += urgencia * tardiness
 
     return (total_tardiness, maior), choices_feitas
 
@@ -937,8 +944,10 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             # random.sample pode retornar a > b, então normalizamos antes de
             # verificar a restrição EDD para evitar checar na direção errada.
             early, late = (a, b) if a < b else (b, a)
-            _dl_early  = current[early].get('deadline_horas') or float('inf')
-            _dl_late   = current[late].get('deadline_horas')  or float('inf')
+            dl_e = current[early].get('deadline_horas')
+            dl_l = current[late].get('deadline_horas')
+            _dl_early = dl_e if dl_e is not None else float('inf')
+            _dl_late  = dl_l if dl_l is not None else float('inf')
             # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
             # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
             mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
@@ -1127,8 +1136,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             # EDD só é respeitado se o deadline do pedido que vai para a posição
             # anterior (late→early) for ≤ ao que vai para trás (early→late).
             # None = sem prazo definido → tratado como infinito (menos urgente).
-            _dl_early = melhor[early].get('deadline_horas') or float('inf')
-            _dl_late  = melhor[late].get('deadline_horas')  or float('inf')
+            dl_e = melhor[early].get('deadline_horas')
+            dl_l = melhor[late].get('deadline_horas')
+            _dl_early = dl_e if dl_e is not None else float('inf')
+            _dl_late  = dl_l if dl_l is not None else float('inf')
             # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
             # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
             mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
