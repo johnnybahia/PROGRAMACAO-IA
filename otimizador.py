@@ -371,6 +371,9 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
       A: Data Inicial Especial  B: Máquina Especial  C: Produto  D: Referência  E: Cor
       F: Qtd Máquinas  G: Cliente  H: Ordem de Compra  I: Data de Entrega
       J: Data Finalização (saída)  K: Prazo (saída)
+      L: Data de Entrega Especial — quando preenchida, substitui a col I em TODAS
+         as análises (custo, EDD, SA, relatórios). O código passa a trabalhar
+         exclusivamente para cumprir este prazo.
       M1: Data base (lida separadamente por ler_data_base)
     """
     ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
@@ -381,15 +384,16 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
         if len(linha) < 6:
             continue
         try:
-            data_esp_str    = linha[0].strip() if linha[0].strip() else ''
-            maquina_especial = linha[1].strip() if len(linha) > 1 else ''
-            produto         = linha[2].strip() if len(linha) > 2 else ''
-            ref             = linha[3].strip() if len(linha) > 3 else ''
-            cor             = linha[4].strip() if len(linha) > 4 else ''
-            qtd_str         = linha[5].strip() if len(linha) > 5 else ''
-            cliente         = linha[6].strip() if len(linha) > 6 else ''
-            ordem_compra    = linha[7].strip() if len(linha) > 7 else ''
-            data_ent_str    = linha[8].strip() if len(linha) > 8 else ''
+            data_esp_str        = linha[0].strip() if linha[0].strip() else ''
+            maquina_especial    = linha[1].strip() if len(linha) > 1 else ''
+            produto             = linha[2].strip() if len(linha) > 2 else ''
+            ref                 = linha[3].strip() if len(linha) > 3 else ''
+            cor                 = linha[4].strip() if len(linha) > 4 else ''
+            qtd_str             = linha[5].strip() if len(linha) > 5 else ''
+            cliente             = linha[6].strip() if len(linha) > 6 else ''
+            ordem_compra        = linha[7].strip() if len(linha) > 7 else ''
+            data_ent_str        = linha[8].strip() if len(linha) > 8 else ''
+            data_ent_esp_str    = linha[11].strip() if len(linha) > 11 else ''
         except IndexError:
             continue
 
@@ -414,6 +418,14 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
         deadline_horas = None
         if data_entrega:
             deadline_horas = data_para_horas(data_base, data_entrega, datas_bloqueadas)
+
+        # DATA DE ENTREGA ESPECIAL (col L): quando preenchida, substitui a data de
+        # entrega e o deadline em TODAS as análises — o código passa a trabalhar
+        # exclusivamente para cumprir este prazo.
+        data_ent_especial = parse_data(data_ent_esp_str)
+        if data_ent_especial:
+            data_entrega   = data_ent_especial
+            deadline_horas = data_para_horas(data_base, data_ent_especial, datas_bloqueadas)
 
         pedidos.append({
             'linha_sheet':          i,
