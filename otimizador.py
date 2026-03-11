@@ -62,15 +62,9 @@ CONFIG = {
     'ABA_RESULTADO':        'DISTRIBUIÇÃO',
     'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
-    # Limiar 0 → qualquer estratégia que reduza o custo total (mesmo por margem mínima)
-    # vence o EDD. Com a função de custo priorizando atrasos, isso garante que o
-    # algoritmo sempre escolha o caminho com menor latência, sem preferência por makespan.
+    # Limiar 0 → qualquer combinação que reduza o custo lexicográfico (tardiness, makespan)
+    # vence o EDD. Como a comparação é por tupla, qualquer redução de atraso é suficiente.
     'LIMIAR_TROCA_PERCENT': 0,
-    # Penalidade por atraso: 50× faz cada hora de atraso pesar 50 horas de makespan.
-    # Com makespan típico de 300–500h, atrasar 1 pedido em 10h eleva o custo tanto
-    # quanto aumentar o makespan total em 500h — ou seja, entregar no prazo é objetivo
-    # dominante; o makespan só desempata quando todos os prazos já estão cumpridos.
-    'PENALIDADE_ATRASO':    50.0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
         'DATAS FORA DE PROGRAMAÇÃO',
@@ -80,7 +74,7 @@ CONFIG = {
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
     # Simulated Annealing — ordenação de pedidos (dentro do mesmo prazo)
     'SA_ITER_MULT': 4,    # iterações SA = MC_iters × multiplicador
-    'SA_T0_FRAC':   0.05, # temperatura inicial como fração do makespan atual
+    'SA_T0_FRAC':   0.05, # temperatura inicial como fração do tardiness (ou makespan) inicial
     'SA_COOLING':   0.995,
     # Simulated Annealing — atribuição de máquinas (encaixes)
     # Otimiza QUAL máquina recebe cada pedido para a ordem EDD fixa.
@@ -649,8 +643,8 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
                     Se o índice for >= len(gidxs) do pedido, aplica módulo para
                     garantir validade (pedido pode ter restrição de máquina).
 
-    Retorna (custo, choices_feitas) onde custo inclui penalidade de atraso
-    e choices_feitas é a lista de índices que permite reproduzir a simulação.
+    Retorna ((total_tardiness, makespan), choices_feitas) — tupla lexicográfica
+    onde total_tardiness é a prioridade absoluta e makespan é o desempate.
 
     Thread-safe: todos os estados são locais.
     """
@@ -693,18 +687,18 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
         if dl is not None and pedido_fim > dl:
             total_tardiness += pedido_fim - dl
 
-    custo = maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
-    return custo, choices_feitas
+    return (total_tardiness, maior), choices_feitas
 
 
-# ── CUSTO COM PENALIDADE DE ATRASO ───────────────────────────────────────────
-def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
+# ── CUSTO LEXICOGRÁFICO: (tardiness, makespan) ───────────────────────────────
+def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> tuple:
     """
-    Como simular_termino, mas penaliza atrasos em relação ao deadline de cada pedido.
-    Retorna: makespan + PENALIDADE_ATRASO × soma_dos_atrasos_em_horas
+    Retorna (total_tardiness, makespan) — objetivo lexicográfico.
 
-    Isso garante que pedidos urgentes sejam priorizados em TODAS as estratégias,
-    no Simulated Annealing e no 2-opt — não apenas quando EDD é escolhida.
+    Prioridade absoluta: minimizar total_tardiness (soma ponderada dos atrasos).
+    Desempate: minimizar makespan quando tardiness é igual.
+
+    Pedidos já atrasados no início (deadline_horas negativo) recebem peso maior.
     Thread-safe (cria 'filas' local).
     """
     filas           = np.zeros(num_machines, dtype=np.float64)
@@ -744,7 +738,7 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
             dias_ja_atrasado = max(0.0, -dl) / 24.0
             urgencia = 1.0 + dias_ja_atrasado
             total_tardiness += urgencia * tardiness
-    return maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
+    return (total_tardiness, maior)
 
 
 # ── ESTRATÉGIAS ──────────────────────────────────────────────────────────────
@@ -867,7 +861,10 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         current_t = simular_custo(current, ref_data, num_machines)
         best, best_t = list(current), current_t
 
-        T       = current_t * CONFIG['SA_T0_FRAC']
+        # Duas temperaturas: uma para tardiness (prioridade), outra para makespan (desempate).
+        # Se tardiness atual = 0, T_tard = 0 e o SA só otimiza makespan — comportamento correto.
+        T_tard  = current_t[0] * CONFIG['SA_T0_FRAC']
+        T_make  = current_t[1] * CONFIG['SA_T0_FRAC']
         cooling = CONFIG['SA_COOLING']
         iters   = _mc_iter(n) * CONFIG['SA_ITER_MULT']
 
@@ -883,13 +880,22 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                 continue  # pedido menos urgente iria para posição anterior → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
-            neighbor_t = simular_custo(neighbor, ref_data, num_machines)
-            delta = neighbor_t - current_t
-            if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+            neighbor_t  = simular_custo(neighbor, ref_data, num_machines)
+            n_tard, n_make = neighbor_t
+            c_tard, c_make = current_t
+            # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
+            if n_tard != c_tard:
+                delta  = n_tard - c_tard
+                accept = delta < 0 or (T_tard > 1e-9 and random.random() < math.exp(-delta / T_tard))
+            else:
+                delta  = n_make - c_make
+                accept = delta < 0 or (T_make > 1e-9 and random.random() < math.exp(-delta / T_make))
+            if accept:
                 current, current_t = neighbor, neighbor_t
                 if current_t < best_t:
                     best, best_t = list(current), current_t
-            T *= cooling
+            T_tard *= cooling
+            T_make *= cooling
 
         # Garante EDD obrigatório no resultado — sort estável preserva a ordem
         # otimizada dentro de grupos de mesmo deadline.
@@ -1062,7 +1068,7 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             cand      = list(melhor)
             cand[early], cand[late] = cand[late], cand[early]
             t = simular_custo(cand, ref_data, num_machines)
-            if t < melhor_t - 1e-9:
+            if t < melhor_t:
                 melhor, melhor_t = cand, t
                 melhorou = True
         if not melhorou:
@@ -1121,7 +1127,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
         base_iters = CONFIG['MC_ITER'][-1][1]
     total_iters = base_iters * CONFIG['SA_ENCAIXES_MULT']
 
-    T       = current_t * CONFIG['SA_T0_FRAC']
+    T_tard  = current_t[0] * CONFIG['SA_T0_FRAC']
+    T_make  = current_t[1] * CONFIG['SA_T0_FRAC']
     cooling = CONFIG['SA_ENCAIXES_COOLING']
 
     for _ in range(total_iters):
@@ -1133,16 +1140,24 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
         neighbor[idx] = current_choices[idx] + random.randint(1, max(1, num_machines - 1))
 
         neighbor_t, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor)
-        delta = neighbor_t - current_t
-
-        if delta < 0 or (T > 1e-9 and random.random() < math.exp(-delta / T)):
+        n_tard, n_make = neighbor_t
+        c_tard, c_make = current_t
+        # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
+        if n_tard != c_tard:
+            delta  = n_tard - c_tard
+            accept = delta < 0 or (T_tard > 1e-9 and random.random() < math.exp(-delta / T_tard))
+        else:
+            delta  = n_make - c_make
+            accept = delta < 0 or (T_make > 1e-9 and random.random() < math.exp(-delta / T_make))
+        if accept:
             current_choices = neighbor
             current_t       = neighbor_t
             if current_t < best_t:
                 best_t       = current_t
                 best_choices = list(current_choices)
 
-        T *= cooling
+        T_tard *= cooling
+        T_make *= cooling
 
     return best_choices
 
@@ -1167,12 +1182,12 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     for est in estrategias:
         ordenados = est['fn'](pedidos)
         t = simular_custo(ordenados, ref_data, num_machines)
-        ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t), 'ordenados': ordenados})
+        ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t[1]), 'ordenados': ordenados})
     t_ref_rank = next(r for r in ranking if r['id'] == 'edd')['terminoTotal']
     for r in ranking:
-        r['diff']       = _round(r['terminoTotal'] - t_ref_rank)
-        r['percentual'] = _round(((r['terminoTotal'] - t_ref_rank) / t_ref_rank) * 100) if t_ref_rank > 0 else 0
-    ranking.sort(key=lambda r: r['terminoTotal'])
+        r['diff']       = _round(r['terminoTotal'][1] - t_ref_rank[1])
+        r['percentual'] = _round(((r['terminoTotal'][1] - t_ref_rank[1]) / t_ref_rank[1]) * 100) if t_ref_rank[1] > 0 else 0
+    ranking.sort(key=lambda r: r['terminoTotal'])  # tupla → comparação lexicográfica
 
     # Referência: EDD em todos os grupos — usa custo com penalidade de atraso
     comb_ref      = [idx_ref] * num_grupos
@@ -1205,21 +1220,22 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
                 melhor_comb      = comb
                 melhor_ordenados = ord_
 
-    is_todo_ref = lambda c: all(i == idx_ref for i in c)
-    ganho = ((melhor_tempo - tempo_ref) / tempo_ref) * 100 if tempo_ref > 0 else 0
+    is_todo_ref  = lambda c: all(i == idx_ref for i in c)
+    # Ganho de makespan para exibição (informativo); a decisão usa comparação lexicográfica.
+    ganho_make = ((melhor_tempo[1] - tempo_ref[1]) / tempo_ref[1]) * 100 if tempo_ref[1] > 0 else 0
 
-    if not is_todo_ref(melhor_comb) and ganho <= -limiar:
+    if not is_todo_ref(melhor_comb) and melhor_tempo < tempo_ref:
         comb_final      = melhor_comb
         tempo_final     = melhor_tempo
         ordenados_final = melhor_ordenados
-        decisao = f'⚡ Combinação otimizada foi {abs(_round(ganho))}% mais rápida — superou o limiar de {limiar}%'
+        decisao = f'⚡ Combinação otimizada venceu (atraso: {_round(melhor_tempo[0])}h vs {_round(tempo_ref[0])}h; makespan: {abs(_round(ganho_make))}% melhor)'
     else:
         comb_final      = comb_ref
         tempo_final     = tempo_ref
         ordenados_final = ordenados_ref
         info = ''
-        if not is_todo_ref(melhor_comb) and ganho < 0:
-            info = f' (melhor foi {abs(_round(ganho))}% mais rápida — abaixo do limiar de {limiar}%)'
+        if not is_todo_ref(melhor_comb) and melhor_tempo < tempo_ref:
+            info = f' (melhor foi {abs(_round(ganho_make))}% mais rápida no makespan)'
         decisao = f'✅ EDD venceu{info}'
 
     estrategias_por_grupo = [
@@ -1247,7 +1263,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
         'id':                  'edd' if todo_ref else 'combinacao_prioridade',
         'nome':                nome_est,
         'terminoTotal':        tempo_final,
-        'terminoHoras':        _round(tempo_final),
+        'terminoHoras':        _round(tempo_final[1]),
         'ordenados':           ordenados_final,
         'decisao':             decisao,
         'estrategiasPorGrupo': estrategias_por_grupo,
@@ -1563,10 +1579,10 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
     b.banner('📊 RANKING DAS ESTRATÉGIAS', '#455A64')
     b.write(cab, bg='#263238', fg='#FFFFFF', bold=True, h_align='CENTER')
 
-    melhor_t = ranking[0]['terminoTotal']
+    melhor_t = ranking[0]['terminoTotal'][1]  # makespan do melhor para exibição
     for i, est in enumerate(ranking):
-        diff   = _round(est['terminoTotal'] - melhor_t)
-        perc   = _round(((est['terminoTotal'] - melhor_t) / melhor_t) * 100) if melhor_t > 0 else 0
+        diff   = _round(est['terminoTotal'][1] - melhor_t)
+        perc   = _round(((est['terminoTotal'][1] - melhor_t) / melhor_t) * 100) if melhor_t > 0 else 0
         pos_s  = '🏆 1º' if i == 0 else f'{i + 1}º'
         diff_s = '—' if i == 0 else (f'+{diff}h' if diff >= 0 else f'{diff}h')
         perc_s = '✅ MELHOR' if i == 0 else (f'+{perc}% mais lento' if perc > 0 else f'{perc}% mais rápido')
@@ -1775,7 +1791,7 @@ def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
     if ranking:
         linhas.append('\n📊 Top 3:')
         for i, est in enumerate(ranking[:3]):
-            diff = '✅ melhor' if i == 0 else f"+{_round(est['terminoTotal'] - ranking[0]['terminoTotal'])}h"
+            diff = '✅ melhor' if i == 0 else f"+{_round(est['terminoTotal'][1] - ranking[0]['terminoTotal'][1])}h"
             linhas.append(f"   {i+1}. {est['nome'][:38]}: {est['terminoHoras']}h ({diff})")
 
     atrasados   = sum(1 for r in resultado if r.get('prazo_delta') is not None and r['prazo_delta'] < 0)
@@ -2031,13 +2047,13 @@ def main():
 
     print('  Refinando com busca local 2-opt...')
     ordenados_2opt, t_2opt = busca_local_2opt(melhor['ordenados'], ref_data, num_machines)
-    if t_2opt < melhor['terminoTotal'] - 1e-9:
-        ganho_2opt = _round(((melhor['terminoTotal'] - t_2opt) / melhor['terminoTotal']) * 100)
+    if t_2opt < melhor['terminoTotal']:
+        ganho_2opt = _round(((melhor['terminoTotal'][1] - t_2opt[1]) / melhor['terminoTotal'][1]) * 100) if melhor['terminoTotal'][1] > 0 else 0
         melhor['ordenados']    = ordenados_2opt
         melhor['terminoTotal'] = t_2opt
-        melhor['terminoHoras'] = _round(t_2opt)
+        melhor['terminoHoras'] = _round(t_2opt[1])
         melhor['decisao']     += f' → 2-opt −{ganho_2opt}%'
-        print(f'  ✔ 2-opt melhorou {ganho_2opt}% → {_round(t_2opt)}h')
+        print(f'  ✔ 2-opt melhorou {ganho_2opt}% → {_round(t_2opt[1])}h')
     else:
         print(f'  ✔ 2-opt: solução já estava em ótimo local')
 
@@ -2046,11 +2062,11 @@ def main():
     melhores_choices = sa_encaixes(melhor['ordenados'], ref_data, num_machines)
     t_encaixes, _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines, melhores_choices)
     t_greedy,   _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines)
-    if t_encaixes < t_greedy - 1e-9:
-        ganho_enc = _round(((t_greedy - t_encaixes) / t_greedy) * 100)
-        print(f'  ✔ SA encaixes melhorou {ganho_enc}% → {_round(t_encaixes)}h (greedy era {_round(t_greedy)}h)')
+    if t_encaixes < t_greedy:
+        ganho_enc = _round(((t_greedy[1] - t_encaixes[1]) / t_greedy[1]) * 100) if t_greedy[1] > 0 else 0
+        print(f'  ✔ SA encaixes melhorou {ganho_enc}% → {_round(t_encaixes[1])}h (greedy era {_round(t_greedy[1])}h)')
         melhor['terminoTotal'] = t_encaixes
-        melhor['terminoHoras'] = _round(t_encaixes)
+        melhor['terminoHoras'] = _round(t_encaixes[1])
         melhor['decisao']     += f' → SA encaixes −{ganho_enc}%'
     else:
         melhores_choices = None   # greedy já era ótimo, usa o padrão
