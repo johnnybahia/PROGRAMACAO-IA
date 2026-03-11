@@ -1494,6 +1494,12 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
 
 
 # ── SALVAR RELATÓRIO PARA IMPRESSÃO ──────────────────────────────────────────
+def _e_modelo_chines_48(nome_modelo: str) -> bool:
+    """Retorna True se o modelo for '48 fusos Chines' (variações de capitalização)."""
+    n = nome_modelo.lower()
+    return '48' in n and 'fuso' in n and 'chin' in n
+
+
 def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
     """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
     ordenado = sorted(
@@ -1508,6 +1514,15 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
     b     = SheetBuilder(spreadsheet, CONFIG['ABA_RELATORIO'], cols=ncols)
 
     hoje  = date.today().strftime('%d/%m/%Y')
+
+    # Aviso de ajuste para máquinas chinesas (aparece antes do cabeçalho)
+    tem_chines = any(_e_modelo_chines_48(r.get('nome_modelo', '')) for r in ordenado)
+    if tem_chines:
+        b.banner(
+            '⚠ ATENÇÃO: Máquinas chinesas ajustada a quantidade para Espula grande '
+            '— quantidade de máquinas dobrada automaticamente.',
+            '#F57F17', fg='#FFFFFF', bold=True, font_size=12)
+
     b.banner(f'📋 RELATÓRIO DE PRODUÇÃO — Gerado em {hoje}', '#0D47A1', font_size=13)
     cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
     b.banner(
@@ -1515,7 +1530,8 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
         cor_b, font_size=11)
     b.blank()
     b.write(cab, bg='#263238', fg='#FFFFFF', bold=True, h_align='CENTER')
-    b.freeze(4)
+    freeze_rows = 6 if tem_chines else 4
+    b.freeze(freeze_rows)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
     for i, r in enumerate(ordenado):
@@ -1533,12 +1549,60 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
         termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
         entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
 
+        maquinas = r['maquinas_alocadas']
+        if _e_modelo_chines_48(r.get('nome_modelo', '')):
+            maquinas = maquinas * 2
+
         b.write([
             inicio_s, termino_s,
             r['referencia'], r.get('produto', ''), r.get('cor', ''),
             r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], r['maquinas_alocadas'],
+            r['nome_modelo'], maquinas,
             entrega_s, r.get('prazo_str', ''),
+        ], bg=bg)
+
+    b.flush()
+
+
+def salvar_relatorio_montagem(spreadsheet, resultado: list):
+    """Cria aba RELATORIO MONTAGEM para uso dos montadores na produção."""
+    ordenado = sorted(
+        resultado,
+        key=lambda r: (r.get('dt_inicio') or datetime.min, r.get('dt_termino') or datetime.min)
+    )
+
+    cab   = ['Data Início', 'Total Máquinas', 'Modelo', 'Produto', 'Cliente', 'OC']
+    ncols = len(cab)
+    b     = SheetBuilder(spreadsheet, 'RELATORIO MONTAGEM', cols=ncols)
+
+    hoje  = date.today().strftime('%d/%m/%Y')
+    b.banner(f'🔧 RELATÓRIO DE MONTAGEM — Gerado em {hoje}', '#1A237E', font_size=13)
+    b.blank()
+    b.write(cab, bg='#37474F', fg='#FFFFFF', bold=True, h_align='CENTER')
+    b.freeze(3)
+
+    cores_base = ['#FFFFFF', '#F5F5F5']
+    for i, r in enumerate(ordenado):
+        bg = cores_base[i % 2]
+
+        # Data de início como valor de data puro (para permitir filtro por data)
+        dt_inicio = r.get('dt_inicio')
+        if dt_inicio:
+            inicio_val = dt_inicio.strftime('%d/%m/%Y')
+        else:
+            inicio_val = ''
+
+        maquinas = r['maquinas_alocadas']
+        if _e_modelo_chines_48(r.get('nome_modelo', '')):
+            maquinas = maquinas * 2
+
+        b.write([
+            inicio_val,
+            maquinas,
+            r.get('nome_modelo', ''),
+            r.get('produto', ''),
+            r.get('cliente', ''),
+            r.get('ordem_compra', ''),
         ], bg=bg)
 
     b.flush()
@@ -1904,6 +1968,7 @@ def main():
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
     salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos))
     salvar_relatorio(spreadsheet, resultado, melhor)
+    salvar_relatorio_montagem(spreadsheet, resultado)
     escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
 
     tempo_total = time.time() - t0
