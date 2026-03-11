@@ -1561,8 +1561,122 @@ def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor):
     b.flush()
 
 
+# ── CÁLCULO DE MÁQUINAS CHINESAS EXTRAS ──────────────────────────────────────
+def _calcular_extras_chines(pedidos_orig: list, modelos: dict,
+                             melhor_ordenados: list, resultado: list,
+                             data_base) -> dict | None:
+    """
+    Calcula quantas máquinas chinesas extras (incremento em total_maquinas)
+    são necessárias para que 100% dos pedidos elegíveis fiquem em dia.
+
+    Elegível = deadline_horas > 0 (prazo NÃO anterior à data base).
+
+    Retorna dict com:
+      extras          — número de máquinas extras por modelo chinês (int ou '>200')
+      elegiveis       — total de pedidos elegíveis únicos
+      atrasados       — pedidos elegíveis atrasados no resultado atual
+      modelos_info    — lista de dicts {nome_modelo, total_maquinas_atual}
+    Retorna None se não houver nenhum modelo chinês cadastrado.
+    """
+    # 1. Identificar modelos chineses
+    abas_chines = {aba: mod for aba, mod in modelos.items()
+                   if _e_modelo_chines_48(mod['nome_modelo'])}
+    if not abas_chines:
+        return None
+
+    # 2. Contar pedidos elegíveis e atrasados a partir do resultado real
+    #    (resultado já usa a melhor atribuição SA — mais preciso que re-simular)
+    prazo_por_linha: dict[int, int] = {}
+    for r in resultado:
+        ls = r.get('linha_sheet')
+        de = r.get('data_entrega')
+        pd = r.get('prazo_delta')
+        if ls is None or de is None or pd is None:
+            continue
+        if de < data_base:
+            continue   # não elegível — prazo anterior à data base
+        # Guarda o pior prazo do pedido (pode ter múltiplas alocações por modelo)
+        if ls not in prazo_por_linha:
+            prazo_por_linha[ls] = pd
+        else:
+            prazo_por_linha[ls] = min(prazo_por_linha[ls], pd)
+
+    n_elegiveis = len(prazo_por_linha)
+    n_atrasados = sum(1 for v in prazo_por_linha.values() if v < 0)
+
+    modelos_info = [
+        {'nome_modelo': mod['nome_modelo'], 'total_maquinas_atual': mod['total_maquinas']}
+        for mod in abas_chines.values()
+    ]
+
+    if n_atrasados == 0:
+        return {
+            'extras': 0,
+            'elegiveis': n_elegiveis,
+            'atrasados': 0,
+            'modelos_info': modelos_info,
+        }
+
+    # 3. Montar lista de pedidos elegíveis na ordem do melhor, sem arrays numpy
+    #    (serão recomputados contra o ref_data expandido)
+    linhas_elegiveis = set(prazo_por_linha.keys())
+    pedidos_eleg_ord = [
+        {k: v for k, v in p.items() if not k.startswith('_')}
+        for p in melhor_ordenados
+        if p.get('linha_sheet') in linhas_elegiveis
+    ]
+    if not pedidos_eleg_ord:
+        return {
+            'extras': 0,
+            'elegiveis': n_elegiveis,
+            'atrasados': n_atrasados,
+            'modelos_info': modelos_info,
+        }
+
+    # 4. Helper: simula tardiness com N extras adicionados a cada modelo chinês
+    def tardiness_com_extras(n_extras: int) -> float:
+        modelos_ext = {}
+        for aba, mod in modelos.items():
+            m = dict(mod)
+            if aba in abas_chines:
+                m['referencias'] = dict(mod['referencias'])
+                m['descricoes']  = dict(mod.get('descricoes', {}))
+                m['total_maquinas'] = mod['total_maquinas'] + n_extras
+            modelos_ext[aba] = m
+        ref_ext, num_ext, _ = precomputar_maquinas(modelos_ext)
+        ped_clean = [dict(p) for p in pedidos_eleg_ord]
+        preparar_restricoes_pedidos(ped_clean, ref_ext, modelos_ext)
+        return simular_custo(ped_clean, ref_ext, num_ext)[0]
+
+    # 5. Busca binária: menor N onde tardiness == 0
+    MAX_BUSCA = 200
+    if tardiness_com_extras(MAX_BUSCA) != 0:
+        return {
+            'extras': f'>{MAX_BUSCA}',
+            'elegiveis': n_elegiveis,
+            'atrasados': n_atrasados,
+            'modelos_info': modelos_info,
+        }
+
+    lo, hi = 1, MAX_BUSCA
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if tardiness_com_extras(mid) == 0:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    return {
+        'extras': lo,
+        'elegiveis': n_elegiveis,
+        'atrasados': n_atrasados,
+        'modelos_info': modelos_info,
+    }
+
+
 # ── SALVAR COMPARATIVO ───────────────────────────────────────────────────────
-def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
+def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos,
+                       pedidos=None, modelos=None, resultado=None, data_base=None):
     cab   = ['Posição', 'Estratégia', 'Descrição', 'Término Total (h)', 'Diferença vs Melhor (h)', 'Variação %']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, 'COMPARATIVO', cols=ncols)
@@ -1614,6 +1728,70 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
     )
 
     b.blank(3)
+
+    # ── SEÇÃO: CAPACIDADE — máquinas chinesas extras necessárias ────────────
+    if pedidos is not None and modelos is not None and resultado is not None and data_base is not None:
+        analise = _calcular_extras_chines(pedidos, modelos, melhor['ordenados'], resultado, data_base)
+
+        b.banner('🏭 ANÁLISE DE CAPACIDADE — Máquinas Chinesas', '#1A237E', font_size=12)
+
+        if analise is None:
+            b.banner(
+                'Nenhum modelo "48 fusos Chines" encontrado nas abas de máquinas. '
+                'Esta análise só se aplica a máquinas chinesas.',
+                '#ECEFF1', fg='#37474F', bold=False, wrap=True
+            )
+        else:
+            mi = analise['modelos_info']
+            nomes_ch = ', '.join(m['nome_modelo'] for m in mi)
+            maq_atuais_str = '  |  '.join(
+                f"{m['nome_modelo']}: {m['total_maquinas_atual']} máq."
+                for m in mi
+            )
+
+            b.write(
+                ['Modelo(s) Chinês', 'Qtd. Atual', 'Pedidos Elegíveis',
+                 'Pedidos Atrasados', 'Extras Necessários', 'Observação'],
+                bg='#283593', fg='#FFFFFF', bold=True, h_align='CENTER'
+            )
+
+            extras = analise['extras']
+            n_el   = analise['elegiveis']
+            n_at   = analise['atrasados']
+
+            if extras == 0:
+                cor_linha = '#C8E6C9'
+                extras_s  = '0 — todos em dia ✅'
+                obs       = 'Nenhum acréscimo necessário com a estratégia atual.'
+            elif isinstance(extras, str):   # '>200'
+                cor_linha = '#FFCDD2'
+                extras_s  = extras
+                obs       = 'Mesmo com muitas máquinas extras, pedidos podem não caber no prazo.'
+            else:
+                cor_linha = '#FFF9C4'
+                extras_s  = str(extras)
+                obs = (
+                    f'+{extras} por modelo chinês. '
+                    'Estimativa via simulação greedy (pedidos elegíveis, ordem EDD).'
+                )
+
+            for m in mi:
+                b.write(
+                    [m['nome_modelo'], m['total_maquinas_atual'],
+                     n_el, n_at, extras_s, obs],
+                    bg=cor_linha
+                )
+
+            b.blank()
+            b.banner(
+                '⚠ Pedidos elegíveis = prazo ≥ data base. '
+                'Pedidos com data de entrega anterior à data base são excluídos desta conta. '
+                'Extras = incremento em K1 de cada aba chinesa (máquinas físicas adicionais).',
+                '#E8EAF6', fg='#283593', bold=False, wrap=True
+            )
+
+        b.blank(2)
+
     _secao_cientifica(b, num_pedidos, num_modelos)
     b.freeze(4)
     b.flush()
@@ -2091,7 +2269,9 @@ def main():
 
     print('8/8 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
-    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos))
+    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos),
+                       pedidos=pedidos, modelos=modelos, resultado=resultado,
+                       data_base=data_base)
     salvar_relatorio(spreadsheet, resultado, melhor)
     salvar_relatorio_montagem(spreadsheet, resultado)
     escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
