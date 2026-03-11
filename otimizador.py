@@ -295,16 +295,15 @@ def parse_data(s: str):
 
 
 def _dia_util(d: date, datas_bloqueadas: set) -> bool:
-    """Retorna True se o dia é útil: segunda a sexta e não está em datas_bloqueadas."""
-    return d.weekday() < 5 and d not in datas_bloqueadas
+    """Retorna True se o dia não está em datas_bloqueadas. Fins de semana só são bloqueados se cadastrados na aba 'DATAS FORA DE PROGRAMAÇÃO'."""
+    return d not in datas_bloqueadas
 
 
 def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set) -> datetime:
     """
-    Converte offset em horas virtuais (excluindo fins de semana e dias bloqueados)
-    para datetime real.
+    Converte offset em horas virtuais (excluindo dias bloqueados) para datetime real.
     base_date é o dia 0 do planejamento (hora 0).
-    Apenas dias úteis (seg–sex) que não estejam em datas_bloqueadas contam.
+    Apenas dias que não estejam em datas_bloqueadas contam.
     """
     hpd = CONFIG['HORAS_POR_DIA']
     if horas_offset <= 0:
@@ -326,7 +325,7 @@ def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set)
 def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -> float:
     """
     Converte uma data alvo em offset de horas virtuais a partir de base_date,
-    contando apenas dias úteis (seg–sex) que não estejam em datas_bloqueadas.
+    contando apenas dias que não estejam em datas_bloqueadas.
 
     Retorna valor negativo quando target_date < base_date, preservando a ordem
     relativa de prazos vencidos — essencial para que o EDD continue funcionando
