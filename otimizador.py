@@ -2128,8 +2128,15 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
 
     ref_data_orig, num_orig, _ = precomputar_maquinas(modelos)
     ref_data_sim,  num_sim,  _ = precomputar_maquinas(modelos_sim)
-    termino_orig = simular_termino(pedidos, ref_data_orig, num_orig)
-    termino_sim  = simular_termino(pedidos, ref_data_sim,  num_sim)
+
+    # Remove _gidxs/_tempos pré-computados para forçar o lookup direto no ref_data
+    # correto. Sem isso, ambas as simulações reutilizam os arrays do original e
+    # mostram melhoria zero, mesmo quando o cadastro da cor reduziria o término.
+    pedidos_limpos = [{k: v for k, v in p.items() if not k.startswith('_')}
+                      for p in pedidos]
+
+    termino_orig = simular_termino(pedidos_limpos, ref_data_orig, num_orig)
+    termino_sim  = simular_termino(pedidos_limpos, ref_data_sim,  num_sim)
     melhoria_h   = _round(termino_orig - termino_sim)
     melhoria_pct = _round((melhoria_h / termino_orig * 100) if termino_orig > 0 else 0)
 
