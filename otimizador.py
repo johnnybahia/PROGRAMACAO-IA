@@ -62,11 +62,15 @@ CONFIG = {
     'ABA_RESULTADO':        'DISTRIBUIÇÃO',
     'ABA_RELATORIO':        'RELATORIO',
     'HORAS_POR_DIA':        24,
-    'LIMIAR_TROCA_PERCENT': 10,
-    # Penalidade por atraso: cada hora de atraso em relação ao deadline equivale a
-    # PENALIDADE_ATRASO horas de makespan na função de custo. Isso garante que
-    # pedidos urgentes sejam priorizados em TODAS as estratégias e no SA.
-    'PENALIDADE_ATRASO':    5.0,
+    # Limiar 0 → qualquer estratégia que reduza o custo total (mesmo por margem mínima)
+    # vence o EDD. Com a função de custo priorizando atrasos, isso garante que o
+    # algoritmo sempre escolha o caminho com menor latência, sem preferência por makespan.
+    'LIMIAR_TROCA_PERCENT': 0,
+    # Penalidade por atraso: 50× faz cada hora de atraso pesar 50 horas de makespan.
+    # Com makespan típico de 300–500h, atrasar 1 pedido em 10h eleva o custo tanto
+    # quanto aumentar o makespan total em 500h — ou seja, entregar no prazo é objetivo
+    # dominante; o makespan só desempata quando todos os prazos já estão cumpridos.
+    'PENALIDADE_ATRASO':    50.0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
         'DATAS FORA DE PROGRAMAÇÃO',
@@ -717,7 +721,17 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> float:
                 pedido_fim = fim
         dl = p.get('deadline_horas')
         if dl is not None and pedido_fim > dl:
-            total_tardiness += pedido_fim - dl
+            tardiness = pedido_fim - dl
+            # Peso de urgência: pedidos que já estavam atrasados no início do planejamento
+            # (deadline_horas negativo) recebem peso maior — cada dia de atraso pré-existente
+            # adiciona 1 ao peso base, tornando pedidos mais atrasados proporcionalmente
+            # mais custosos de atrasar ainda mais.
+            # Exemplos: já 0 dias atrasado → peso 1.0
+            #           já 2 dias atrasado → peso 3.0 (3× mais importante)
+            #           já 5 dias atrasado → peso 6.0
+            dias_ja_atrasado = max(0.0, -dl) / 24.0
+            urgencia = 1.0 + dias_ja_atrasado
+            total_tardiness += urgencia * tardiness
     return maior + CONFIG['PENALIDADE_ATRASO'] * total_tardiness
 
 
@@ -889,6 +903,41 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             return (dl, t_min, p.get('cor', ''))
         return sorted(pedidos, key=_key)
 
+    def lsf(pedidos):
+        """
+        Least Slack First (Menor Folga Primeiro) — estratégia focada em garantir
+        que pedidos que vencem antes saiam antes.
+
+        Folga = deadline − tempo_de_produção
+              = a hora mais tarde em que o pedido PODE começar e ainda entregar no prazo.
+
+        Pedidos com menor folga (ou folga negativa = já impossível de entregar no prazo)
+        entram primeiro. Isso maximiza a chance de cada pedido terminar antes do seu prazo.
+
+        Diferença fundamental em relação ao EDD:
+          EDD olha só o prazo.
+          LSF olha prazo E quanto tempo o pedido leva — o que realmente importa
+          para saber se vai fechar no prazo.
+
+        Exemplo onde LSF vence o EDD:
+          Pedido A: prazo=50h, produção=45h → folga=5h  → tem que começar AGORA
+          Pedido B: prazo=30h, produção=2h  → folga=28h → pode esperar
+          EDD coloca B primeiro (prazo 30<50) → A atrasa.
+          LSF coloca A primeiro (folga 5<28) → A fecha no prazo, B também.
+        """
+        def _folga(p):
+            dl     = p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+            min_s  = float(p.get('min_start', 0.0))
+            tempos = p.get('_tempos')
+            t_min  = (float(np.min(tempos)) if tempos is not None and len(tempos) > 0
+                      else get_menor_tempo(p['referencia'], modelos))
+            # Folga real = janela disponível após o início permitido menos o tempo de produção.
+            # Subtrai min_start para que pedidos com data mínima de início não tenham
+            # sua urgência subestimada (a janela deles é menor do que o deadline sugere).
+            folga  = (dl - min_s - t_min) if dl != float('inf') else float('inf')
+            return (folga, dl, p.get('cor', ''))
+        return sorted(pedidos, key=_folga)
+
     def _com_edd(fn):
         """
         Wrapper obrigatório: aplica a estratégia fn como critério de desempate
@@ -930,6 +979,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         {'id': 'mdd_rapido',   'nome': '9 — Mais Atrasado + Mais Rápido',
          'descricao': 'Prazo mais urgente/atrasado primeiro; desempate pelo menor tempo de produção na máquina',
          'fn': mdd_rapido},
+        {'id': 'lsf',          'nome': '10 — Menor Folga Primeiro (LSF)',
+         'descricao': 'Ordena por prazo − tempo de produção: quem tem menos margem para começar entra primeiro',
+         'fn': lsf},
     ]
 
 
@@ -1171,7 +1223,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     todo_ref = is_todo_ref(comb_final)
 
     def _nome_res(n):
-        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — '):
+        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — ', '10 — '):
             n = n.replace(prefix, '')
         return n[:22]
 
