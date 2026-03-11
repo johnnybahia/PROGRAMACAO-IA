@@ -39,6 +39,7 @@ import copy
 import random
 import math
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 
@@ -226,19 +227,37 @@ class SheetBuilder:
         })
 
     def flush(self):
-        if self.data:
-            cell_list = []
-            for r, c, v in self.data:
-                cell = gspread.Cell(r, c, v)
-                cell_list.append(cell)
-            self._ws.update_cells(cell_list, value_input_option='RAW')
+        # Registra timestamp de geração na última linha — facilita verificar se a aba foi realmente atualizada
+        ts = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        self.data.append((self.row, 1, f'Gerado em: {ts}'))
+        self.formats.append({
+            'repeatCell': {
+                'range': self._range(self.row, 1, self.cols),
+                'cell':  {'userEnteredFormat': _fmt('#ECEFF1', '#607D8B', False, False, 9, 'LEFT', False)},
+                'fields': 'userEnteredFormat',
+            }
+        })
 
-        if self.formats:
-            for req in self.formats:
-                self._inject_sid(req)
-            self.ss.batch_update({'requests': self.formats})
+        try:
+            if self.data:
+                cell_list = []
+                for r, c, v in self.data:
+                    cell = gspread.Cell(r, c, v)
+                    cell_list.append(cell)
+                self._ws.update_cells(cell_list, value_input_option='RAW')
 
-        print(f'  ✔ Aba "{self.name}" salva.')
+            if self.formats:
+                for req in self.formats:
+                    self._inject_sid(req)
+                self.ss.batch_update({'requests': self.formats})
+
+            print(f'  ✔ Aba "{self.name}" salva ({ts})')
+
+        except Exception:
+            print(f'\n  ❌ ERRO ao salvar aba "{self.name}" — detalhes abaixo:')
+            traceback.print_exc()
+            print()
+            raise  # re-lança para não mascarar o problema
 
     def _range(self, row, col, num_cols):
         return {
