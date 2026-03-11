@@ -918,13 +918,11 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             early, late = (a, b) if a < b else (b, a)
             _dl_early  = current[early].get('deadline_horas') or float('inf')
             _dl_late   = current[late].get('deadline_horas')  or float('inf')
-            _wk_early  = current[early].get('_semana')
-            _wk_late   = current[late].get('_semana')
-            # Mesma semana ISO → troca livre (custo guia para menos atraso/makespan).
-            # Semanas diferentes → respeita EDD estrito.
-            mesma_semana = (_wk_early is not None and _wk_early == _wk_late)
-            if not mesma_semana and _dl_late > _dl_early:
-                continue  # semanas diferentes e pedido menos urgente iria para frente → viola EDD
+            # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
+            # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
+            mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
+            if not mesmo_prazo and _dl_late > _dl_early:
+                continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
             neighbor_t  = simular_custo(neighbor, ref_data, num_machines)
@@ -1110,11 +1108,11 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
             # None = sem prazo definido → tratado como infinito (menos urgente).
             _dl_early = melhor[early].get('deadline_horas') or float('inf')
             _dl_late  = melhor[late].get('deadline_horas')  or float('inf')
-            _wk_early = melhor[early].get('_semana')
-            _wk_late  = melhor[late].get('_semana')
-            mesma_semana = (_wk_early is not None and _wk_early == _wk_late)
-            if not mesma_semana and _dl_late > _dl_early:
-                continue  # semanas diferentes e pedido menos urgente iria para frente → viola EDD
+            # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
+            # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
+            mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
+            if not mesmo_prazo and _dl_late > _dl_early:
+                continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
             cand      = list(melhor)
             cand[early], cand[late] = cand[late], cand[early]
             t = simular_custo(cand, ref_data, num_machines)
@@ -1212,113 +1210,75 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
     return best_choices
 
 
-# ── ESCOLHA PARALELA DA MELHOR ESTRATÉGIA ────────────────────────────────────
+# ── ESCOLHA DA MELHOR ESTRATÉGIA (EDD estrito + SA intra-prazo) ───────────────
 def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines):
+    """
+    A ordenação final é SEMPRE por prazo de entrega (EDD estrito, dia a dia).
+    Pedidos com prazos diferentes nunca são reordenados — o cliente com prazo
+    mais próximo é sempre atendido primeiro, sem exceção.
+
+    Dentro de um mesmo dia de prazo, o SA pode otimizar a sequência para
+    reduzir atraso e makespan. A decisão final é entre EDD puro e EDD+SA:
+    o SA só vence se melhorar o custo lexicográfico (atraso, makespan).
+
+    O ranking informativo mostra todas as 10 estratégias para referência,
+    mas nenhuma delas pode alterar a prioridade entre datas diferentes.
+    """
     estrategias = make_estrategias(modelos, ref_data, num_machines)
-    limiar      = CONFIG['LIMIAR_TROCA_PERCENT']
-    idx_ref     = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
-    num_grupos  = len(grupos)
+    idx_edd = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
+    idx_sa  = next(i for i, e in enumerate(estrategias) if e['id'] == 'sa')
 
-    # Pré-computa ordenações de cada grupo × estratégia
-    print('  Pré-computando ordenações por grupo e estratégia...')
-    group_orderings = []
-    for g in grupos:
-        ord_g = [est['fn'](g['pedidos']) for est in estrategias]
-        group_orderings.append(ord_g)
+    # EDD puro — base sempre respeitada
+    print('  Calculando ordenação EDD base...')
+    ordenados_edd = estrategias[idx_edd]['fn'](pedidos)
+    t_edd         = simular_custo(ordenados_edd, ref_data, num_machines)
 
-    # Ranking individual (todos os pedidos juntos) — usa custo com penalidade de atraso
-    print('  Calculando ranking individual das estratégias...')
+    # SA — otimiza DENTRO de grupos de mesmo prazo (nunca troca pedidos de datas diferentes)
+    print('  Refinando com SA dentro dos grupos de mesmo prazo...')
+    ordenados_sa = estrategias[idx_sa]['fn'](pedidos)
+    t_sa         = simular_custo(ordenados_sa, ref_data, num_machines)
+
+    # Decisão: SA só ganha se melhorar o custo lexicográfico
+    if t_sa < t_edd:
+        ordenados_final = ordenados_sa
+        tempo_final     = t_sa
+        est_final       = estrategias[idx_sa]
+        ganho_make      = ((t_edd[1] - t_sa[1]) / t_edd[1]) * 100 if t_edd[1] > 0 else 0
+        decisao = (f'⚡ SA otimizou dentro dos grupos de prazo '
+                   f'(atraso: {_round(t_sa[0])}h vs {_round(t_edd[0])}h EDD; '
+                   f'makespan: {abs(_round(ganho_make))}% melhor)')
+    else:
+        ordenados_final = ordenados_edd
+        tempo_final     = t_edd
+        est_final       = estrategias[idx_edd]
+        decisao         = '✅ EDD direto — prazo mais próximo sempre primeiro'
+
+    # Ranking informativo — todas as estratégias, comparadas contra o resultado final
+    print('  Calculando ranking informativo das estratégias...')
     ranking = []
     for est in estrategias:
-        ordenados = est['fn'](pedidos)
-        t = simular_custo(ordenados, ref_data, num_machines)
-        ranking.append({**est, 'terminoTotal': t, 'terminoHoras': _round(t[1]), 'ordenados': ordenados})
-    t_ref_rank = next(r for r in ranking if r['id'] == 'edd')['terminoTotal']
-    for r in ranking:
-        r['diff']       = _round(r['terminoTotal'][1] - t_ref_rank[1])
-        r['percentual'] = _round(((r['terminoTotal'][1] - t_ref_rank[1]) / t_ref_rank[1]) * 100) if t_ref_rank[1] > 0 else 0
-    ranking.sort(key=lambda r: r['terminoTotal'])  # tupla → comparação lexicográfica
-
-    # Referência: EDD em todos os grupos — usa custo com penalidade de atraso
-    comb_ref      = [idx_ref] * num_grupos
-    ordenados_ref = [p for g_idx, g in enumerate(grupos) for p in group_orderings[g_idx][idx_ref]]
-    tempo_ref     = simular_custo(ordenados_ref, ref_data, num_machines)
-
-    # Testa TODAS as combinações em paralelo
-    combinacoes = gerar_combinacoes(num_grupos, len(estrategias))
-    print(f'  Testando {len(combinacoes)} combinações em paralelo...')
-
-    melhor_comb      = list(comb_ref)
-    melhor_tempo     = tempo_ref
-    melhor_ordenados = ordenados_ref
-
-    def _eval(comb):
-        ordenados = [p for g_i, g in enumerate(grupos) for p in group_orderings[g_i][comb[g_i]]]
-        return simular_custo(ordenados, ref_data, num_machines), comb, ordenados
-
-    workers = min(os.cpu_count() or 4, len(combinacoes))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_eval, c): c for c in combinacoes}
-        done    = 0
-        for fut in as_completed(futures):
-            t, comb, ord_ = fut.result()
-            done += 1
-            if done % 100 == 0:
-                print(f'    {done}/{len(combinacoes)} combinações testadas...')
-            if t < melhor_tempo:
-                melhor_tempo     = t
-                melhor_comb      = comb
-                melhor_ordenados = ord_
-
-    is_todo_ref  = lambda c: all(i == idx_ref for i in c)
-    # Ganho de makespan para exibição (informativo); a decisão usa comparação lexicográfica.
-    ganho_make = ((melhor_tempo[1] - tempo_ref[1]) / tempo_ref[1]) * 100 if tempo_ref[1] > 0 else 0
-
-    if not is_todo_ref(melhor_comb) and melhor_tempo < tempo_ref:
-        comb_final      = melhor_comb
-        tempo_final     = melhor_tempo
-        ordenados_final = melhor_ordenados
-        decisao = f'⚡ Combinação otimizada venceu (atraso: {_round(melhor_tempo[0])}h vs {_round(tempo_ref[0])}h; makespan: {abs(_round(ganho_make))}% melhor)'
-    else:
-        comb_final      = comb_ref
-        tempo_final     = tempo_ref
-        ordenados_final = ordenados_ref
-        info = ''
-        if not is_todo_ref(melhor_comb) and melhor_tempo < tempo_ref:
-            info = f' (melhor foi {abs(_round(ganho_make))}% mais rápida no makespan)'
-        decisao = f'✅ EDD venceu{info}'
+        ord_ = est['fn'](pedidos)
+        t_   = simular_custo(ord_, ref_data, num_machines)
+        diff = _round(t_[1] - tempo_final[1])
+        perc = _round(((t_[1] - tempo_final[1]) / tempo_final[1]) * 100) if tempo_final[1] > 0 else 0
+        ranking.append({**est, 'terminoTotal': t_, 'terminoHoras': _round(t_[1]),
+                        'ordenados': ord_, 'diff': diff, 'percentual': perc})
+    ranking.sort(key=lambda r: r['terminoTotal'])
 
     estrategias_por_grupo = [
-        {
-            'grupo':             grupos[i]['prioridade'],
-            'estrategia':        estrategias[comb_final[i]],
-            'quantidadePedidos': len(grupos[i]['pedidos']),
-        }
-        for i in range(num_grupos)
+        {'grupo': 1, 'estrategia': est_final, 'quantidadePedidos': len(pedidos)}
     ]
 
-    usa_pri  = num_grupos > 1
-    todo_ref = is_todo_ref(comb_final)
-
-    def _nome_res(n):
-        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — ', '10 — '):
-            n = n.replace(prefix, '')
-        return n[:22]
-
-    nome_est = (estrategias[idx_ref]['nome'] if todo_ref
-                else ' | '.join(f"G{g['grupo']}: {_nome_res(g['estrategia']['nome'])}"
-                                for g in estrategias_por_grupo))
-
     melhor = {
-        'id':                  'edd' if todo_ref else 'combinacao_prioridade',
-        'nome':                nome_est,
+        'id':                  est_final['id'],
+        'nome':                est_final['nome'],
         'terminoTotal':        tempo_final,
         'terminoHoras':        _round(tempo_final[1]),
         'ordenados':           ordenados_final,
         'decisao':             decisao,
         'estrategiasPorGrupo': estrategias_por_grupo,
-        'usaPrioridade':       usa_pri,
-        'totalCombinacoes':    len(combinacoes),
+        'usaPrioridade':       False,
+        'totalCombinacoes':    2,
     }
 
     return melhor, ranking
@@ -1539,7 +1499,7 @@ def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor):
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, CONFIG['ABA_RESULTADO'], cols=ncols)
 
-    cor_banner = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
+    cor_banner = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(
         f"🏆 Estratégia: {melhor['nome']}  |  Término total: {melhor['terminoHoras']}h  |  {melhor.get('decisao', '')}",
         cor_banner, font_size=11)
@@ -1609,7 +1569,7 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos):
 
     b.banner('📊 COMPARATIVO DE ESTRATÉGIAS DE DISTRIBUIÇÃO', '#0D47A1', font_size=13)
 
-    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
+    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(f"🏆 Escolhido: {melhor['nome']}  —  Término total: {melhor['terminoHoras']}h", cor_b)
     b.banner(f"{melhor.get('decisao', '')}  |  Limiar: {CONFIG['LIMIAR_TROCA_PERCENT']}%",
              '#E8F5E9', fg='#1B5E20', bold=False)
@@ -1690,7 +1650,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
             '#F57F17', fg='#FFFFFF', bold=True, font_size=12)
 
     b.banner(f'📋 RELATÓRIO DE PRODUÇÃO — Gerado em {hoje}', '#0D47A1', font_size=13)
-    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento') else '#E65100'
+    cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(
         f"🏆 {melhor['nome']}  |  Término total: {melhor['terminoHoras']}h  |  {melhor.get('decisao', '')}",
         cor_b, font_size=11)
