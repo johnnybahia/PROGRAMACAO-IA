@@ -1630,7 +1630,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
         cor_b, font_size=11)
     b.blank()
     b.write(cab, bg='#263238', fg='#FFFFFF', bold=True, h_align='CENTER')
-    freeze_rows = 6 if tem_chines else 4
+    freeze_rows = 6 if tem_chines else 5
     b.freeze(freeze_rows)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
