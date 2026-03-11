@@ -889,6 +889,37 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             return (dl, t_min, p.get('cor', ''))
         return sorted(pedidos, key=_key)
 
+    def lsf(pedidos):
+        """
+        Least Slack First (Menor Folga Primeiro) — estratégia focada em garantir
+        que pedidos que vencem antes saiam antes.
+
+        Folga = deadline − tempo_de_produção
+              = a hora mais tarde em que o pedido PODE começar e ainda entregar no prazo.
+
+        Pedidos com menor folga (ou folga negativa = já impossível de entregar no prazo)
+        entram primeiro. Isso maximiza a chance de cada pedido terminar antes do seu prazo.
+
+        Diferença fundamental em relação ao EDD:
+          EDD olha só o prazo.
+          LSF olha prazo E quanto tempo o pedido leva — o que realmente importa
+          para saber se vai fechar no prazo.
+
+        Exemplo onde LSF vence o EDD:
+          Pedido A: prazo=50h, produção=45h → folga=5h  → tem que começar AGORA
+          Pedido B: prazo=30h, produção=2h  → folga=28h → pode esperar
+          EDD coloca B primeiro (prazo 30<50) → A atrasa.
+          LSF coloca A primeiro (folga 5<28) → A fecha no prazo, B também.
+        """
+        def _folga(p):
+            dl     = p['deadline_horas'] if p['deadline_horas'] is not None else float('inf')
+            tempos = p.get('_tempos')
+            t_min  = (float(np.min(tempos)) if tempos is not None and len(tempos) > 0
+                      else get_menor_tempo(p['referencia'], modelos))
+            folga  = dl - t_min
+            return (folga, dl, p.get('cor', ''))
+        return sorted(pedidos, key=_folga)
+
     def _com_edd(fn):
         """
         Wrapper obrigatório: aplica a estratégia fn como critério de desempate
@@ -930,6 +961,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
         {'id': 'mdd_rapido',   'nome': '9 — Mais Atrasado + Mais Rápido',
          'descricao': 'Prazo mais urgente/atrasado primeiro; desempate pelo menor tempo de produção na máquina',
          'fn': mdd_rapido},
+        {'id': 'lsf',          'nome': '10 — Menor Folga Primeiro (LSF)',
+         'descricao': 'Ordena por prazo − tempo de produção: quem tem menos margem para começar entra primeiro',
+         'fn': lsf},
     ]
 
 
@@ -1171,7 +1205,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     todo_ref = is_todo_ref(comb_final)
 
     def _nome_res(n):
-        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — '):
+        for prefix in ('✅ ', '2 — ', '3 — ', '4 — ', '5 — ', '6 — ', '7 — ', '8 — ', '9 — ', '10 — '):
             n = n.replace(prefix, '')
         return n[:22]
 
