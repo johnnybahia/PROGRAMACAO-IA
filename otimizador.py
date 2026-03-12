@@ -80,8 +80,8 @@ CONFIG = {
     # Simulated Annealing — atribuição de máquinas (encaixes)
     # Otimiza QUAL máquina recebe cada pedido para a ordem EDD fixa.
     # Cada iteração testa uma combinação diferente de encaixe nas máquinas.
-    'SA_ENCAIXES_MULT':    6,     # iterações = MC_iters × multiplicador (mais que o de ordenação)
-    'SA_ENCAIXES_COOLING': 0.997, # resfria mais devagar — espaço de busca maior
+    'SA_ENCAIXES_MULT':    10,     # iterações = MC_iters × multiplicador (mais que o de ordenação)
+    'SA_ENCAIXES_COOLING': 0.998, # resfria mais devagar — espaço de busca maior
     # 2-opt local search
     '2OPT_MAX_N':  300,   # busca exaustiva O(n²) se n ≤ este valor; acima → amostragem
     '2OPT_PASSES': 5,     # máximo de passagens por rodada
@@ -1947,7 +1947,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
     if tem_chines:
         b.banner(
             '⚠ ATENÇÃO: Máquinas chinesas ajustada a quantidade para Espula grande '
-            '— quantidade de máquinas dobrada automaticamente.',
+            '— quantidade de máquinas é o que precisa ser montado realmente.',
             '#F57F17', fg='#FFFFFF', bold=True, font_size=12)
 
     b.banner(f'📋 RELATÓRIO DE PRODUÇÃO — Gerado em {hoje}', '#0D47A1', font_size=13)
@@ -1977,7 +1977,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
 
         maquinas = r['maquinas_alocadas']
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = maquinas * 2
+            maquinas = maquinas / 2
 
         b.write([
             inicio_s, termino_s,
