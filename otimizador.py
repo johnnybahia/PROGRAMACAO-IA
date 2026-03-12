@@ -1977,7 +1977,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
 
         maquinas = r['maquinas_alocadas']
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = maquinas / 2
+            maquinas = math.ceil(maquinas / 2)
 
         b.write([
             inicio_s, termino_s,
