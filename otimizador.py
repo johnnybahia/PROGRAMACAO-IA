@@ -551,16 +551,35 @@ def agrupar_por_dia_vencimento(pedidos: list) -> list:
     A separação em blocos é uma restrição DURA: pedidos de um bloco nunca
     competem com pedidos de outro bloco pela mesma posição na fila — cada
     bloco usa as máquinas que o anterior deixou livres.
+
+    Restrições especiais consideradas:
+      min_start > 0  — pedido não pode iniciar antes de X horas. Um pedido
+                       vencido com min_start = 8 dias vai para o bloco dia+8,
+                       não para 'vencido'. Um pedido com prazo dia+2 mas
+                       min_start = dia+5 vai para dia+5 (bloco mais tardio).
+      maquina_especial — a restrição de máquina já é respeitada pelo simulador;
+                         aqui apenas garantimos que o bucket não seja anterior
+                         ao min_start do pedido.
     """
     mapa: dict = {}
     for p in pedidos:
-        dl = p.get('deadline_horas')
+        dl  = p.get('deadline_horas')
+        ms  = p.get('min_start') or 0.0    # horas até o início mínimo (0 = agora)
+        # dia do bloco ditado pelo min_start (0 se pode começar hoje ou antes)
+        ms_day = int(ms // 24) if ms > 0.0 else 0
+
         if dl is None:
-            bucket = 'sem_prazo'
+            # sem prazo: se tem min_start futuro, vai para aquele dia
+            bucket = ms_day if ms_day > 0 else 'sem_prazo'
         elif dl < 0:
-            bucket = 'vencido'
+            # vencido: mas se min_start ainda está no futuro, não pode rodar
+            # no bloco 'vencido' — desloca para o dia correto
+            bucket = ms_day if ms_day > 0 else 'vencido'
         else:
-            bucket = int(dl // 24)          # 0 = vence hoje, 1 = amanhã, …
+            dl_day = int(dl // 24)         # 0 = vence hoje, 1 = amanhã, …
+            # usa o bloco mais tardio entre prazo e min_start
+            bucket = max(dl_day, ms_day)
+
         mapa.setdefault(bucket, []).append(p)
 
     # Ordena: vencidos primeiro, depois dias 0, 1, 2, …, sem prazo por último
