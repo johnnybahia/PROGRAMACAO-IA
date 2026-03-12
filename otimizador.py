@@ -539,6 +539,42 @@ def agrupar_por_prioridade(pedidos: list) -> list:
     return [{'prioridade': k, 'pedidos': mapa[k]} for k in sorted(mapa)]
 
 
+def agrupar_por_dia_vencimento(pedidos: list) -> list:
+    """
+    Agrupa pedidos por dia de vencimento relativo à data base.
+
+    Buckets (em ordem de urgência):
+      'vencido'   — todos os pedidos já atrasados (deadline_horas < 0)
+      0, 1, 2, …  — dia 0 = vence hoje [0h, 24h), dia 1 = amanhã [24h, 48h), …
+      'sem_prazo' — pedidos sem data de entrega (sempre por último)
+
+    A separação em blocos é uma restrição DURA: pedidos de um bloco nunca
+    competem com pedidos de outro bloco pela mesma posição na fila — cada
+    bloco usa as máquinas que o anterior deixou livres.
+    """
+    mapa: dict = {}
+    for p in pedidos:
+        dl = p.get('deadline_horas')
+        if dl is None:
+            bucket = 'sem_prazo'
+        elif dl < 0:
+            bucket = 'vencido'
+        else:
+            bucket = int(dl // 24)          # 0 = vence hoje, 1 = amanhã, …
+        mapa.setdefault(bucket, []).append(p)
+
+    # Ordena: vencidos primeiro, depois dias 0, 1, 2, …, sem prazo por último
+    def _key(b):
+        if b == 'vencido':
+            return (-1, 0)
+        if b == 'sem_prazo':
+            return (float('inf'), 0)
+        return (b, 0)
+
+    return [{'bucket': b, 'pedidos': mapa[b]}
+            for b in sorted(mapa, key=_key)]
+
+
 # ── PRÉ-COMPUTAÇÃO NUMPY ─────────────────────────────────────────────────────
 def precomputar_maquinas(modelos: dict):
     """
@@ -654,14 +690,20 @@ def _chave_pedido(p: dict, ref_data: dict) -> str:
 
 
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
-def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
+def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
+                     filas_iniciais=None) -> float:
     """
     Simula tempo total de produção respeitando min_start e maquina_especial de cada pedido.
     Usa arrays pré-computados (_gidxs/_tempos) quando disponíveis — assim a restrição
     de máquina especial é considerada em todas as simulações de estratégia/Monte Carlo.
     Thread-safe (cria 'filas' local).
+
+    filas_iniciais: estado inicial das máquinas (numpy array). Quando fornecido, as
+    máquinas partem do estado deixado pelo grupo/bloco anterior — usado na otimização
+    rolling-horizon por bloco de prazo. None = começa do zero (comportamento padrão).
     """
-    filas = np.zeros(num_machines, dtype=np.float64)
+    filas = (filas_iniciais.copy() if filas_iniciais is not None
+             else np.zeros(num_machines, dtype=np.float64))
     maior = 0.0
     for p in pedidos:
         gidxs = p.get('_gidxs')
@@ -686,7 +728,8 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int) -> float:
 
 # ── SIMULAÇÃO COM GRAVAÇÃO / REPRODUÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────
 def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
-                            choices: list | None = None) -> tuple:
+                            choices: list | None = None,
+                            filas_iniciais=None) -> tuple:
     """
     Versão do simulador que grava OU reproduz quais máquinas foram atribuídas.
 
@@ -697,12 +740,16 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
                     Se o índice for >= len(gidxs) do pedido, aplica módulo para
                     garantir validade (pedido pode ter restrição de máquina).
 
-    Retorna ((total_tardiness, makespan), choices_feitas) — tupla lexicográfica
-    onde total_tardiness é a prioridade absoluta e makespan é o desempate.
+    filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
+
+    Retorna ((total_tardiness, makespan), choices_feitas, filas_finais) — a terceira
+    posição contém o numpy array com o estado das máquinas ao fim da simulação,
+    necessário para encadear blocos de prazo na otimização rolling-horizon.
 
     Thread-safe: todos os estados são locais.
     """
-    filas           = np.zeros(num_machines, dtype=np.float64)
+    filas           = (filas_iniciais.copy() if filas_iniciais is not None
+                       else np.zeros(num_machines, dtype=np.float64))
     maior           = 0.0
     total_tardiness = 0.0
     choices_feitas  = []
@@ -748,11 +795,12 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
             urgencia = 1.0 + dias_ja_atrasado
             total_tardiness += urgencia * tardiness
 
-    return (total_tardiness, maior), choices_feitas
+    return (total_tardiness, maior), choices_feitas, filas
 
 
 # ── CUSTO LEXICOGRÁFICO: (tardiness, makespan) ───────────────────────────────
-def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> tuple:
+def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
+                   filas_iniciais=None) -> tuple:
     """
     Retorna (total_tardiness, makespan) — objetivo lexicográfico.
 
@@ -761,8 +809,11 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int) -> tuple:
 
     Pedidos já atrasados no início (deadline_horas negativo) recebem peso maior.
     Thread-safe (cria 'filas' local).
+
+    filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
     """
-    filas           = np.zeros(num_machines, dtype=np.float64)
+    filas           = (filas_iniciais.copy() if filas_iniciais is not None
+                       else np.zeros(num_machines, dtype=np.float64))
     maior           = 0.0
     total_tardiness = 0.0
     for p in pedidos:
@@ -830,7 +881,8 @@ def _sort_by_edd(pedidos: list) -> list:
     ))
 
 
-def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
+def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
+                      filas_iniciais=None) -> list:
     """Cria as estratégias como closures sobre modelos e ref_data."""
 
     def _mc_iter(n):
@@ -927,8 +979,9 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
             list(_sort_by_edd(rapido(pedidos))),
         ]
         current = min(candidatos_ini,
-                      key=lambda o: simular_custo(o, ref_data, num_machines))
-        current_t = simular_custo(current, ref_data, num_machines)
+                      key=lambda o: simular_custo(o, ref_data, num_machines,
+                                                  filas_iniciais))
+        current_t = simular_custo(current, ref_data, num_machines, filas_iniciais)
         best, best_t = list(current), current_t
 
         # Duas temperaturas: uma para tardiness (prioridade), outra para makespan (desempate).
@@ -955,7 +1008,7 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int) -> list:
                 continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
-            neighbor_t  = simular_custo(neighbor, ref_data, num_machines)
+            neighbor_t  = simular_custo(neighbor, ref_data, num_machines, filas_iniciais)
             n_tard, n_make = neighbor_t
             c_tard, c_make = current_t
             # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
@@ -1097,7 +1150,8 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
 
 
 # ── 2-OPT LOCAL SEARCH ────────────────────────────────────────────────────────
-def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
+def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
+                      filas_iniciais=None):
     """
     Refinamento por busca local 2-opt.
 
@@ -1115,10 +1169,11 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
     """
     n = len(ordenados)
     if n < 2:
-        return list(ordenados), simular_custo(ordenados, ref_data, num_machines)
+        return list(ordenados), simular_custo(ordenados, ref_data, num_machines,
+                                              filas_iniciais)
 
     melhor   = list(ordenados)
-    melhor_t = simular_custo(melhor, ref_data, num_machines)
+    melhor_t = simular_custo(melhor, ref_data, num_machines, filas_iniciais)
     max_n    = CONFIG['2OPT_MAX_N']
 
     for _ in range(CONFIG['2OPT_PASSES']):
@@ -1147,7 +1202,7 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
                 continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
             cand      = list(melhor)
             cand[early], cand[late] = cand[late], cand[early]
-            t = simular_custo(cand, ref_data, num_machines)
+            t = simular_custo(cand, ref_data, num_machines, filas_iniciais)
             if t < melhor_t:
                 melhor, melhor_t = cand, t
                 melhorou = True
@@ -1158,7 +1213,8 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int):
 
 
 # ── SA DE ENCAIXES — OTIMIZAÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────────────
-def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
+def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
+                 filas_iniciais=None) -> list:
     """
     Simulated Annealing sobre ATRIBUIÇÃO DE MÁQUINAS para ordem EDD fixa.
 
@@ -1189,7 +1245,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
     menor custo encontrado, pronta para ser usada em otimizar_distribuicao.
     """
     # Semente greedy
-    current_t, current_choices = simular_com_atribuicao(pedidos, ref_data, num_machines)
+    current_t, current_choices, _ = simular_com_atribuicao(
+        pedidos, ref_data, num_machines, filas_iniciais=filas_iniciais)
     best_t      = current_t
     best_choices = list(current_choices)
 
@@ -1219,7 +1276,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
         # O módulo em simular_com_atribuicao garante que o índice é válido.
         neighbor[idx] = current_choices[idx] + random.randint(1, max(1, num_machines - 1))
 
-        neighbor_t, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor)
+        neighbor_t, _, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor,
+                                                    filas_iniciais=filas_iniciais)
         n_tard, n_make = neighbor_t
         c_tard, c_make = current_t
         # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
@@ -1243,7 +1301,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int) -> list:
 
 
 # ── ESCOLHA DA MELHOR ESTRATÉGIA (EDD estrito + SA intra-prazo) ───────────────
-def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines):
+def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
+                                filas_iniciais=None):
     """
     A ordenação final é SEMPRE por prazo de entrega (EDD estrito, dia a dia).
     Pedidos com prazos diferentes nunca são reordenados — o cliente com prazo
@@ -1255,20 +1314,22 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
 
     O ranking informativo mostra todas as 10 estratégias para referência,
     mas nenhuma delas pode alterar a prioridade entre datas diferentes.
+
+    filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
     """
-    estrategias = make_estrategias(modelos, ref_data, num_machines)
+    estrategias = make_estrategias(modelos, ref_data, num_machines, filas_iniciais)
     idx_edd = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
     idx_sa  = next(i for i, e in enumerate(estrategias) if e['id'] == 'sa')
 
     # EDD puro — base sempre respeitada
     print('  Calculando ordenação EDD base...')
     ordenados_edd = estrategias[idx_edd]['fn'](pedidos)
-    t_edd         = simular_custo(ordenados_edd, ref_data, num_machines)
+    t_edd         = simular_custo(ordenados_edd, ref_data, num_machines, filas_iniciais)
 
     # SA — otimiza DENTRO de grupos de mesmo prazo (nunca troca pedidos de datas diferentes)
     print('  Refinando com SA dentro dos grupos de mesmo prazo...')
     ordenados_sa = estrategias[idx_sa]['fn'](pedidos)
-    t_sa         = simular_custo(ordenados_sa, ref_data, num_machines)
+    t_sa         = simular_custo(ordenados_sa, ref_data, num_machines, filas_iniciais)
 
     # Decisão: SA só ganha se melhorar o custo lexicográfico
     if t_sa < t_edd:
@@ -1290,7 +1351,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
     ranking = []
     for est in estrategias:
         ord_ = est['fn'](pedidos)
-        t_   = simular_custo(ord_, ref_data, num_machines)
+        t_   = simular_custo(ord_, ref_data, num_machines, filas_iniciais)
         diff = _round(t_[1] - tempo_final[1])
         perc = _round(((t_[1] - tempo_final[1]) / tempo_final[1]) * 100) if tempo_final[1] > 0 else 0
         ranking.append({**est, 'terminoTotal': t_, 'terminoHoras': _round(t_[1]),
@@ -2212,6 +2273,122 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
         print()
 
 
+# ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
+def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
+    """
+    Otimização rolling-horizon: agrupa pedidos por dia de vencimento e aplica
+    toda a capacidade de análise (EDD/SA + 2-opt + SA encaixes) a cada bloco
+    separadamente, passando o estado das máquinas para o bloco seguinte.
+
+    Vantagens sobre a otimização global:
+      • Pedidos atrasados usam as máquinas ANTES dos pedidos futuros —
+        restrição dura, não apenas peso na função de custo.
+      • Cada bloco é menor → mais iterações SA/2-opt por pedido.
+      • O "tetris" dentro de cada bloco é mais apertado.
+
+    Retorna (ordenados_total, choices_total, melhor_global).
+    'choices_total' é a concatenação dos choices de todos os blocos e pode
+    ser passado diretamente a otimizar_distribuicao como a lista de encaixes.
+    """
+    blocos   = agrupar_por_dia_vencimento(pedidos)
+    n_blocos = len(blocos)
+
+    filas_atual     = np.zeros(num_machines, dtype=np.float64)
+    ordenados_total = []
+    choices_total   = []
+    decisao_partes  = []
+    tard_total      = 0.0
+
+    for i, bloco in enumerate(blocos):
+        ped_b  = bloco['pedidos']
+        bucket = bloco['bucket']
+        nb     = len(ped_b)
+
+        if bucket == 'vencido':
+            label = 'vencidos'
+        elif bucket == 'sem_prazo':
+            label = 'sem prazo'
+        else:
+            label = f'dia +{bucket}'
+
+        print(f'  Bloco {i+1}/{n_blocos}: {label}  ({nb} pedido{"s" if nb != 1 else ""})')
+
+        if nb == 0:
+            continue
+
+        # ── Escolher melhor ordenação dentro do bloco ──────────────────────
+        grupos_b = agrupar_por_prioridade(ped_b)
+        melhor_b, _ = escolher_melhor_estrategia(
+            ped_b, modelos, grupos_b, ref_data, num_machines,
+            filas_iniciais=filas_atual,
+        )
+
+        # ── 2-opt dentro do bloco ──────────────────────────────────────────
+        ord_2opt, t_2opt = busca_local_2opt(
+            melhor_b['ordenados'], ref_data, num_machines,
+            filas_iniciais=filas_atual,
+        )
+        if t_2opt < melhor_b['terminoTotal']:
+            ganho = _round(((melhor_b['terminoTotal'][1] - t_2opt[1])
+                            / melhor_b['terminoTotal'][1]) * 100) if melhor_b['terminoTotal'][1] > 0 else 0
+            melhor_b['ordenados']    = ord_2opt
+            melhor_b['terminoTotal'] = t_2opt
+            print(f'    2-opt −{ganho}%')
+
+        # ── SA encaixes dentro do bloco ────────────────────────────────────
+        choices_sa = sa_encaixes(
+            melhor_b['ordenados'], ref_data, num_machines,
+            filas_iniciais=filas_atual,
+        )
+        t_enc, _,  filas_enc = simular_com_atribuicao(
+            melhor_b['ordenados'], ref_data, num_machines,
+            choices_sa, filas_iniciais=filas_atual,
+        )
+        t_grd, choices_grd, filas_grd = simular_com_atribuicao(
+            melhor_b['ordenados'], ref_data, num_machines,
+            filas_iniciais=filas_atual,
+        )
+
+        if t_enc < t_grd:
+            choices_bloco = choices_sa
+            filas_atual   = filas_enc
+            tard_total   += t_enc[0]
+        else:
+            choices_bloco = choices_grd
+            filas_atual   = filas_grd
+            tard_total   += t_grd[0]
+
+        ordenados_total.extend(melhor_b['ordenados'])
+        choices_total.extend(choices_bloco)
+        decisao_partes.append(f'{label}:{melhor_b["id"]}')
+
+    makespan_total = float(filas_atual.max()) if len(filas_atual) else 0.0
+    t_global = (tard_total, makespan_total)
+
+    decisao_str = (f'Blocos ({n_blocos}g): '
+                   + ' | '.join(decisao_partes[:4])
+                   + ('…' if len(decisao_partes) > 4 else ''))
+
+    melhor_global = {
+        'id':                  'blocos',
+        'nome':                f'Blocos por prazo ({n_blocos} grupos)',
+        'terminoTotal':        t_global,
+        'terminoHoras':        _round(makespan_total),
+        'ordenados':           ordenados_total,
+        'decisao':             decisao_str,
+        'usaPrioridade':       False,
+        'totalCombinacoes':    n_blocos,
+        'estrategiasPorGrupo': [
+            {'grupo': i + 1,
+             'estrategia': {'id': 'blocos', 'nome': b['bucket']},
+             'quantidadePedidos': len(b['pedidos'])}
+            for i, b in enumerate(blocos)
+        ],
+    }
+
+    return ordenados_total, choices_total, melhor_global
+
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     if len(sys.argv) < 3:
@@ -2267,42 +2444,28 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
-    print('6/8 Escolhendo melhor estratégia...')
-    grupos = agrupar_por_prioridade(pedidos)
-    melhor, ranking = escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines)
+    print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
+    blocos_info = agrupar_por_dia_vencimento(pedidos)
+    print(f'  {len(blocos_info)} bloco(s): '
+          + ', '.join(
+              ('vencidos' if b['bucket'] == 'vencido' else
+               'sem prazo' if b['bucket'] == 'sem_prazo' else
+               f'dia+{b["bucket"]}') + f'({len(b["pedidos"])}p)'
+              for b in blocos_info
+          ))
+    ordenados_total, choices_total, melhor = otimizar_em_blocos(
+        pedidos, modelos, ref_data, num_machines)
     print(f'  ✔ {melhor["decisao"]}')
 
-    print('  Refinando com busca local 2-opt...')
-    ordenados_2opt, t_2opt = busca_local_2opt(melhor['ordenados'], ref_data, num_machines)
-    if t_2opt < melhor['terminoTotal']:
-        ganho_2opt = _round(((melhor['terminoTotal'][1] - t_2opt[1]) / melhor['terminoTotal'][1]) * 100) if melhor['terminoTotal'][1] > 0 else 0
-        melhor['ordenados']    = ordenados_2opt
-        melhor['terminoTotal'] = t_2opt
-        melhor['terminoHoras'] = _round(t_2opt[1])
-        melhor['decisao']     += f' → 2-opt −{ganho_2opt}%'
-        print(f'  ✔ 2-opt melhorou {ganho_2opt}% → {_round(t_2opt[1])}h')
-    else:
-        print(f'  ✔ 2-opt: solução já estava em ótimo local')
-
-    print('7/8 Otimizando encaixe de máquinas e gerando distribuição...')
-    print('  Buscando melhor atribuição de máquinas (SA encaixes)...')
-    melhores_choices = sa_encaixes(melhor['ordenados'], ref_data, num_machines)
-    t_encaixes, _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines, melhores_choices)
-    t_greedy,   _ = simular_com_atribuicao(melhor['ordenados'], ref_data, num_machines)
-    if t_encaixes < t_greedy:
-        ganho_enc = _round(((t_greedy[1] - t_encaixes[1]) / t_greedy[1]) * 100) if t_greedy[1] > 0 else 0
-        print(f'  ✔ SA encaixes melhorou {ganho_enc}% → {_round(t_encaixes[1])}h (greedy era {_round(t_greedy[1])}h)')
-        melhor['terminoTotal'] = t_encaixes
-        melhor['terminoHoras'] = _round(t_encaixes[1])
-        melhor['decisao']     += f' → SA encaixes −{ganho_enc}%'
-    else:
-        melhores_choices = None   # greedy já era ótimo, usa o padrão
-        print(f'  ✔ SA encaixes: greedy já era o melhor encaixe')
-
+    print('7/8 Gerando distribuição final...')
     resultado, sem_cadastro = otimizar_distribuicao(
-        melhor['ordenados'], modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas, choices=melhores_choices
+        ordenados_total, modelos, ref_data, num_machines, ridx_map,
+        data_base, datas_bloqueadas, choices=choices_total
     )
+    # ranking informativo (apenas EDD global para comparação)
+    grupos  = agrupar_por_prioridade(pedidos)
+    _, ranking = escolher_melhor_estrategia(
+        pedidos, modelos, grupos, ref_data, num_machines)
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
 
