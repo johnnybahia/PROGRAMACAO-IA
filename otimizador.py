@@ -841,7 +841,12 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
     Retorna (total_tardiness, makespan) — objetivo lexicográfico.
 
     Prioridade absoluta: minimizar total_tardiness (soma ponderada dos atrasos).
-    Desempate: minimizar makespan quando tardiness é igual.
+    Desempate: minimizar makespan (quando o último pedido do bloco termina).
+
+    No rolling-horizon os blocos são sequenciais: terminar o bloco atual mais
+    cedo libera máquinas mais cedo para o próximo bloco — o que automaticamente
+    adianta todos os pedidos dos blocos seguintes. Minimizar o makespan do bloco
+    é equivalente a minimizar o término individual de cada pedido neste contexto.
 
     Pedidos já atrasados no início (deadline_horas negativo) recebem peso maior.
     Thread-safe (cria 'filas' local).
