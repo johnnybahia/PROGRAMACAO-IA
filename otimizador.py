@@ -2304,6 +2304,175 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
         print()
 
 
+# ── PRÉ-SIMULAÇÃO DE RESTRIÇÕES ──────────────────────────────────────────────
+def _pre_simular_restritos(fila_inicial: list, num_machines: int, hpd: float) -> list:
+    """
+    Antes do rolling-horizon principal, determina o bloco correto para pedidos
+    com restrições (maquina_especial ou min_start > 0) fazendo uma pré-simulação
+    greedy de todos os pedidos em ordem de bloco.
+
+    Algoritmo:
+      1. Para cada bloco (em ordem), captura snapshot das máquinas ANTES de
+         processar o bloco e depois roda simulação greedy simples do bloco.
+      2. Para cada pedido restrito, usa o snapshot do seu bloco para calcular
+         o início efetivo real (max(min_start, maquina_mais_cedo_livre)).
+      3. Se o início efetivo cai fora da janela do bloco, o pedido é realocado
+         para o bloco correto.
+
+    Retorna nova fila com as realocações aplicadas (blocos reordenados).
+    """
+    def _bkey(b):
+        if b == 'vencido':   return -1
+        if b == 'sem_prazo': return float('inf')
+        return b
+
+    tem_restrito = any(
+        bool(p.get('maquina_especial')) or float(p.get('min_start', 0.0)) > 0
+        for bloco in fila_inicial for p in bloco['pedidos']
+    )
+    if not tem_restrito:
+        return fila_inicial   # nada a ajustar
+
+    # ── Pré-simulação greedy: snapshot ANTES de cada bloco ──────────────────
+    filas         = np.zeros(num_machines, dtype=np.float64)
+    snap_antes    = {}   # bucket → filas antes do bloco
+
+    for bloco in fila_inicial:
+        b = bloco['bucket']
+        snap_antes[b] = filas.copy()
+        for p in bloco['pedidos']:
+            gidxs = p.get('_gidxs')
+            if gidxs is None:
+                continue
+            tempos = p['_tempos']
+            min_s  = float(p.get('min_start', 0.0))
+            for _ in range(p['maquinas_necessarias']):
+                available = np.maximum(filas[gidxs], min_s)
+                ft        = available + tempos
+                best      = int(np.argmin(ft))
+                filas[gidxs[best]] = float(ft[best])
+
+    # ── Realocar pedidos restritos para o bloco efetivo ─────────────────────
+    mapa_novo: dict = {}
+    ajustes         = 0
+
+    for bloco in fila_inicial:
+        b_atual    = bloco['bucket']
+        filas_ref  = snap_antes.get(b_atual, np.zeros(num_machines, dtype=np.float64))
+
+        for p in bloco['pedidos']:
+            maq_esp = bool(p.get('maquina_especial'))
+            min_s   = float(p.get('min_start', 0.0))
+
+            # Pedidos sem restrição mantêm o bloco atual
+            if not maq_esp and min_s <= 0.0:
+                mapa_novo.setdefault(b_atual, []).append(p)
+                continue
+
+            gidxs = p.get('_gidxs')
+            if gidxs is None:
+                mapa_novo.setdefault(b_atual, []).append(p)
+                continue
+
+            # Início efetivo considerando disponibilidade real das máquinas
+            machine_free    = float(np.min(filas_ref[gidxs]))
+            effective_start = max(min_s, machine_free)
+            effective_day   = int(effective_start // hpd) if effective_start > 0 else 0
+
+            # Bucket correto: nunca anterior ao bucket pelo prazo
+            dl = p.get('deadline_horas')
+            if dl is None:
+                b_correto = 'sem_prazo'
+            elif dl < 0:
+                # Vencido: só move se realmente não pode iniciar agora
+                b_correto = effective_day if effective_day > 0 else 'vencido'
+            else:
+                dl_day    = int(dl // hpd)
+                b_correto = max(dl_day, effective_day)
+
+            if b_correto != b_atual:
+                ajustes += 1
+            mapa_novo.setdefault(b_correto, []).append(p)
+
+    if ajustes:
+        print(f'  ↪ Pré-simulação: {ajustes} pedido(s) com restrição '
+              f'realocado(s) para o bloco correto')
+
+    return [{'bucket': b, 'pedidos': mapa_novo[b]}
+            for b in sorted(mapa_novo, key=_bkey)
+            if mapa_novo[b]]
+
+
+# ── SEPARAÇÃO DE PEDIDOS COM RESTRIÇÕES ──────────────────────────────────────
+def _separar_diferidos(pedidos: list, filas_atual, hpd: float, bucket) -> tuple:
+    """
+    Separa os pedidos do bloco em dois grupos:
+      no_bloco  — podem ser agendados dentro da janela deste bloco
+      diferidos — têm restrição (maquina_especial / min_start) que impede
+                  início antes do fim da janela do bloco; são realocados
+                  para o bloco correto baseado no estado real das máquinas
+
+    Lógica de janela:
+      bucket 'vencido' → janela termina em 0h  (já era pra ter saído)
+      bucket  n (int)  → janela termina em (n+1)*hpd horas
+      bucket 'sem_prazo' → janela infinita (nunca difere)
+
+    Para pedidos sem _gidxs (sem cadastro) a função os mantém no bloco atual
+    — o simulador já os ignora corretamente.
+    """
+    if bucket == 'sem_prazo':
+        return list(pedidos), {}   # sem_prazo: nunca difere
+
+    block_end = 0.0 if bucket == 'vencido' else (bucket + 1) * hpd
+
+    no_bloco:  list = []
+    diferidos: dict = {}
+
+    for p in pedidos:
+        gidxs = p.get('_gidxs')
+        min_s = float(p.get('min_start', 0.0))
+
+        if gidxs is None:
+            no_bloco.append(p)
+            continue
+
+        # Quando a máquina mais rápida (dentro das permitidas) estará livre
+        machine_free    = float(np.min(filas_atual[gidxs]))
+        effective_start = max(min_s, machine_free)
+
+        if effective_start <= block_end:
+            no_bloco.append(p)
+        else:
+            # Dia efetivo de início — determina o bloco de destino
+            effective_day = int(effective_start // hpd)
+            diferidos.setdefault(effective_day, []).append(p)
+
+    return no_bloco, diferidos
+
+
+def _inserir_em_fila(fila: list, idx_atual: int, dia: int, pedidos_novos: list):
+    """
+    Insere pedidos_novos no bloco de dia 'dia' da fila, após idx_atual.
+    Se o bloco não existir, cria um novo na posição correta (ordem crescente
+    de dia, antes de 'sem_prazo').
+    """
+    for j in range(idx_atual + 1, len(fila)):
+        bj = fila[j]['bucket']
+        if bj == dia:
+            fila[j]['pedidos'].extend(pedidos_novos)
+            return
+        if bj == 'sem_prazo' or (isinstance(bj, int) and bj > dia):
+            fila.insert(j, {'bucket': dia, 'pedidos': list(pedidos_novos)})
+            return
+    # Adiciona antes de 'sem_prazo' se existir, senão no fim
+    sp = next((j for j in range(idx_atual + 1, len(fila))
+               if fila[j]['bucket'] == 'sem_prazo'), None)
+    if sp is not None:
+        fila.insert(sp, {'bucket': dia, 'pedidos': list(pedidos_novos)})
+    else:
+        fila.append({'bucket': dia, 'pedidos': list(pedidos_novos)})
+
+
 # ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
 def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     """
@@ -2321,19 +2490,40 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     'choices_total' é a concatenação dos choices de todos os blocos e pode
     ser passado diretamente a otimizar_distribuicao como a lista de encaixes.
     """
-    blocos   = agrupar_por_dia_vencimento(pedidos)
-    n_blocos = len(blocos)
+    hpd = CONFIG['HORAS_POR_DIA']
+
+    # ── Pré-simulação: blocos iniciais com restrições já no lugar certo ────────
+    # Roda simulação greedy de todos os pedidos para capturar estado das máquinas
+    # antes de cada bloco. Pedidos com maquina_especial ou min_start são realocados
+    # para o bloco onde de fato podem iniciar — antes de qualquer SA/2-opt.
+    fila_base = [{'bucket': b['bucket'], 'pedidos': list(b['pedidos'])}
+                 for b in agrupar_por_dia_vencimento(pedidos)]
+    fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
 
     filas_atual     = np.zeros(num_machines, dtype=np.float64)
     ordenados_total = []
     choices_total   = []
     decisao_partes  = []
+    blocos_info     = []   # para estrategiasPorGrupo no resultado
     tard_total      = 0.0
+    idx             = 0    # índice corrente (fila pode crescer durante o loop)
 
-    for i, bloco in enumerate(blocos):
-        ped_b  = bloco['pedidos']
+    while idx < len(fila):
+        bloco  = fila[idx]
         bucket = bloco['bucket']
-        nb     = len(ped_b)
+
+        # ── Realocar pedidos com restrições baseado no estado atual ─────────
+        # Após o bloco anterior rodar, máquinas podem estar ocupadas além
+        # da janela deste bloco — pedidos com maquina_especial ou min_start
+        # que não conseguem iniciar nesta janela vão para o bloco correto.
+        ped_b, diferidos = _separar_diferidos(
+            bloco['pedidos'], filas_atual, hpd, bucket)
+
+        for dia_ef, ped_dif in sorted(diferidos.items()):
+            _inserir_em_fila(fila, idx, dia_ef, ped_dif)
+
+        nb    = len(ped_b)
+        n_dif = sum(len(v) for v in diferidos.values())
 
         if bucket == 'vencido':
             label = 'vencidos'
@@ -2342,9 +2532,12 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         else:
             label = f'dia +{bucket}'
 
-        print(f'  Bloco {i+1}/{n_blocos}: {label}  ({nb} pedido{"s" if nb != 1 else ""})')
+        dif_s = f'  ↪ {n_dif} diferido{"s" if n_dif != 1 else ""}' if n_dif else ''
+        print(f'  Bloco {idx+1}/{len(fila)}: {label}  '
+              f'({nb} pedido{"s" if nb != 1 else ""}{dif_s})')
 
         if nb == 0:
+            idx += 1
             continue
 
         # ── Escolher melhor ordenação dentro do bloco ──────────────────────
@@ -2397,9 +2590,12 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         ordenados_total.extend(melhor_b['ordenados'])
         choices_total.extend(choices_bloco)
         decisao_partes.append(f'{label}:{melhor_b["id"]}')
+        blocos_info.append({'bucket': bucket, 'nb': nb, 'est': melhor_b})
+        idx += 1
 
+    n_blocos       = len(blocos_info)
     makespan_total = float(filas_atual.max()) if len(filas_atual) else 0.0
-    t_global = (tard_total, makespan_total)
+    t_global       = (tard_total, makespan_total)
 
     decisao_str = (f'Blocos ({n_blocos}g): '
                    + ' | '.join(decisao_partes[:4])
@@ -2416,9 +2612,9 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         'totalCombinacoes':    n_blocos,
         'estrategiasPorGrupo': [
             {'grupo': i + 1,
-             'estrategia': {'id': 'blocos', 'nome': b['bucket']},
-             'quantidadePedidos': len(b['pedidos'])}
-            for i, b in enumerate(blocos)
+             'estrategia': {'id': 'blocos', 'nome': bi['bucket']},
+             'quantidadePedidos': bi['nb']}
+            for i, bi in enumerate(blocos_info)
         ],
     }
 
