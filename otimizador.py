@@ -322,10 +322,27 @@ def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set)
     return datetime.combine(data_atual, datetime.min.time()) + timedelta(hours=horas_restantes)
 
 
+def data_para_horas_corridas(base_date: date, target_date: date) -> float:
+    """
+    Converte uma data do cliente em offset de horas de CALENDÁRIO a partir de base_date,
+    sem descontar datas bloqueadas.
+
+    Usado exclusivamente para deadline_horas e min_start — o prazo combinado com o
+    cliente é uma data no calendário real; feriados e bloqueios não movem o prazo.
+
+    Retorna valor negativo para datas passadas (preserva ordem EDD de pedidos vencidos).
+    """
+    delta = (target_date - base_date).days
+    return float(delta * CONFIG['HORAS_POR_DIA'])
+
+
 def data_para_horas(base_date: date, target_date: date, datas_bloqueadas: set) -> float:
     """
-    Converte uma data alvo em offset de horas virtuais a partir de base_date,
+    Converte uma data alvo em offset de horas ÚTEIS a partir de base_date,
     contando apenas dias que não estejam em datas_bloqueadas.
+
+    Usado pelo tetris (min_start de máquinas, filas) — representa quando a máquina
+    estará disponível contando só os dias em que ela efetivamente trabalha.
 
     Retorna valor negativo quando target_date < base_date, preservando a ordem
     relativa de prazos vencidos — essencial para que o EDD continue funcionando
@@ -433,25 +450,25 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
         if total_maq <= 0:
             continue
 
-        # Data inicial especial → min_start em horas virtuais
+        # Data inicial especial (col A) → min_start em horas de calendário corridas.
+        # O cliente combinou uma data real; bloqueios não movem essa restrição.
         data_esp  = parse_data(data_esp_str)
         min_start = 0.0
         if data_esp:
-            min_start = data_para_horas(data_base, data_esp, datas_bloqueadas)
+            min_start = data_para_horas_corridas(data_base, data_esp)
 
-        # Deadline → offset em horas virtuais
+        # Deadline (col I) → offset em horas de calendário corridas.
+        # O prazo do cliente é uma data no calendário; feriados não o movem.
         data_entrega   = parse_data(data_ent_str)
         deadline_horas = None
         if data_entrega:
-            deadline_horas = data_para_horas(data_base, data_entrega, datas_bloqueadas)
+            deadline_horas = data_para_horas_corridas(data_base, data_entrega)
 
-        # DATA DE ENTREGA ESPECIAL (col L): quando preenchida, substitui a data de
-        # entrega e o deadline em TODAS as análises — o código passa a trabalhar
-        # exclusivamente para cumprir este prazo.
+        # DATA DE ENTREGA ESPECIAL (col L): substitui col I em TODAS as análises.
         data_ent_especial = parse_data(data_ent_esp_str)
         if data_ent_especial:
             data_entrega   = data_ent_especial
-            deadline_horas = data_para_horas(data_base, data_ent_especial, datas_bloqueadas)
+            deadline_horas = data_para_horas_corridas(data_base, data_ent_especial)
 
         pedidos.append({
             'linha_sheet':          i,
