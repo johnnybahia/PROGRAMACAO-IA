@@ -923,7 +923,7 @@ def _sort_by_edd(pedidos: list) -> list:
 
 
 def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
-                      filas_iniciais=None) -> list:
+                      filas_iniciais=None, livre=False) -> list:
     """Cria as estratégias como closures sobre modelos e ref_data."""
 
     def _mc_iter(n):
@@ -1034,19 +1034,19 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
 
         for _ in range(iters):
             a, b = random.sample(range(n), 2)
-            # Normaliza sempre early < late — mesma lógica do 2-opt.
-            # random.sample pode retornar a > b, então normalizamos antes de
-            # verificar a restrição EDD para evitar checar na direção errada.
-            early, late = (a, b) if a < b else (b, a)
-            dl_e = current[early].get('deadline_horas')
-            dl_l = current[late].get('deadline_horas')
-            _dl_early = dl_e if dl_e is not None else float('inf')
-            _dl_late  = dl_l if dl_l is not None else float('inf')
-            # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
-            # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
-            mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
-            if not mesmo_prazo and _dl_late > _dl_early:
-                continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
+            if not livre:
+                # Modo global: EDD estrito entre pedidos de prazos diferentes.
+                # Dentro de um bloco rolling-horizon (livre=True) a prioridade entre
+                # blocos já está garantida — o SA pode reordenar livremente para
+                # minimizar o makespan do bloco e liberar máquinas mais cedo.
+                early, late = (a, b) if a < b else (b, a)
+                dl_e = current[early].get('deadline_horas')
+                dl_l = current[late].get('deadline_horas')
+                _dl_early = dl_e if dl_e is not None else float('inf')
+                _dl_late  = dl_l if dl_l is not None else float('inf')
+                mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
+                if not mesmo_prazo and _dl_late > _dl_early:
+                    continue
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
             neighbor_t  = simular_custo(neighbor, ref_data, num_machines, filas_iniciais)
@@ -1192,7 +1192,7 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
 
 # ── 2-OPT LOCAL SEARCH ────────────────────────────────────────────────────────
 def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
-                      filas_iniciais=None):
+                      filas_iniciais=None, livre=False):
     """
     Refinamento por busca local 2-opt.
 
@@ -1204,9 +1204,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
     Usa arrays pré-computados dos pedidos → respeita maquina_especial.
     Custo zero se a solução já estiver num ótimo local.
 
-    Restrição EDD: só aceita trocas onde o pedido que avança na fila tem
-    deadline ≤ ao pedido que recua. Isso garante que a otimização de
-    makespan nunca coloca um pedido menos urgente antes de um mais urgente.
+    livre=False (padrão): EDD estrito — nunca coloca pedido menos urgente antes.
+    livre=True  (blocos): trocas livres — prioridade entre blocos já garantida
+                          pelo rolling-horizon; dentro do bloco o foco é liberar
+                          máquinas mais cedo possível.
     """
     n = len(ordenados)
     if n < 2:
@@ -1225,24 +1226,17 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
             else [tuple(random.sample(range(n), 2)) for _ in range(n * 4)]
         )
         for a, b in pares:
-            # Normaliza sempre early < late — garante que a verificação EDD seja
-            # correta independente da ordem em que o par foi gerado (random ou não).
-            early, late = (a, b) if a < b else (b, a)
-            # Após a troca: posição early recebe o pedido do late, e vice-versa.
-            # EDD só é respeitado se o deadline do pedido que vai para a posição
-            # anterior (late→early) for ≤ ao que vai para trás (early→late).
-            # None = sem prazo definido → tratado como infinito (menos urgente).
-            dl_e = melhor[early].get('deadline_horas')
-            dl_l = melhor[late].get('deadline_horas')
-            _dl_early = dl_e if dl_e is not None else float('inf')
-            _dl_late  = dl_l if dl_l is not None else float('inf')
-            # Mesmo prazo exato (mesmo dia) → troca livre para otimizar encaixe.
-            # Prazos diferentes → EDD estrito: nunca coloca pedido menos urgente antes.
-            mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
-            if not mesmo_prazo and _dl_late > _dl_early:
-                continue  # prazos diferentes e pedido menos urgente iria para frente → viola EDD
+            if not livre:
+                early, late = (a, b) if a < b else (b, a)
+                dl_e = melhor[early].get('deadline_horas')
+                dl_l = melhor[late].get('deadline_horas')
+                _dl_early = dl_e if dl_e is not None else float('inf')
+                _dl_late  = dl_l if dl_l is not None else float('inf')
+                mesmo_prazo = (_dl_early == _dl_late and _dl_early != float('inf'))
+                if not mesmo_prazo and _dl_late > _dl_early:
+                    continue
             cand      = list(melhor)
-            cand[early], cand[late] = cand[late], cand[early]
+            cand[a], cand[b] = cand[b], cand[a]
             t = simular_custo(cand, ref_data, num_machines, filas_iniciais)
             if t < melhor_t:
                 melhor, melhor_t = cand, t
@@ -1343,22 +1337,17 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
 
 # ── ESCOLHA DA MELHOR ESTRATÉGIA (EDD estrito + SA intra-prazo) ───────────────
 def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
-                                filas_iniciais=None):
+                                filas_iniciais=None, livre=False):
     """
-    A ordenação final é SEMPRE por prazo de entrega (EDD estrito, dia a dia).
-    Pedidos com prazos diferentes nunca são reordenados — o cliente com prazo
-    mais próximo é sempre atendido primeiro, sem exceção.
-
-    Dentro de um mesmo dia de prazo, o SA pode otimizar a sequência para
-    reduzir atraso e makespan. A decisão final é entre EDD puro e EDD+SA:
-    o SA só vence se melhorar o custo lexicográfico (atraso, makespan).
-
-    O ranking informativo mostra todas as 10 estratégias para referência,
-    mas nenhuma delas pode alterar a prioridade entre datas diferentes.
+    livre=False (padrão): EDD estrito entre pedidos de prazos diferentes.
+    livre=True  (blocos): SA livre para reordenar qualquer pedido dentro do bloco
+                          buscando menor makespan — prioridade entre blocos já
+                          garantida pelo rolling-horizon.
 
     filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
     """
-    estrategias = make_estrategias(modelos, ref_data, num_machines, filas_iniciais)
+    estrategias = make_estrategias(modelos, ref_data, num_machines, filas_iniciais,
+                                   livre=livre)
     idx_edd = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
     idx_sa  = next(i for i, e in enumerate(estrategias) if e['id'] == 'sa')
 
@@ -2113,7 +2102,8 @@ def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
     if ranking:
         linhas.append('\n📊 Top 3:')
         for i, est in enumerate(ranking[:3]):
-            diff = '✅ melhor' if i == 0 else f"+{_round(est['terminoTotal'][1] - ranking[0]['terminoTotal'][1])}h"
+            _d   = _round(est['terminoTotal'][1] - ranking[0]['terminoTotal'][1])
+            diff = '✅ melhor' if i == 0 else (f'+{_d}h' if _d >= 0 else f'{_d}h')
             linhas.append(f"   {i+1}. {est['nome'][:38]}: {est['terminoHoras']}h ({diff})")
 
     atrasados   = sum(1 for r in resultado if r.get('prazo_delta') is not None and r['prazo_delta'] < 0)
@@ -2359,15 +2349,20 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
 
         # ── Escolher melhor ordenação dentro do bloco ──────────────────────
         grupos_b = agrupar_por_prioridade(ped_b)
+        # livre=True: SA e 2-opt podem reordenar qualquer pedido dentro do bloco.
+        # A prioridade entre blocos já está garantida pelo rolling-horizon.
+        # Dentro do bloco o único objetivo é liberar máquinas mais cedo possível.
         melhor_b, _ = escolher_melhor_estrategia(
             ped_b, modelos, grupos_b, ref_data, num_machines,
             filas_iniciais=filas_atual,
+            livre=True,
         )
 
         # ── 2-opt dentro do bloco ──────────────────────────────────────────
         ord_2opt, t_2opt = busca_local_2opt(
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
+            livre=True,
         )
         if t_2opt < melhor_b['terminoTotal']:
             ganho = _round(((melhor_b['terminoTotal'][1] - t_2opt[1])
