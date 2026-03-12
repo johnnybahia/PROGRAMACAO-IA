@@ -786,7 +786,7 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    maior           = 0.0
+    soma_conclusoes = 0.0
     total_tardiness = 0.0
     choices_feitas  = []
     ptr             = 0
@@ -815,11 +815,10 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
             ptr += 1
             fim = float(ft[k])
             filas[gidxs[k]] = fim
-            if fim > maior:
-                maior = fim
             if fim > pedido_fim:
                 pedido_fim = fim
 
+        soma_conclusoes += pedido_fim   # acumula quando cada pedido termina
         dl = p.get('deadline_horas')
         if dl is not None and pedido_fim > dl:
             tardiness = pedido_fim - dl
@@ -831,17 +830,22 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
             urgencia = 1.0 + dias_ja_atrasado
             total_tardiness += urgencia * tardiness
 
-    return (total_tardiness, maior), choices_feitas, filas
+    return (total_tardiness, soma_conclusoes), choices_feitas, filas
 
 
-# ── CUSTO LEXICOGRÁFICO: (tardiness, makespan) ───────────────────────────────
+# ── CUSTO LEXICOGRÁFICO: (tardiness, soma_conclusoes) ────────────────────────
 def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
                    filas_iniciais=None) -> tuple:
     """
-    Retorna (total_tardiness, makespan) — objetivo lexicográfico.
+    Retorna (total_tardiness, soma_conclusoes) — objetivo lexicográfico.
 
     Prioridade absoluta: minimizar total_tardiness (soma ponderada dos atrasos).
-    Desempate: minimizar makespan quando tardiness é igual.
+    Desempate: minimizar soma dos tempos de conclusão individuais de cada pedido.
+
+    Usar soma das conclusões (Σ C_j) em vez de makespan (max C_j) força o
+    otimizador a terminar CADA pedido o mais cedo possível — não só o último.
+    Isso é essencial quando o problema é entrega no curto prazo: o SA e o 2-opt
+    vão preferir encaixes que liberam pedidos mais cedo individualmente.
 
     Pedidos já atrasados no início (deadline_horas negativo) recebem peso maior.
     Thread-safe (cria 'filas' local).
@@ -850,7 +854,7 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    maior           = 0.0
+    soma_conclusoes = 0.0
     total_tardiness = 0.0
     for p in pedidos:
         gidxs = p.get('_gidxs')
@@ -869,10 +873,9 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
             best = int(np.argmin(ft))
             fim  = float(ft[best])
             filas[gidxs[best]] = fim
-            if fim > maior:
-                maior = fim
             if fim > pedido_fim:
                 pedido_fim = fim
+        soma_conclusoes += pedido_fim   # acumula quando cada pedido termina
         dl = p.get('deadline_horas')
         if dl is not None and pedido_fim > dl:
             tardiness = pedido_fim - dl
@@ -886,7 +889,7 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
             dias_ja_atrasado = max(0.0, -dl) / 24.0
             urgencia = 1.0 + dias_ja_atrasado
             total_tardiness += urgencia * tardiness
-    return (total_tardiness, maior)
+    return (total_tardiness, soma_conclusoes)
 
 
 # ── ESTRATÉGIAS ──────────────────────────────────────────────────────────────
@@ -1372,10 +1375,10 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
         ordenados_final = ordenados_sa
         tempo_final     = t_sa
         est_final       = estrategias[idx_sa]
-        ganho_make      = ((t_edd[1] - t_sa[1]) / t_edd[1]) * 100 if t_edd[1] > 0 else 0
+        ganho_conc      = ((t_edd[1] - t_sa[1]) / t_edd[1]) * 100 if t_edd[1] > 0 else 0
         decisao = (f'⚡ SA otimizou dentro dos grupos de prazo '
                    f'(atraso: {_round(t_sa[0])}h vs {_round(t_edd[0])}h EDD; '
-                   f'makespan: {abs(_round(ganho_make))}% melhor)')
+                   f'conclusões: {abs(_round(ganho_conc))}% melhor)')
     else:
         ordenados_final = ordenados_edd
         tempo_final     = t_edd
@@ -1383,14 +1386,18 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
         decisao         = '✅ EDD direto — prazo mais próximo sempre primeiro'
 
     # Ranking informativo — todas as estratégias, comparadas contra o resultado final
+    # terminoHoras usa simular_termino (makespan real em horas) para exibição legível.
+    # terminoTotal usa simular_custo (tardiness, soma_conclusoes) para comparação interna.
     print('  Calculando ranking informativo das estratégias...')
+    makespan_final = simular_termino(ordenados_final, ref_data, num_machines, filas_iniciais)
     ranking = []
     for est in estrategias:
-        ord_ = est['fn'](pedidos)
-        t_   = simular_custo(ord_, ref_data, num_machines, filas_iniciais)
-        diff = _round(t_[1] - tempo_final[1])
-        perc = _round(((t_[1] - tempo_final[1]) / tempo_final[1]) * 100) if tempo_final[1] > 0 else 0
-        ranking.append({**est, 'terminoTotal': t_, 'terminoHoras': _round(t_[1]),
+        ord_     = est['fn'](pedidos)
+        t_       = simular_custo(ord_, ref_data, num_machines, filas_iniciais)
+        make_est = simular_termino(ord_, ref_data, num_machines, filas_iniciais)
+        diff = _round(make_est - makespan_final)
+        perc = _round(((make_est - makespan_final) / makespan_final) * 100) if makespan_final > 0 else 0
+        ranking.append({**est, 'terminoTotal': t_, 'terminoHoras': _round(make_est),
                         'ordenados': ord_, 'diff': diff, 'percentual': perc})
     ranking.sort(key=lambda r: r['terminoTotal'])
 
@@ -1402,7 +1409,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
         'id':                  est_final['id'],
         'nome':                est_final['nome'],
         'terminoTotal':        tempo_final,
-        'terminoHoras':        _round(tempo_final[1]),
+        'terminoHoras':        _round(makespan_final),
         'ordenados':           ordenados_final,
         'decisao':             decisao,
         'estrategiasPorGrupo': estrategias_por_grupo,
