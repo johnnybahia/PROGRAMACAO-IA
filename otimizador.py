@@ -59,15 +59,29 @@ except ImportError:
 
 # ── CONFIGURAÇÕES ────────────────────────────────────────────────────────────
 CONFIG = {
-    'ABA_PEDIDO':           'PEDIDO',
-    'ABA_RESULTADO':        'DISTRIBUIÇÃO',
-    'ABA_RELATORIO':        'RELATORIO',
+    # ── Pipeline 48 fusos (padrão) ──────────────────────────────────────────
+    'ABA_PEDIDO':                'PEDIDO',
+    'ABA_RESULTADO':             'DISTRIBUIÇÃO',
+    'ABA_RELATORIO':             'RELATORIO',
+    'ABA_RELATORIO_MONTAGEM':    'RELATORIO MONTAGEM',
+    'ABA_COMPARATIVO':           'COMPARATIVO',
+    # ── Pipeline 32 fusos (novo) ────────────────────────────────────────────
+    'ABA_PEDIDO_32':             'PEDIDO 32',
+    'ABA_RESULTADO_32':          'DISTRIBUIÇÃO 32',
+    'ABA_RELATORIO_32':          'RELATORIO 32',
+    'ABA_RELATORIO_MONTAGEM_32': 'RELATORIO MONTAGEM 32',
+    'ABA_COMPARATIVO_32':        'COMPARATIVO 32',
+    # Prefixo das abas de máquinas do pipeline 32 fusos
+    'PREFIXO_MODELOS_32':        'DADOS_32_',
     'HORAS_POR_DIA':        24,
     # Limiar 0 → qualquer combinação que reduza o custo lexicográfico (tardiness, makespan)
     # vence o EDD. Como a comparação é por tupla, qualquer redução de atraso é suficiente.
     'LIMIAR_TROCA_PERCENT': 0,
     'ABAS_IGNORAR': {
-        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
+        # Pipeline 48 fusos
+        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO', 'RELATORIO MONTAGEM',
+        # Pipeline 32 fusos
+        'PEDIDO 32', 'DISTRIBUIÇÃO 32', 'COMPARATIVO 32', 'RELATORIO 32', 'RELATORIO MONTAGEM 32',
         'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
     },
@@ -378,14 +392,15 @@ def _semana_id(data_entrega) -> int | None:
 
 
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
-def ler_data_base(spreadsheet) -> date:
-    """Lê a data base de início (célula M1) da aba PEDIDO."""
-    ws  = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
+def ler_data_base(spreadsheet, aba_pedido: str = None) -> date:
+    """Lê a data base de início (célula M1) da aba PEDIDO (ou aba indicada)."""
+    aba = aba_pedido or CONFIG['ABA_PEDIDO']
+    ws  = spreadsheet.worksheet(aba)
     val = ws.acell('M1').value or ''
     d   = parse_data(val)
     if d is None:
         d = date.today()
-        print(f'  ⚠ M1 da aba PEDIDO inválido ou vazio. Usando hoje: {d.strftime("%d/%m/%Y")}')
+        print(f'  ⚠ M1 da aba "{aba}" inválido ou vazio. Usando hoje: {d.strftime("%d/%m/%Y")}')
     return d
 
 
@@ -408,9 +423,10 @@ def ler_datas_bloqueadas(spreadsheet) -> set:
 
 
 # ── LER PEDIDOS ──────────────────────────────────────────────────────────────
-def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
+def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set,
+                aba_pedido: str = None) -> list:
     """
-    Lê a aba PEDIDO com a estrutura:
+    Lê a aba PEDIDO (ou aba indicada) com a estrutura:
       A: Data Inicial Especial  B: Máquina Especial  C: Produto  D: Referência  E: Cor
       F: Qtd Máquinas  G: Cliente  H: Ordem de Compra  I: Data de Entrega
       J: Data Finalização (saída)  K: Prazo (saída)
@@ -419,7 +435,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
          exclusivamente para cumprir este prazo.
       M1: Data base (lida separadamente por ler_data_base)
     """
-    ws   = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
+    ws   = spreadsheet.worksheet(aba_pedido or CONFIG['ABA_PEDIDO'])
     rows = ws.get_all_values()
     pedidos = []
 
@@ -491,13 +507,30 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
 
 
 # ── LER MODELOS ──────────────────────────────────────────────────────────────
-def ler_modelos(spreadsheet) -> dict:
+def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
+    """
+    Lê as abas de máquinas da planilha.
+
+    apenas_prefixo — se fornecido, usa APENAS abas cujo nome começa com esse
+                     prefixo (ex: 'DADOS_32_' para o pipeline de 32 fusos).
+                     Se None, usa todas as abas válidas exceto as que começam
+                     com CONFIG['PREFIXO_MODELOS_32'] (separação dos pipelines).
+    """
     modelos = {}
     ignorar = CONFIG['ABAS_IGNORAR']
+    prefixo_32 = CONFIG['PREFIXO_MODELOS_32']
     for ws in spreadsheet.worksheets():
         nome = ws.title.strip()
         if nome in ignorar:
             continue
+        if apenas_prefixo:
+            # Pipeline 32 fusos: só abas com o prefixo correto
+            if not nome.startswith(apenas_prefixo):
+                continue
+        else:
+            # Pipeline padrão: exclui abas reservadas ao pipeline 32 fusos
+            if nome.startswith(prefixo_32):
+                continue
         try:
             k1 = ws.acell('K1').value or ''
             l1 = ws.acell('L1').value or ''
@@ -1581,9 +1614,10 @@ def calcular_sugestoes(modelos: dict) -> list:
 
 
 # ── ESCREVER DE VOLTA NA ABA PEDIDO (colunas J e K) ──────────────────────────
-def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
-    """Preenche colunas J (data finalização) e K (prazo) na aba PEDIDO."""
-    ws = spreadsheet.worksheet(CONFIG['ABA_PEDIDO'])
+def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list,
+                               aba_pedido: str = None):
+    """Preenche colunas J (data finalização) e K (prazo) na aba PEDIDO (ou aba indicada)."""
+    ws = spreadsheet.worksheet(aba_pedido or CONFIG['ABA_PEDIDO'])
 
     # Para cada pedido, pega o termino mais tardio entre as alocações
     por_linha = {}
@@ -1615,12 +1649,13 @@ def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list):
 
 
 # ── SALVAR RESULTADO ─────────────────────────────────────────────────────────
-def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor):
+def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
+                     aba: str = None):
     cab   = ['Referência', 'Produto', 'Cor', 'Cliente', 'Ordem de Compra',
              'Modelo', 'Aba', 'Máquinas', 'Tempo Prod. (h)',
              'Início', 'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, CONFIG['ABA_RESULTADO'], cols=ncols)
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RESULTADO'], cols=ncols)
 
     cor_banner = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(
@@ -1799,10 +1834,11 @@ def _calcular_extras_chines(pedidos_orig: list, modelos: dict,
 
 # ── SALVAR COMPARATIVO ───────────────────────────────────────────────────────
 def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos,
-                       pedidos=None, modelos=None, resultado=None, data_base=None):
+                       pedidos=None, modelos=None, resultado=None, data_base=None,
+                       aba: str = None):
     cab   = ['Posição', 'Estratégia', 'Descrição', 'Término Total (h)', 'Diferença vs Melhor (h)', 'Variação %']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, 'COMPARATIVO', cols=ncols)
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_COMPARATIVO'], cols=ncols)
 
     b.banner('📊 COMPARATIVO DE ESTRATÉGIAS DE DISTRIBUIÇÃO', '#0D47A1', font_size=13)
 
@@ -1927,7 +1963,7 @@ def _e_modelo_chines_48(nome_modelo: str) -> bool:
     return '48' in n and 'fuso' in n and 'chin' in n
 
 
-def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
+def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None):
     """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
     ordenado = sorted(
         resultado,
@@ -1938,7 +1974,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
              'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
              'Data Entrega', 'Prazo']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, CONFIG['ABA_RELATORIO'], cols=ncols)
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO'], cols=ncols)
 
     hoje  = date.today().strftime('%d/%m/%Y')
 
@@ -1990,7 +2026,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
     b.flush()
 
 
-def salvar_relatorio_montagem(spreadsheet, resultado: list):
+def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
     """Cria aba RELATORIO MONTAGEM para uso dos montadores na produção."""
     ordenado = sorted(
         resultado,
@@ -1999,7 +2035,7 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list):
 
     cab   = ['Data Início', 'Total Máquinas', 'Modelo', 'Produto', 'Cliente', 'OC']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, 'RELATORIO MONTAGEM', cols=ncols)
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO_MONTAGEM'], cols=ncols)
 
     hoje  = date.today().strftime('%d/%m/%Y')
     b.banner(f'🔧 RELATÓRIO DE MONTAGEM — Gerado em {hoje}', '#1A237E', font_size=13)
@@ -2211,7 +2247,8 @@ def _detectar_lacunas(pedidos: list, modelos: dict) -> list:
     return sugestoes
 
 
-def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
+def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet,
+                              apenas_prefixo: str = None):
     """
     Detecta lacunas de cor nas máquinas, simula o ganho e entra em loop
     até o usuário cadastrar todas as cores na planilha ou optar por ignorar.
@@ -2284,7 +2321,7 @@ def analisar_cores_faltantes(pedidos: list, modelos: dict, spreadsheet):
 
         # Re-lê os modelos diretamente da planilha
         print('   🔄 Verificando planilha...')
-        modelos_novo = ler_modelos(spreadsheet)
+        modelos_novo = ler_modelos(spreadsheet, apenas_prefixo=apenas_prefixo)
 
         pendentes = _detectar_lacunas(pedidos, modelos_novo)
 
@@ -2621,6 +2658,112 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     return ordenados_total, choices_total, melhor_global
 
 
+# ── PIPELINE ─────────────────────────────────────────────────────────────────
+def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
+    """
+    Executa o pipeline completo de otimização para um grupo de máquinas.
+
+    cfg deve conter:
+      label                — nome descritivo para logs (ex: '48 fusos', '32 fusos')
+      aba_pedido           — nome da aba de pedidos de entrada
+      aba_resultado        — nome da aba de distribuição de saída
+      aba_comparativo      — nome da aba de comparativo
+      aba_relatorio        — nome da aba de relatório
+      aba_relatorio_mont   — nome da aba de relatório de montagem
+      apenas_prefixo       — prefixo das abas de máquinas (None = todas exceto _32_)
+    """
+    label              = cfg['label']
+    aba_pedido         = cfg['aba_pedido']
+    aba_resultado      = cfg['aba_resultado']
+    aba_comparativo    = cfg['aba_comparativo']
+    aba_relatorio      = cfg['aba_relatorio']
+    aba_relatorio_mont = cfg['aba_relatorio_mont']
+    apenas_prefixo     = cfg.get('apenas_prefixo')
+
+    print(f'\n{"="*60}')
+    print(f'  PIPELINE: {label}  (pedidos: "{aba_pedido}")')
+    print(f'{"="*60}')
+
+    # Verifica se a aba de pedidos existe
+    try:
+        spreadsheet.worksheet(aba_pedido)
+    except gspread.WorksheetNotFound:
+        print(f'  ⚠ Aba "{aba_pedido}" não encontrada. Pulando pipeline {label}.\n')
+        return
+
+    print(f'1/7 Lendo data base de "{aba_pedido}"...')
+    data_base = ler_data_base(spreadsheet, aba_pedido=aba_pedido)
+    print(f'  ✔ Data base: {data_base.strftime("%d/%m/%Y")}')
+
+    print('2/7 Lendo pedidos...')
+    pedidos = ler_pedidos(spreadsheet, data_base, datas_bloqueadas,
+                          aba_pedido=aba_pedido)
+    if not pedidos:
+        print(f'  ❌ Nenhum pedido encontrado na aba "{aba_pedido}". Pulando pipeline.')
+        return
+    print(f'  ✔ {len(pedidos)} pedidos.')
+
+    print('3/7 Lendo modelos de máquinas...')
+    modelos = ler_modelos(spreadsheet, apenas_prefixo=apenas_prefixo)
+    if not modelos:
+        print(f'  ❌ Nenhuma aba de máquina encontrada para o pipeline {label}.')
+        return
+    print(f'  ✔ {len(modelos)} modelo(s).')
+
+    print('4/7 Pré-computando estrutura numpy...')
+    ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
+    print(f'  ✔ {num_machines} máquinas físicas indexadas.')
+
+    modelos_novos = analisar_cores_faltantes(pedidos, modelos, spreadsheet,
+                                             apenas_prefixo=apenas_prefixo)
+    if modelos_novos is not None:
+        modelos = modelos_novos
+        ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
+        print(f'  ✔ Reindexado: {num_machines} máquinas físicas.')
+
+    preparar_restricoes_pedidos(pedidos, ref_data, modelos)
+    print(f'  ✔ Restrições de máquina especial aplicadas.')
+
+    print('5/7 Otimizando em blocos por prazo (rolling-horizon)...')
+    blocos_info = agrupar_por_dia_vencimento(pedidos)
+    print(f'  {len(blocos_info)} bloco(s): '
+          + ', '.join(
+              ('vencidos' if b['bucket'] == 'vencido' else
+               'sem prazo' if b['bucket'] == 'sem_prazo' else
+               f'dia+{b["bucket"]}') + f'({len(b["pedidos"])}p)'
+              for b in blocos_info
+          ))
+    ordenados_total, choices_total, melhor = otimizar_em_blocos(
+        pedidos, modelos, ref_data, num_machines)
+    print(f'  ✔ {melhor["decisao"]}')
+
+    print('6/7 Gerando distribuição final...')
+    resultado, sem_cadastro = otimizar_distribuicao(
+        ordenados_total, modelos, ref_data, num_machines, ridx_map,
+        data_base, datas_bloqueadas, choices=choices_total
+    )
+    grupos  = agrupar_por_prioridade(pedidos)
+    _, ranking = escolher_melhor_estrategia(
+        pedidos, modelos, grupos, ref_data, num_machines)
+    sugestoes = calcular_sugestoes(modelos)
+    print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, '
+          f'{len(sugestoes)} sugestões.')
+
+    print('7/7 Salvando resultados...')
+    salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
+                     aba=aba_resultado)
+    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos),
+                       pedidos=pedidos, modelos=modelos, resultado=resultado,
+                       data_base=data_base, aba=aba_comparativo)
+    salvar_relatorio(spreadsheet, resultado, melhor, aba=aba_relatorio)
+    salvar_relatorio_montagem(spreadsheet, resultado, aba=aba_relatorio_mont)
+    escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro,
+                               aba_pedido=aba_pedido)
+
+    print(gerar_resumo(resultado, sem_cadastro, melhor, ranking))
+    print(f'  ✔ Pipeline {label} concluído.\n')
+
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     if len(sys.argv) < 3:
@@ -2639,80 +2782,40 @@ def main():
     print(f'   Planilha: {url_planilha[:60]}...')
     print(f'   Workers:  {os.cpu_count() or 4} threads\n')
 
-    print('1/8 Conectando ao Google Sheets...')
+    print('1/3 Conectando ao Google Sheets...')
     gc          = conectar(credentials_path)
     spreadsheet = abrir_planilha(gc, url_planilha)
     print(f'  ✔ Conectado: "{spreadsheet.title}"')
 
-    print('2/8 Lendo data base e datas bloqueadas...')
-    data_base        = ler_data_base(spreadsheet)
+    print('2/3 Lendo datas bloqueadas...')
     datas_bloqueadas = ler_datas_bloqueadas(spreadsheet)
-    print(f'  ✔ Data base: {data_base.strftime("%d/%m/%Y")}')
 
-    print('3/8 Lendo pedidos...')
-    pedidos = ler_pedidos(spreadsheet, data_base, datas_bloqueadas)
-    if not pedidos:
-        print('❌ Nenhum pedido encontrado na aba PEDIDO.')
-        sys.exit(1)
-    print(f'  ✔ {len(pedidos)} pedidos.')
+    print('3/3 Executando pipelines...')
 
-    print('4/8 Lendo modelos de máquinas...')
-    modelos = ler_modelos(spreadsheet)
-    if not modelos:
-        print('❌ Nenhuma aba de máquina encontrada.')
-        sys.exit(1)
-    print(f'  ✔ {len(modelos)} modelo(s).')
+    # ── Pipeline padrão: PEDIDO → DISTRIBUIÇÃO / RELATORIO / RELATORIO MONTAGEM
+    executar_pipeline(spreadsheet, {
+        'label':              '48 fusos (padrão)',
+        'aba_pedido':         CONFIG['ABA_PEDIDO'],
+        'aba_resultado':      CONFIG['ABA_RESULTADO'],
+        'aba_comparativo':    CONFIG['ABA_COMPARATIVO'],
+        'aba_relatorio':      CONFIG['ABA_RELATORIO'],
+        'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM'],
+        'apenas_prefixo':     None,   # usa todas as abas exceto DADOS_32_*
+    }, datas_bloqueadas)
 
-    print('5/8 Pré-computando estrutura numpy...')
-    ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
-    print(f'  ✔ {num_machines} máquinas físicas indexadas.')
-
-    modelos_novos = analisar_cores_faltantes(pedidos, modelos, spreadsheet)
-    if modelos_novos is not None:
-        modelos  = modelos_novos
-        ref_data, num_machines, ridx_map = precomputar_maquinas(modelos)
-        print(f'  ✔ Reindexado: {num_machines} máquinas físicas.')
-
-    preparar_restricoes_pedidos(pedidos, ref_data, modelos)
-    print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
-
-    print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
-    blocos_info = agrupar_por_dia_vencimento(pedidos)
-    print(f'  {len(blocos_info)} bloco(s): '
-          + ', '.join(
-              ('vencidos' if b['bucket'] == 'vencido' else
-               'sem prazo' if b['bucket'] == 'sem_prazo' else
-               f'dia+{b["bucket"]}') + f'({len(b["pedidos"])}p)'
-              for b in blocos_info
-          ))
-    ordenados_total, choices_total, melhor = otimizar_em_blocos(
-        pedidos, modelos, ref_data, num_machines)
-    print(f'  ✔ {melhor["decisao"]}')
-
-    print('7/8 Gerando distribuição final...')
-    resultado, sem_cadastro = otimizar_distribuicao(
-        ordenados_total, modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas, choices=choices_total
-    )
-    # ranking informativo (apenas EDD global para comparação)
-    grupos  = agrupar_por_prioridade(pedidos)
-    _, ranking = escolher_melhor_estrategia(
-        pedidos, modelos, grupos, ref_data, num_machines)
-    sugestoes = calcular_sugestoes(modelos)
-    print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
-
-    print('8/8 Salvando resultados...')
-    salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
-    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos),
-                       pedidos=pedidos, modelos=modelos, resultado=resultado,
-                       data_base=data_base)
-    salvar_relatorio(spreadsheet, resultado, melhor)
-    salvar_relatorio_montagem(spreadsheet, resultado)
-    escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
+    # ── Pipeline 32 fusos: PEDIDO 32 → DISTRIBUIÇÃO 32 / RELATORIO 32 / …
+    executar_pipeline(spreadsheet, {
+        'label':              '32 fusos',
+        'aba_pedido':         CONFIG['ABA_PEDIDO_32'],
+        'aba_resultado':      CONFIG['ABA_RESULTADO_32'],
+        'aba_comparativo':    CONFIG['ABA_COMPARATIVO_32'],
+        'aba_relatorio':      CONFIG['ABA_RELATORIO_32'],
+        'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM_32'],
+        'apenas_prefixo':     CONFIG['PREFIXO_MODELOS_32'],  # só abas DADOS_32_*
+    }, datas_bloqueadas)
 
     tempo_total = time.time() - t0
-    print(f'\n✅ Concluído em {tempo_total:.1f}s')
-    print(gerar_resumo(resultado, sem_cadastro, melhor, ranking))
+    print(f'\n✅ Todos os pipelines concluídos em {tempo_total:.1f}s')
     print(f'\n🔗 Planilha: {spreadsheet.url}')
     print()
 
