@@ -2113,7 +2113,8 @@ def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
     if ranking:
         linhas.append('\n📊 Top 3:')
         for i, est in enumerate(ranking[:3]):
-            diff = '✅ melhor' if i == 0 else f"+{_round(est['terminoTotal'][1] - ranking[0]['terminoTotal'][1])}h"
+            _d   = _round(est['terminoTotal'][1] - ranking[0]['terminoTotal'][1])
+            diff = '✅ melhor' if i == 0 else (f'+{_d}h' if _d >= 0 else f'{_d}h')
             linhas.append(f"   {i+1}. {est['nome'][:38]}: {est['terminoHoras']}h ({diff})")
 
     atrasados   = sum(1 for r in resultado if r.get('prazo_delta') is not None and r['prazo_delta'] < 0)
