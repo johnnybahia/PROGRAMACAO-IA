@@ -65,7 +65,7 @@ CONFIG = {
     'ABA_RELATORIO':             'RELATORIO',
     'ABA_RELATORIO_MONTAGEM':    'RELATORIO MONTAGEM',
     'ABA_COMPARATIVO':           'COMPARATIVO',
-    # ── Pipeline 32 fusos (novo) ────────────────────────────────────────────
+    # ── Pipeline 32 fusos ───────────────────────────────────────────────────
     'ABA_PEDIDO_32':             'PEDIDO 32',
     'ABA_RESULTADO_32':          'DISTRIBUIÇÃO 32',
     'ABA_RELATORIO_32':          'RELATORIO 32',
@@ -73,6 +73,14 @@ CONFIG = {
     'ABA_COMPARATIVO_32':        'COMPARATIVO 32',
     # Prefixo das abas de máquinas do pipeline 32 fusos
     'PREFIXO_MODELOS_32':        'DADOS_32_',
+    # ── Pipeline 16 fusos ───────────────────────────────────────────────────
+    'ABA_PEDIDO_16':             'PEDIDO 16',
+    'ABA_RESULTADO_16':          'DISTRIBUIÇÃO 16',
+    'ABA_RELATORIO_16':          'RELATORIO 16',
+    'ABA_RELATORIO_MONTAGEM_16': 'RELATORIO MONTAGEM 16',
+    'ABA_COMPARATIVO_16':        'COMPARATIVO 16',
+    # Prefixo das abas de máquinas do pipeline 16 fusos
+    'PREFIXO_MODELOS_16':        'DADOS_16_',
     'HORAS_POR_DIA':        24,
     # Limiar 0 → qualquer combinação que reduza o custo lexicográfico (tardiness, makespan)
     # vence o EDD. Como a comparação é por tupla, qualquer redução de atraso é suficiente.
@@ -82,6 +90,8 @@ CONFIG = {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO', 'RELATORIO MONTAGEM',
         # Pipeline 32 fusos
         'PEDIDO 32', 'DISTRIBUIÇÃO 32', 'COMPARATIVO 32', 'RELATORIO 32', 'RELATORIO MONTAGEM 32',
+        # Pipeline 16 fusos
+        'PEDIDO 16', 'DISTRIBUIÇÃO 16', 'COMPARATIVO 16', 'RELATORIO 16', 'RELATORIO MONTAGEM 16',
         'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
     },
@@ -541,12 +551,13 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
             if not nome.startswith(apenas_prefixo):
                 continue
         else:
-            # Pipeline padrão: só abas que começam com 'DADOS_' (com underscore)
-            # e que não pertencem ao pipeline 32 fusos.
+            # Pipeline padrão (48 fusos): só abas que começam com 'DADOS_' (com underscore)
+            # e que não pertencem a nenhum pipeline específico (32 fusos, 16 fusos, …).
             # Isso exclui automaticamente abas como DADOS2, DADOS3, etc.
             if not nome.startswith('DADOS_'):
                 continue
-            if nome.startswith(prefixo_32):
+            prefixos_especificos = [CONFIG['PREFIXO_MODELOS_32'], CONFIG['PREFIXO_MODELOS_16']]
+            if any(nome.startswith(p) for p in prefixos_especificos):
                 continue
         try:
             k1 = ws.acell('K1').value or ''
@@ -1684,7 +1695,7 @@ def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
              'Modelo', 'Aba', 'Máquinas', 'Tempo Prod. (h)',
              'Início', 'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
-    abas_ocultas = {CONFIG['ABA_RESULTADO'], CONFIG['ABA_RESULTADO_32']}
+    abas_ocultas = {CONFIG['ABA_RESULTADO'], CONFIG['ABA_RESULTADO_32'], CONFIG['ABA_RESULTADO_16']}
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RESULTADO'], cols=ncols,
                          hidden=(aba or CONFIG['ABA_RESULTADO']) in abas_ocultas)
 
@@ -1869,7 +1880,7 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos,
                        aba: str = None):
     cab   = ['Posição', 'Estratégia', 'Descrição', 'Término Total (h)', 'Diferença vs Melhor (h)', 'Variação %']
     ncols = len(cab)
-    abas_ocultas = {CONFIG['ABA_COMPARATIVO'], CONFIG['ABA_COMPARATIVO_32']}
+    abas_ocultas = {CONFIG['ABA_COMPARATIVO'], CONFIG['ABA_COMPARATIVO_32'], CONFIG['ABA_COMPARATIVO_16']}
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_COMPARATIVO'], cols=ncols,
                          hidden=(aba or CONFIG['ABA_COMPARATIVO']) in abas_ocultas)
 
@@ -3021,6 +3032,17 @@ def main():
         'aba_relatorio':      CONFIG['ABA_RELATORIO_32'],
         'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM_32'],
         'apenas_prefixo':     CONFIG['PREFIXO_MODELOS_32'],  # só abas DADOS_32_*
+    }, datas_bloqueadas)
+
+    # ── Pipeline 16 fusos: PEDIDO 16 → DISTRIBUIÇÃO 16 / RELATORIO 16 / …
+    executar_pipeline(spreadsheet, {
+        'label':              '16 fusos',
+        'aba_pedido':         CONFIG['ABA_PEDIDO_16'],
+        'aba_resultado':      CONFIG['ABA_RESULTADO_16'],
+        'aba_comparativo':    CONFIG['ABA_COMPARATIVO_16'],
+        'aba_relatorio':      CONFIG['ABA_RELATORIO_16'],
+        'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM_16'],
+        'apenas_prefixo':     CONFIG['PREFIXO_MODELOS_16'],  # só abas DADOS_16_*
     }, datas_bloqueadas)
 
     tempo_total = time.time() - t0
