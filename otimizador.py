@@ -510,6 +510,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set,
             'deadline_horas':       deadline_horas,
             '_semana':              _semana_id(data_entrega),
             'data_especial':        data_esp,
+            'data_entrega_especial': data_ent_especial,
             'min_start':            min_start,
             'maquina_especial':     maquina_especial,
             'prioridade':           1,          # mantido para compatibilidade interna
@@ -2161,7 +2162,8 @@ def _calc_eficiencia(np_, nm):
 def _avisos_restricoes(resultado: list, pedidos: list) -> str:
     """
     Gera aviso textual para pedidos atrasados, destacando restrições que
-    podem ter contribuído (máquina especial, data inicial especial).
+    podem ter contribuído: máquina especial (col B), data inicial especial
+    (col A) e data de entrega especial (col L).
 
     Pedidos com restrições configuradas recebem destaque especial, pois
     o usuário pode removê-las para melhorar os prazos.
@@ -2187,6 +2189,10 @@ def _avisos_restricoes(resultado: list, pedidos: list) -> str:
         if pedido.get('data_especial'):
             restricoes.append(
                 f'data inicial especial {pedido["data_especial"].strftime("%d/%m/%Y")}'
+            )
+        if pedido.get('data_entrega_especial'):
+            restricoes.append(
+                f'data de entrega especial {pedido["data_entrega_especial"].strftime("%d/%m/%Y")}'
             )
 
         info = {
