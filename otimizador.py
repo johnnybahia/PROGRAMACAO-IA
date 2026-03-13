@@ -560,6 +560,7 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
 
             referencias = {}
             descricoes  = {}
+            e_chines    = 'CHINES' in nome.upper()  # DADOS_48_FUSOS_CHINES / DADOS_32_FUSOS_CHINES
             rows = ws.get_all_values()
             for linha in rows[1:]:
                 if len(linha) < 7:
@@ -567,11 +568,15 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
                 descricao = ' '.join(linha[0].split())        # Coluna A = descrição completa
                 ref       = ' '.join(linha[6].split())        # Coluna G = REFERENCIA
                 cor_maq   = ' '.join(linha[5].split()) if len(linha) > 5 else ''  # Coluna F = COR
-                tempo_str = linha[1].strip()                  # Coluna B
                 if not ref:
                     continue
                 try:
-                    tempo = float(tempo_str.replace(',', '.'))
+                    # Máquinas chinesas: usa Coluna I / 2 como tempo de produção.
+                    # As demais abas usam Coluna B diretamente.
+                    if e_chines and len(linha) > 8 and linha[8].strip():
+                        tempo = float(linha[8].strip().replace(',', '.')) / 2
+                    else:
+                        tempo = float(linha[1].strip().replace(',', '.'))  # Coluna B
                 except (ValueError, AttributeError):
                     continue
                 if tempo <= 0:
