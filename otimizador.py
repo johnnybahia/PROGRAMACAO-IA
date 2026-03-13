@@ -571,12 +571,9 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
                 if not ref:
                     continue
                 try:
-                    # Máquinas chinesas: usa Coluna I / 2 como tempo de produção.
-                    # As demais abas usam Coluna B diretamente.
-                    if e_chines and len(linha) > 8 and linha[8].strip():
-                        tempo = float(linha[8].strip().replace(',', '.')) / 2
-                    else:
-                        tempo = float(linha[1].strip().replace(',', '.'))  # Coluna B
+                    tempo = float(linha[1].strip().replace(',', '.'))  # Coluna B
+                    if e_chines:
+                        tempo = tempo / 2
                 except (ValueError, AttributeError):
                     continue
                 if tempo <= 0:
