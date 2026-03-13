@@ -2074,6 +2074,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
 
     # Expande cada alocação em rodadas e coleta tudo para ordenar por data
     linhas = []
+    print(f'  [DBG RELATORIO] data_base={data_base} n_resultados={len(ordenado)}')
     for r in ordenado:
         pd = r.get('prazo_delta')
         if pd is not None and pd < 0:
@@ -2100,6 +2101,9 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         tempo_r     = r.get('tempo_producao', 0)
         inicio_h    = r.get('inicio_horas', 0)
         entrega_s   = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
+        print(f'  [DBG RELATORIO] ref={r["referencia"]} modelo={r.get("nome_modelo","")} '
+              f'alocadas={r["maquinas_alocadas"]} total_mod={r.get("total_maquinas_modelo")} '
+              f'n_rodadas={n_rodadas} inicio_h={inicio_h} tempo_r={tempo_r}')
 
         restante = total_rodadas
         for j in range(n_rodadas):
@@ -2179,6 +2183,9 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list,
         n_rodadas = math.ceil(total_rodadas / total_modelo)
         tempo_r   = r.get('tempo_producao', 0)
         inicio_h  = r.get('inicio_horas', 0)
+        print(f'  [DBG MONTAGEM] ref={r["referencia"]} modelo={r.get("nome_modelo","")} '
+              f'alocadas={r["maquinas_alocadas"]} total_modelo={r.get("total_maquinas_modelo")} '
+              f'n_rodadas={n_rodadas} inicio_h={inicio_h} tempo_r={tempo_r} data_base={data_base}')
 
         restante = total_rodadas
         for i in range(n_rodadas):
