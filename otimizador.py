@@ -2159,6 +2159,84 @@ def _calc_eficiencia(np_, nm):
     cob = min(99.99, ((f - 7) / f) * 100)
     return min(99, round(cob * 0.5 + 31.5 * 0.3 + 95 * 0.2))
 
+def _verificar_inviabilidade_restricoes(pedidos: list) -> str:
+    """
+    Analisa ANTES da otimização se algum pedido tem restrições que tornam
+    o cumprimento do prazo matematicamente impossível.
+
+    Condição de inviabilidade:
+        min_start + tempo_mínimo_de_produção > deadline_horas
+
+    Ou seja: mesmo que a máquina esteja completamente livre e o pedido
+    inicie no seu primeiro momento permitido (min_start), ainda assim
+    não terminaria antes do prazo.
+
+    Deve ser chamado após preparar_restricoes_pedidos(), pois usa _tempos
+    já filtrados pela maquina_especial.
+
+    Unidades: todas em horas corridas (calendário) a partir da data base.
+    """
+    inviaveis = []
+
+    for p in pedidos:
+        dl    = p.get('deadline_horas')
+        if dl is None:
+            continue                        # sem prazo → não há impossibilidade
+
+        tempos = p.get('_tempos')
+        if tempos is None or len(tempos) == 0:
+            continue                        # sem cadastro → tratado em sem_cadastro
+
+        min_s      = float(p.get('min_start', 0.0))
+        min_tempo  = float(np.min(tempos))  # máquina mais rápida disponível
+        fim_minimo = min_s + min_tempo      # término mais cedo possível
+
+        if fim_minimo <= dl:
+            continue                        # viável matematicamente
+
+        # Identifica quais restrições contribuem para a impossibilidade
+        restricoes = []
+        if p.get('maquina_especial'):
+            restricoes.append(f'máquina especial "{p["maquina_especial"]}"')
+        if p.get('data_especial'):
+            restricoes.append(
+                f'data inicial especial {p["data_especial"].strftime("%d/%m/%Y")}'
+            )
+        if p.get('data_entrega_especial'):
+            restricoes.append(
+                f'data de entrega especial {p["data_entrega_especial"].strftime("%d/%m/%Y")}'
+            )
+
+        deficit_dias = math.ceil((fim_minimo - dl) / 24)
+
+        inviaveis.append({
+            'referencia':    p['referencia'],
+            'produto':       p.get('produto', ''),
+            'cliente':       p.get('cliente', ''),
+            'deficit_dias':  deficit_dias,
+            'restricoes':    restricoes,
+        })
+
+    if not inviaveis:
+        return ''
+
+    linhas = [
+        '\n🚫 INVIÁVEL — Pedidos que NÃO podem cumprir o prazo com as restrições atuais:',
+        '   Mesmo com a máquina completamente livre, o prazo não seria atingido.',
+        '   Remova ou ajuste as restrições abaixo para que o otimizador tenha flexibilidade.',
+    ]
+    for info in inviaveis:
+        cli  = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+        rest = (', '.join(info['restricoes'])
+                if info['restricoes'] else 'prazo insuficiente para o tempo de produção')
+        linhas.append(
+            f"   • [{info['referencia']}] {info['produto']}{cli}"
+            f" — {info['deficit_dias']} dia(s) de déficit | CAUSA: {rest}"
+        )
+
+    return '\n'.join(linhas)
+
+
 def _avisos_restricoes(resultado: list, pedidos: list) -> str:
     """
     Gera aviso textual para pedidos atrasados, destacando restrições que
@@ -2846,6 +2924,10 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
 
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas.')
+
+    aviso_inviavel = _verificar_inviabilidade_restricoes(pedidos)
+    if aviso_inviavel:
+        print(aviso_inviavel)
 
     print('5/7 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
