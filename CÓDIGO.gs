@@ -49,14 +49,7 @@ function onOpen() {
     .addItem("➕ Cadastrar Produto — 48 Fusos", "abrirCadastroPedido")
     .addItem("➕ Cadastrar Produto — 32 Fusos", "abrirCadastroPedido32")
     .addSeparator()
-    .addItem("▶ Analisar Distribuição", "analisarDistribuicao")
-    .addItem("📊 Comparar Estratégias de Distribuição", "analisarDistribuicao")
-    .addSeparator()
     .addItem("📅 Datas Fora de Programação", "abrirGestaoDatas")
-    .addSeparator()
-    .addItem("🔍 Diagnóstico — Ver abas reconhecidas", "diagnosticoModelos")
-    .addSeparator()
-    .addItem("🗑 Limpar aba Distribuição", "limparDistribuicao")
     .addToUi();
 }
 
