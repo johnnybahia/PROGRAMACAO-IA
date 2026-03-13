@@ -43,6 +43,16 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 
+# ── MODO VERBOSE ──────────────────────────────────────────────────────────────
+# Ativado com --verbose ou -v na linha de comando.
+# Imprime passo a passo: pedidos lidos, agrupamento, alocação e resultado.
+VERBOSE = False
+
+def vlog(*args, **kwargs):
+    """Imprime apenas quando VERBOSE=True."""
+    if VERBOSE:
+        print(*args, **kwargs)
+
 try:
     import numpy as np
 except ImportError:
@@ -2775,6 +2785,15 @@ def _rolling_horizon_pass(pedidos: list, modelos: dict, ref_data: dict,
                  for b in agrupar_por_dia_vencimento(pedidos)]
     fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
 
+    if VERBOSE and fila:
+        vlog(f'  VERBOSE {prefixo_log}— Blocos de prazo formados:')
+        for bloco in fila:
+            b = bloco['bucket']
+            lbl = 'vencidos' if b == 'vencido' else ('sem prazo' if b == 'sem_prazo' else f'dia+{b}')
+            refs = ', '.join(f'[{p["referencia"]}]' for p in bloco['pedidos'])
+            vlog(f'    {lbl:<12}: {refs}')
+        vlog('')
+
     filas_atual    = (filas_iniciais.copy() if filas_iniciais is not None
                       else np.zeros(num_machines, dtype=np.float64))
     ordenados      = []
@@ -2895,6 +2914,31 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     else:
         print(f'  Nenhum pedido com restrição — passagem única.')
 
+    if VERBOSE:
+        if restritos:
+            vlog(f'\n  VERBOSE — Passo 1 [R] — Pedidos com restrição:')
+            for p in restritos:
+                dl   = p.get('data_entrega')
+                ps   = dl.strftime('%d/%m/%Y') if dl else '—'
+                maq  = p.get('maquina_especial') or ''
+                ini  = p['data_especial'].strftime('%d/%m/%Y') if p.get('data_especial') else ''
+                esp  = p['data_entrega_especial'].strftime('%d/%m/%Y') if p.get('data_entrega_especial') else ''
+                info = ' | '.join(filter(None, [
+                    f'maq="{maq}"' if maq else '',
+                    f'início≥{ini}' if ini else '',
+                    f'prazo_esp={esp}' if esp else '',
+                ]))
+                vlog(f'    Ln{p["linha_sheet"]:>3}  [{p["referencia"]}] '
+                     f'{p.get("produto","")[:18]}  prazo:{ps}  → {info}')
+        if livres:
+            vlog(f'\n  VERBOSE — Passo 2 [L] — Pedidos sem restrição:')
+            for p in livres:
+                dl  = p.get('data_entrega')
+                ps  = dl.strftime('%d/%m/%Y') if dl else 'sem prazo'
+                vlog(f'    Ln{p["linha_sheet"]:>3}  [{p["referencia"]}] '
+                     f'{p.get("produto","")[:18]}  prazo:{ps}')
+        vlog('')
+
     # ── Passo 1: restritos ────────────────────────────────────────────────────
     prefixo_r = '[R] ' if (n_rest and n_liv) else ''
     ord_r, ch_r, filas_r, tard_r, dec_r, bi_r = _rolling_horizon_pass(
@@ -2989,6 +3033,29 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
         return
     print(f'  ✔ {len(pedidos)} pedidos.')
 
+    if VERBOSE:
+        vlog(f'\n{"─"*70}')
+        vlog(f'  VERBOSE — Pedidos lidos da aba "{aba_pedido}":')
+        vlog(f'  {"Ln":>3}  {"Ref":<12} {"Produto":<20} {"Cliente":<16} '
+             f'{"Prazo":>10}  {"Restrições"}')
+        vlog(f'  {"─"*3}  {"─"*12} {"─"*20} {"─"*16} {"─"*10}  {"─"*30}')
+        for p in pedidos:
+            prazo_str = (p['data_entrega'].strftime('%d/%m/%Y')
+                         if p.get('data_entrega') else '—')
+            rests = []
+            if p.get('maquina_especial'):
+                rests.append(f'maq="{p["maquina_especial"]}"')
+            if p.get('data_especial'):
+                rests.append(f'início={p["data_especial"].strftime("%d/%m/%Y")}')
+            if p.get('data_entrega_especial'):
+                rests.append(f'prazo_esp={p["data_entrega_especial"].strftime("%d/%m/%Y")}')
+            tag  = '[R] ' if rests else '[L] '
+            rest = ', '.join(rests) if rests else 'livre'
+            vlog(f'  {p["linha_sheet"]:>3}  {p["referencia"]:<12} '
+                 f'{p.get("produto","")[:20]:<20} {p.get("cliente","")[:16]:<16} '
+                 f'{prazo_str:>10}  {tag}{rest}')
+        vlog(f'{"─"*70}\n')
+
     print('3/7 Lendo modelos de máquinas...')
     modelos = ler_modelos(spreadsheet, apenas_prefixo=apenas_prefixo)
     if not modelos:
@@ -3039,6 +3106,35 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, '
           f'{len(sugestoes)} sugestões.')
 
+    if VERBOSE:
+        pedido_map_v = {p['linha_sheet']: p for p in pedidos}
+        vlog(f'\n{"─"*90}')
+        vlog(f'  VERBOSE — Resultado completo das alocações:')
+        vlog(f'  {"Ln":>3}  {"Ref":<12} {"Produto":<18} {"Máquina":<18} '
+             f'{"Início":>10}  {"Fim":>10}  {"Prazo":>10}  {"Δ dias":>7}  {"Status"}')
+        vlog(f'  {"─"*3}  {"─"*12} {"─"*18} {"─"*18} {"─"*10}  {"─"*10}  {"─"*10}  {"─"*7}  {"─"*15}')
+        for r in resultado:
+            ls       = r.get('linha_sheet')
+            p        = pedido_map_v.get(ls, {})
+            tag      = '[R]' if _tem_restricao(p) else '[L]'
+            ini_s    = r['dt_inicio'].strftime('%d/%m/%Y')  if r.get('dt_inicio')  else '—'
+            fim_s    = r['dt_termino'].strftime('%d/%m/%Y') if r.get('dt_termino') else '—'
+            prazo_s  = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else '—'
+            delta    = r.get('prazo_delta')
+            delta_s  = (f'+{delta}' if delta is not None and delta >= 0
+                        else str(delta) if delta is not None else '—')
+            status   = ('✅ OK'       if delta is not None and delta >= 0
+                        else '❌ ATRASADO' if delta is not None
+                        else '—')
+            vlog(f'  {(ls or 0):>3}  {r["referencia"]:<12} {r.get("produto","")[:18]:<18} '
+                 f'{r.get("nome_modelo","")[:18]:<18} '
+                 f'{ini_s:>10}  {fim_s:>10}  {prazo_s:>10}  {delta_s:>7}  {tag} {status}')
+        if sem_cadastro:
+            vlog(f'\n  SEM CADASTRO ({len(sem_cadastro)}):')
+            for s in sem_cadastro:
+                vlog(f'    Ln{s.get("linha_sheet","?"):>3}  [{s["referencia"]}] {s.get("produto","")}')
+        vlog(f'{"─"*90}\n')
+
     aviso_restricoes = _avisos_restricoes(resultado, pedidos)
     if aviso_restricoes:
         print(aviso_restricoes)
@@ -3060,12 +3156,18 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    if len(sys.argv) < 3:
+    global VERBOSE
+
+    args = [a for a in sys.argv[1:] if a not in ('--verbose', '-v')]
+    VERBOSE = len(args) < len(sys.argv) - 1   # algum flag verbose foi removido
+
+    if len(args) < 2:
         print(__doc__)
+        print('Opções:  --verbose / -v   Exibe passo a passo detalhado do cálculo')
         sys.exit(1)
 
-    url_planilha     = sys.argv[1]
-    credentials_path = sys.argv[2]
+    url_planilha     = args[0]
+    credentials_path = args[1]
 
     if not os.path.exists(credentials_path):
         print(f'❌ Arquivo de credenciais não encontrado: {credentials_path}')
