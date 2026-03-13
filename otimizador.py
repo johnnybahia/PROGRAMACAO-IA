@@ -158,11 +158,12 @@ class SheetBuilder:
     acumulando todas as operações e enviando em lote ao final.
     """
 
-    def __init__(self, spreadsheet, sheet_name: str, cols: int = 10):
+    def __init__(self, spreadsheet, sheet_name: str, cols: int = 10, hidden: bool = False):
         self.ss      = spreadsheet
         self.ss_id   = spreadsheet.id
         self.name    = sheet_name
         self.cols    = cols
+        self.hidden  = hidden
         self.row     = 1
         self.data    = []   # (row, col, value)
         self.formats = []   # Sheets API batchUpdate requests
@@ -251,6 +252,17 @@ class SheetBuilder:
                 'fields': 'userEnteredFormat',
             }
         })
+
+        if self.hidden:
+            self.formats.append({
+                'updateSheetProperties': {
+                    'properties': {
+                        'sheetId': self._sid,
+                        'hidden':  True,
+                    },
+                    'fields': 'hidden',
+                }
+            })
 
         try:
             if self.data:
@@ -1647,13 +1659,17 @@ def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list,
         cell_list.append(gspread.Cell(ln, 10, 'Sem cadastro'))
         cell_list.append(gspread.Cell(ln, 11, '—'))
 
+    aba_nome = aba_pedido or CONFIG['ABA_PEDIDO']
+    try:
+        ws.batch_clear(['J2:K1000'])
+    except Exception:
+        pass  # se não conseguir limpar, tenta escrever mesmo assim
+
     if cell_list:
         try:
             ws.update_cells(cell_list, value_input_option='RAW')
-            aba_nome = aba_pedido or CONFIG['ABA_PEDIDO']
             print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba "{aba_nome}" (J e K).')
         except Exception as e:
-            aba_nome = aba_pedido or CONFIG['ABA_PEDIDO']
             print(f'  ⚠ Não foi possível gravar datas/prazo na aba "{aba_nome}" (J e K): {e}')
             print(f'    Verifique se as colunas J e K estão protegidas na planilha.')
 
@@ -1665,7 +1681,9 @@ def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
              'Modelo', 'Aba', 'Máquinas', 'Tempo Prod. (h)',
              'Início', 'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RESULTADO'], cols=ncols)
+    abas_ocultas = {CONFIG['ABA_RESULTADO'], CONFIG['ABA_RESULTADO_32']}
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RESULTADO'], cols=ncols,
+                         hidden=(aba or CONFIG['ABA_RESULTADO']) in abas_ocultas)
 
     cor_banner = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(
@@ -1848,7 +1866,9 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos,
                        aba: str = None):
     cab   = ['Posição', 'Estratégia', 'Descrição', 'Término Total (h)', 'Diferença vs Melhor (h)', 'Variação %']
     ncols = len(cab)
-    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_COMPARATIVO'], cols=ncols)
+    abas_ocultas = {CONFIG['ABA_COMPARATIVO'], CONFIG['ABA_COMPARATIVO_32']}
+    b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_COMPARATIVO'], cols=ncols,
+                         hidden=(aba or CONFIG['ABA_COMPARATIVO']) in abas_ocultas)
 
     b.banner('📊 COMPARATIVO DE ESTRATÉGIAS DE DISTRIBUIÇÃO', '#0D47A1', font_size=13)
 
