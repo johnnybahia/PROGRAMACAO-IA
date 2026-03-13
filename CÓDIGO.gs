@@ -46,7 +46,8 @@ const CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("📦 Produção")
-    .addItem("➕ Cadastrar Produto", "abrirCadastroPedido")
+    .addItem("➕ Cadastrar Produto — 48 Fusos", "abrirCadastroPedido")
+    .addItem("➕ Cadastrar Produto — 32 Fusos", "abrirCadastroPedido32")
     .addSeparator()
     .addItem("▶ Analisar Distribuição", "analisarDistribuicao")
     .addItem("📊 Comparar Estratégias de Distribuição", "analisarDistribuicao")
@@ -64,8 +65,9 @@ function onOpen() {
 // CADASTRO DE PRODUTOS
 // ═══════════════════════════════════════════════════════════
 
-// Prefixo que identifica abas de dados de máquinas
-var PREFIXO_DADOS = "DADOS_";
+// Prefixo que identifica abas de dados de máquinas (48 fusos — exclui 32)
+var PREFIXO_DADOS    = "DADOS_";
+var PREFIXO_DADOS_32 = "DADOS_32_";
 // Nome parcial da aba FUSO 2X2 (para soma de N1)
 var FUSO_2X2_KEYWORD = "2X2";
 
@@ -322,6 +324,197 @@ function inserirCadastroPedido(payload) {
     return { ok: false, msg: "Erros: " + erros.join("; ") };
   }
 
+  return {
+    ok: true,
+    inseridos: inseridos,
+    msg: erros.length > 0 ? "Inserido em " + inseridos + " aba(s). Erros: " + erros.join("; ") : ""
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// CADASTRO DE PRODUTOS — 32 FUSOS
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Abre o formulário de cadastro de produto para máquinas de 32 fusos.
+ */
+function abrirCadastroPedido32() {
+  var html = HtmlService.createHtmlOutputFromFile("CadastroPedido32")
+    .setWidth(520)
+    .setHeight(620)
+    .setTitle("Cadastrar Produto — 32 Fusos");
+  SpreadsheetApp.getUi().showModalDialog(html, "Inserir Dados do Produto — 32 Fusos");
+}
+
+/**
+ * Retorna ao formulário HTML os dados das abas DADOS_32_* para autocomplete e tabela de máquinas.
+ */
+function carregarDadosCadastro32() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abas = ss.getSheets();
+
+  var refsSet     = {};
+  var coresSet    = {};
+  var largurasSet = {};
+  var maquinas    = [];
+
+  for (var i = 0; i < abas.length; i++) {
+    var aba  = abas[i];
+    var nome = aba.getName().trim();
+    if (nome.indexOf(PREFIXO_DADOS_32) !== 0) continue;
+
+    var nomeMaquina = String(aba.getRange("L1").getValue()).trim() || nome;
+    maquinas.push({ nomeAba: nome, nomeMaquina: nomeMaquina });
+
+    var dados = aba.getDataRange().getValues();
+    for (var r = 1; r < dados.length; r++) {
+      var linha = dados[r];
+      var cor  = String(linha[5] || "").trim();   // Coluna F
+      var ref  = String(linha[6] || "").trim();   // Coluna G
+      var larg = String(linha[7] || "").trim();   // Coluna H
+      if (ref)  refsSet[ref]      = true;
+      if (cor)  coresSet[cor]     = true;
+      if (larg) largurasSet[larg] = true;
+    }
+  }
+
+  return {
+    referencias: Object.keys(refsSet).sort(),
+    cores:       Object.keys(coresSet).sort(),
+    larguras:    Object.keys(largurasSet).sort(),
+    maquinas:    maquinas
+  };
+}
+
+/**
+ * Retorna todos os dados vinculados a uma referência nas abas DADOS_32_*.
+ */
+function buscarDadosPorReferencia32(ref) {
+  var ss   = SpreadsheetApp.getActiveSpreadsheet();
+  var abas = ss.getSheets();
+  var refN = ref.trim().toUpperCase();
+
+  var coresSet    = {};
+  var largurasSet = {};
+  var combinacoes  = {};
+  var temposGerais = {};
+
+  for (var i = 0; i < abas.length; i++) {
+    var aba  = abas[i];
+    var nome = aba.getName().trim();
+    if (nome.indexOf(PREFIXO_DADOS_32) !== 0) continue;
+
+    var dados = aba.getDataRange().getValues();
+    for (var r = 1; r < dados.length; r++) {
+      var linha  = dados[r];
+      var lCor   = String(linha[5] || "").trim();
+      var lRef   = String(linha[6] || "").trim().toUpperCase();
+      var lLarg  = String(linha[7] || "").trim();
+      var lTempo = linha[8];
+
+      if (lRef !== refN) continue;
+
+      if (lCor)  coresSet[lCor]    = true;
+      if (lLarg) largurasSet[lLarg] = true;
+
+      if (lTempo === "" || lTempo === null) continue;
+      var tv = parseFloat(String(lTempo).replace(",", "."));
+      if (isNaN(tv)) continue;
+
+      if (!temposGerais[nome]) temposGerais[nome] = tv;
+
+      var key = lCor + "||" + lLarg;
+      if (!combinacoes[key]) combinacoes[key] = { cor: lCor, larg: lLarg, tempos: {} };
+      if (!combinacoes[key].tempos[nome]) combinacoes[key].tempos[nome] = tv;
+    }
+  }
+
+  var combArray = [];
+  for (var k in combinacoes) combArray.push(combinacoes[k]);
+
+  return {
+    cores:        Object.keys(coresSet).sort(),
+    larguras:     Object.keys(largurasSet).sort(),
+    combinacoes:  combArray,
+    temposGerais: temposGerais
+  };
+}
+
+/**
+ * Insere o cadastro nas abas DADOS_32_* selecionadas.
+ * payload = { referencia, cor, largura, maquinas: [{nomeAba, tempo}] }
+ */
+function inserirCadastroPedido32(payload) {
+  var ss  = SpreadsheetApp.getActiveSpreadsheet();
+  var ref  = String(payload.referencia || "").trim();
+  var cor  = String(payload.cor  || "").trim();
+  var larg = String(payload.largura || "").trim();
+  var maquinasSel = payload.maquinas || [];
+
+  if (!ref || !cor || !larg || maquinasSel.length === 0) {
+    return { ok: false, msg: "Dados incompletos." };
+  }
+
+  var descricaoItem = ref + " " + cor + " " + larg;
+  var inseridos = 0;
+  var erros = [];
+
+  for (var i = 0; i < maquinasSel.length; i++) {
+    var sel     = maquinasSel[i];
+    var nomeAba = sel.nomeAba;
+    var tempoI  = parseFloat(String(sel.tempo).replace(",", "."));
+
+    if (isNaN(tempoI)) {
+      erros.push(nomeAba + ": tempo inválido");
+      continue;
+    }
+    if (nomeAba.indexOf(PREFIXO_DADOS_32) !== 0) {
+      erros.push(nomeAba + ": aba não pertence ao grupo 32 fusos");
+      continue;
+    }
+
+    var aba = ss.getSheetByName(nomeAba);
+    if (!aba) {
+      erros.push(nomeAba + ": aba não encontrada");
+      continue;
+    }
+
+    // Encontra primeira linha livre na coluna A (a partir da linha 2)
+    var ultimaLinha = aba.getLastRow();
+    var linhaLivre  = -1;
+    if (ultimaLinha < 2) {
+      linhaLivre = 2;
+    } else {
+      var colA = aba.getRange(2, 1, ultimaLinha, 1).getValues();
+      for (var r = 0; r < colA.length; r++) {
+        if (String(colA[r][0]).trim() === "") { linhaLivre = r + 2; break; }
+      }
+      if (linhaLivre === -1) linhaLivre = ultimaLinha + 1;
+    }
+
+    // Ler M1
+    var m1 = 0;
+    try {
+      m1 = parseFloat(String(aba.getRange("M1").getValue()).replace(",", ".")) || 0;
+    } catch(e) { m1 = 0; }
+
+    // Coluna B: tempo de produção = I + M1
+    var tempoProd = tempoI + m1;
+
+    aba.getRange(linhaLivre, 1).setValue(descricaoItem);
+    aba.getRange(linhaLivre, 2).setValue(tempoProd);
+    aba.getRange(linhaLivre, 6).setValue(cor);
+    aba.getRange(linhaLivre, 7).setValue(ref);
+    aba.getRange(linhaLivre, 8).setValue(larg);
+    aba.getRange(linhaLivre, 9).setValue(tempoI);
+
+    inseridos++;
+  }
+
+  if (erros.length > 0 && inseridos === 0) {
+    return { ok: false, msg: "Erros: " + erros.join("; ") };
+  }
   return {
     ok: true,
     inseridos: inseridos,
