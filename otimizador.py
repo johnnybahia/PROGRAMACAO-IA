@@ -2158,6 +2158,91 @@ def _calc_eficiencia(np_, nm):
     cob = min(99.99, ((f - 7) / f) * 100)
     return min(99, round(cob * 0.5 + 31.5 * 0.3 + 95 * 0.2))
 
+def _avisos_restricoes(resultado: list, pedidos: list) -> str:
+    """
+    Gera aviso textual para pedidos atrasados, destacando restrições que
+    podem ter contribuído (máquina especial, data inicial especial).
+
+    Pedidos com restrições configuradas recebem destaque especial, pois
+    o usuário pode removê-las para melhorar os prazos.
+    """
+    pedido_map = {p['linha_sheet']: p for p in pedidos}
+
+    atrasados_com_restricao = []
+    atrasados_sem_restricao = []
+
+    vistos = set()
+    for r in resultado:
+        if r.get('prazo_delta') is None or r['prazo_delta'] >= 0:
+            continue
+        ls = r.get('linha_sheet')
+        if ls in vistos:
+            continue
+        vistos.add(ls)
+
+        pedido    = pedido_map.get(ls, {})
+        restricoes = []
+        if pedido.get('maquina_especial'):
+            restricoes.append(f'máquina especial "{pedido["maquina_especial"]}"')
+        if pedido.get('data_especial'):
+            restricoes.append(
+                f'data inicial especial {pedido["data_especial"].strftime("%d/%m/%Y")}'
+            )
+
+        info = {
+            'referencia':  r['referencia'],
+            'produto':     r['produto'],
+            'cliente':     r.get('cliente', ''),
+            'prazo_delta': r['prazo_delta'],
+            'restricoes':  restricoes,
+        }
+        if restricoes:
+            atrasados_com_restricao.append(info)
+        else:
+            atrasados_sem_restricao.append(info)
+
+    if not atrasados_com_restricao and not atrasados_sem_restricao:
+        return ''
+
+    linhas = ['\n⚠  AVISO — Pedidos que NÃO cumprirão o prazo:']
+
+    if atrasados_com_restricao:
+        linhas.append(
+            f'\n  📌 Com restrições configuradas ({len(atrasados_com_restricao)} pedido(s)):'
+        )
+        linhas.append(
+            '     As restrições abaixo limitam a flexibilidade do otimizador.'
+        )
+        linhas.append(
+            '     Considere removê-las se o cumprimento do prazo for prioritário.'
+        )
+        for info in atrasados_com_restricao:
+            delta = abs(info['prazo_delta'])
+            rest  = ', '.join(info['restricoes'])
+            cli   = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+            linhas.append(
+                f"     • [{info['referencia']}] {info['produto']}{cli}"
+                f" — {delta} dia(s) atrasado — RESTRIÇÃO: {rest}"
+            )
+
+    if atrasados_sem_restricao:
+        linhas.append(
+            f'\n  📋 Sem restrições especiais ({len(atrasados_sem_restricao)} pedido(s)):'
+        )
+        linhas.append(
+            '     Volume ou capacidade insuficiente para cumprir estes prazos.'
+        )
+        for info in atrasados_sem_restricao:
+            delta = abs(info['prazo_delta'])
+            cli   = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+            linhas.append(
+                f"     • [{info['referencia']}] {info['produto']}{cli}"
+                f" — {delta} dia(s) atrasado"
+            )
+
+    return '\n'.join(linhas)
+
+
 def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
     linhas = [
         f"🏆 {melhor['nome']}",
@@ -2780,6 +2865,10 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, '
           f'{len(sugestoes)} sugestões.')
+
+    aviso_restricoes = _avisos_restricoes(resultado, pedidos)
+    if aviso_restricoes:
+        print(aviso_restricoes)
 
     print('7/7 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
