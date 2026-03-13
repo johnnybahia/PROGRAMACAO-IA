@@ -2043,7 +2043,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
     )
 
     cab   = ['Início', 'Término', 'Referência', 'Produto', 'Cor',
-             'Cliente', 'Ordem de Compra', 'Modelo', 'Máq./dia',
+             'Cliente', 'Ordem de Compra', 'Modelo', 'Máq./dia', 'Total Pedido',
              'Data Entrega', 'Prazo']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO'], cols=ncols)
@@ -2094,7 +2094,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
             inicio_s, termino_s,
             r['referencia'], r.get('produto', ''), r.get('cor', ''),
             r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maq_dia,
+            r['nome_modelo'], maq_dia, total_rodadas,
             entrega_s, r.get('prazo_str', ''),
         ], bg=bg)
 
