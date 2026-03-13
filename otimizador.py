@@ -524,11 +524,15 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
         if nome in ignorar:
             continue
         if apenas_prefixo:
-            # Pipeline 32 fusos: só abas com o prefixo correto
+            # Pipeline específico: só abas com o prefixo indicado
             if not nome.startswith(apenas_prefixo):
                 continue
         else:
-            # Pipeline padrão: exclui abas reservadas ao pipeline 32 fusos
+            # Pipeline padrão: só abas que começam com 'DADOS_' (com underscore)
+            # e que não pertencem ao pipeline 32 fusos.
+            # Isso exclui automaticamente abas como DADOS2, DADOS3, etc.
+            if not nome.startswith('DADOS_'):
+                continue
             if nome.startswith(prefixo_32):
                 continue
         try:
@@ -1644,8 +1648,14 @@ def escrever_resultado_pedido(spreadsheet, resultado: list, sem_cadastro: list,
         cell_list.append(gspread.Cell(ln, 11, '—'))
 
     if cell_list:
-        ws.update_cells(cell_list, value_input_option='RAW')
-        print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba PEDIDO (J e K).')
+        try:
+            ws.update_cells(cell_list, value_input_option='RAW')
+            aba_nome = aba_pedido or CONFIG['ABA_PEDIDO']
+            print(f'  ✔ {len(por_linha) + len(sem_cadastro)} linha(s) atualizadas na aba "{aba_nome}" (J e K).')
+        except Exception as e:
+            aba_nome = aba_pedido or CONFIG['ABA_PEDIDO']
+            print(f'  ⚠ Não foi possível gravar datas/prazo na aba "{aba_nome}" (J e K): {e}')
+            print(f'    Verifique se as colunas J e K estão protegidas na planilha.')
 
 
 # ── SALVAR RESULTADO ─────────────────────────────────────────────────────────
