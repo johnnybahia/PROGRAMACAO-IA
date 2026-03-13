@@ -2043,7 +2043,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
     )
 
     cab   = ['Início', 'Término', 'Referência', 'Produto', 'Cor',
-             'Cliente', 'Ordem de Compra', 'Modelo', 'Máq./dia',
+             'Cliente', 'Ordem de Compra', 'Modelo', 'Máq./dia', 'Total Pedido',
              'Data Entrega', 'Prazo']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO'], cols=ncols)
@@ -2094,7 +2094,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
             inicio_s, termino_s,
             r['referencia'], r.get('produto', ''), r.get('cor', ''),
             r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maq_dia,
+            r['nome_modelo'], maq_dia, total_rodadas,
             entrega_s, r.get('prazo_str', ''),
         ], bg=bg)
 
@@ -2131,7 +2131,6 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
             total_rodadas = math.ceil(total_rodadas / 2)
             total_modelo  = math.ceil(total_modelo  / 2)
-        maq_dia = min(total_rodadas, total_modelo)
 
         dt_inicio  = r.get('dt_inicio')
         dt_termino = r.get('dt_termino')
@@ -2139,20 +2138,25 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
         if not dt_inicio or not dt_termino:
             continue
 
-        d   = dt_inicio.date()
-        fim = dt_termino.date()
-        while d <= fim:
+        # Distribui as máquinas pelos dias: cada dia recebe até a capacidade
+        # física do modelo; o último dia recebe o restante (pode ser menor).
+        restante = total_rodadas
+        d        = dt_inicio.date()
+        fim      = dt_termino.date()
+        while d <= fim and restante > 0:
+            maq_hoje = min(restante, total_modelo)
             b.write([
                 d.strftime('%d/%m/%Y'),
                 r.get('referencia', ''),
                 r.get('nome_modelo', ''),
-                maq_dia,
+                maq_hoje,
                 r.get('produto', ''),
                 r.get('cliente', ''),
                 r.get('ordem_compra', ''),
             ], bg=cores_base[linha % 2])
-            d    += timedelta(days=1)
-            linha += 1
+            restante -= maq_hoje
+            d        += timedelta(days=1)
+            linha    += 1
 
     b.flush()
 
