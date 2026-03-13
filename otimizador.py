@@ -2008,14 +2008,6 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
 
     hoje  = date.today().strftime('%d/%m/%Y')
 
-    # Aviso de ajuste para máquinas chinesas (aparece antes do cabeçalho)
-    tem_chines = any(_e_modelo_chines_48(r.get('nome_modelo', '')) for r in ordenado)
-    if tem_chines:
-        b.banner(
-            '⚠ ATENÇÃO: Máquinas chinesas ajustada a quantidade para Espula grande '
-            '— quantidade de máquinas é o que precisa ser montado realmente.',
-            '#F57F17', fg='#FFFFFF', bold=True, font_size=12)
-
     b.banner(f'📋 RELATÓRIO DE PRODUÇÃO — Gerado em {hoje}', '#0D47A1', font_size=13)
     cor_b = '#1B5E20' if melhor['id'] in ('edd', 'balanceamento', 'sa') else '#E65100'
     b.banner(
@@ -2041,15 +2033,11 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
         termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
         entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
 
-        maquinas = r['maquinas_alocadas']
-        if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
-
         b.write([
             inicio_s, termino_s,
             r['referencia'], r.get('produto', ''), r.get('cor', ''),
             r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maquinas,
+            r['nome_modelo'], r['maquinas_alocadas'],
             entrega_s, r.get('prazo_str', ''),
         ], bg=bg)
 
@@ -2084,13 +2072,9 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
         else:
             inicio_val = ''
 
-        maquinas = r['maquinas_alocadas']
-        if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
-
         b.write([
             inicio_val,
-            maquinas,
+            r['maquinas_alocadas'],
             r.get('nome_modelo', ''),
             r.get('produto', ''),
             r.get('cliente', ''),
