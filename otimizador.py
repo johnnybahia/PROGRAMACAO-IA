@@ -1587,23 +1587,24 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                                else f'{delta} dias atrasado')
 
             resultado.append({
-                'referencia':        ref,
-                'produto':           produto,
-                'cor':               cor,
-                'cliente':           cliente,
-                'ordem_compra':      ordem_compra,
-                'nome_modelo':       aloc['nome_modelo'],
-                'aba':               aloc['aba'],
-                'maquinas_alocadas': aloc['slots'],
-                'tempo_producao':    aloc['tempo_producao'],
-                'inicio_horas':      _round(aloc['inicio']),
-                'termino_horas':     _round(aloc['termino']),
-                'dt_inicio':         dt_inicio,
-                'dt_termino':        dt_termino,
-                'data_entrega':      data_entrega,
-                'prazo_str':         prazo_str,
-                'prazo_delta':       prazo_delta,
-                'linha_sheet':       linha_sheet,
+                'referencia':            ref,
+                'produto':               produto,
+                'cor':                   cor,
+                'cliente':               cliente,
+                'ordem_compra':          ordem_compra,
+                'nome_modelo':           aloc['nome_modelo'],
+                'aba':                   aloc['aba'],
+                'maquinas_alocadas':     aloc['slots'],
+                'total_maquinas_modelo': modelos[aba]['total_maquinas'],
+                'tempo_producao':        aloc['tempo_producao'],
+                'inicio_horas':          _round(aloc['inicio']),
+                'termino_horas':         _round(aloc['termino']),
+                'dt_inicio':             dt_inicio,
+                'dt_termino':            dt_termino,
+                'data_entrega':          data_entrega,
+                'prazo_str':             prazo_str,
+                'prazo_delta':           prazo_delta,
+                'linha_sheet':           linha_sheet,
             })
 
     return resultado, sem_cadastro
@@ -2042,7 +2043,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
     )
 
     cab   = ['Início', 'Término', 'Referência', 'Produto', 'Cor',
-             'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
+             'Cliente', 'Ordem de Compra', 'Modelo', 'Máq./dia', 'Total Rodadas',
              'Data Entrega', 'Prazo']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO'], cols=ncols)
@@ -2082,15 +2083,18 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
         termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
         entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
 
-        maquinas = r['maquinas_alocadas']
+        total_rodadas = r['maquinas_alocadas']
+        total_modelo  = r.get('total_maquinas_modelo', total_rodadas)
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
+            total_rodadas = math.ceil(total_rodadas / 2)
+            total_modelo  = math.ceil(total_modelo  / 2)
+        maq_dia = min(total_rodadas, total_modelo)
 
         b.write([
             inicio_s, termino_s,
             r['referencia'], r.get('produto', ''), r.get('cor', ''),
             r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maquinas,
+            r['nome_modelo'], maq_dia, total_rodadas,
             entrega_s, r.get('prazo_str', ''),
         ], bg=bg)
 
@@ -2098,45 +2102,84 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
 
 
 def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
-    """Cria aba RELATORIO MONTAGEM para uso dos montadores na produção."""
+    """Cria aba RELATORIO MONTAGEM para uso dos montadores na produção.
+
+    Cada alocação é expandida em uma linha por dia calendário do período.
+    A linha de cabeçalho do grupo mostra o total de rodadas (col F) e o
+    período completo; cada linha-dia mostra as máquinas físicas ocupadas
+    (min(total_rodadas, total_maquinas_modelo)).
+    """
     ordenado = sorted(
         resultado,
         key=lambda r: (r.get('dt_inicio') or datetime.min, r.get('dt_termino') or datetime.min)
     )
 
-    cab   = ['Data Início', 'Total Máquinas', 'Modelo', 'Produto', 'Cliente', 'OC']
+    # Colunas: Dia | Referência | Modelo | Máq./dia | Total Rodadas | Produto | Cliente | OC
+    cab   = ['Dia', 'Referência', 'Modelo', 'Máq./dia', 'Total Rodadas', 'Produto', 'Cliente', 'OC']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RELATORIO_MONTAGEM'], cols=ncols)
 
     hoje  = date.today().strftime('%d/%m/%Y')
     b.banner(f'🔧 RELATÓRIO DE MONTAGEM — Gerado em {hoje}', '#1A237E', font_size=13)
+    b.banner(
+        'Máq./dia = máquinas físicas ocupadas por dia  |  '
+        'Total Rodadas = total de rodadas necessárias (col F do pedido)',
+        '#E8EAF6', fg='#1A237E', font_size=10)
     b.blank()
     b.write(cab, bg='#37474F', fg='#FFFFFF', bold=True, h_align='CENTER')
-    b.freeze(3)
+    b.freeze(4)
 
-    cores_base = ['#FFFFFF', '#F5F5F5']
-    for i, r in enumerate(ordenado):
-        bg = cores_base[i % 2]
+    # Cores alternadas por grupo (um grupo = uma alocação)
+    cores_header = ['#BBDEFB', '#C8E6C9']   # azul-claro / verde-claro para cabeçalho
+    cores_dia    = ['#E3F2FD', '#F1F8E9']   # tom mais claro para linhas de dia
 
-        # Data de início como valor de data puro (para permitir filtro por data)
-        dt_inicio = r.get('dt_inicio')
-        if dt_inicio:
-            inicio_val = dt_inicio.strftime('%d/%m/%Y')
-        else:
-            inicio_val = ''
+    for gi, r in enumerate(ordenado):
+        ci = gi % 2
 
-        maquinas = r['maquinas_alocadas']
+        total_rodadas = r['maquinas_alocadas']
+        total_modelo  = r.get('total_maquinas_modelo', total_rodadas)
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
+            total_rodadas = math.ceil(total_rodadas / 2)
+            total_modelo  = math.ceil(total_modelo  / 2)
+        maq_dia = min(total_rodadas, total_modelo)
 
+        dt_inicio  = r.get('dt_inicio')
+        dt_termino = r.get('dt_termino')
+
+        ini_s = dt_inicio.strftime('%d/%m/%Y')  if dt_inicio  else '—'
+        fim_s = dt_termino.strftime('%d/%m/%Y') if dt_termino else '—'
+
+        # ── Linha de cabeçalho do grupo ──────────────────────────────────────
+        # "Dia" = período completo; Total Rodadas preenchido; Máq./dia vazio
         b.write([
-            inicio_val,
-            maquinas,
+            f'{ini_s} – {fim_s}',
+            r.get('referencia', ''),
             r.get('nome_modelo', ''),
+            '',              # Máq./dia (vazio no header)
+            total_rodadas,   # Total Rodadas (só no header)
             r.get('produto', ''),
             r.get('cliente', ''),
             r.get('ordem_compra', ''),
-        ], bg=bg)
+        ], bg=cores_header[ci], bold=True)
+
+        # ── Uma linha por dia do período ─────────────────────────────────────
+        if dt_inicio and dt_termino:
+            d   = dt_inicio.date()
+            fim = dt_termino.date()
+            while d <= fim:
+                b.write([
+                    d.strftime('%d/%m/%Y'),
+                    r.get('referencia', ''),
+                    r.get('nome_modelo', ''),
+                    maq_dia,   # máquinas físicas ocupadas neste dia
+                    '',        # Total Rodadas (vazio nas linhas de dia)
+                    r.get('produto', ''),
+                    r.get('cliente', ''),
+                    r.get('ordem_compra', ''),
+                ], bg=cores_dia[ci])
+                d += timedelta(days=1)
+
+        b.blank()   # linha em branco entre grupos
 
     b.flush()
 
