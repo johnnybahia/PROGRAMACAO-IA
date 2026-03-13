@@ -65,7 +65,7 @@ CONFIG = {
     'ABA_RELATORIO':             'RELATORIO',
     'ABA_RELATORIO_MONTAGEM':    'RELATORIO MONTAGEM',
     'ABA_COMPARATIVO':           'COMPARATIVO',
-    # ── Pipeline 32 fusos (novo) ────────────────────────────────────────────
+    # ── Pipeline 32 fusos ───────────────────────────────────────────────────
     'ABA_PEDIDO_32':             'PEDIDO 32',
     'ABA_RESULTADO_32':          'DISTRIBUIÇÃO 32',
     'ABA_RELATORIO_32':          'RELATORIO 32',
@@ -73,6 +73,14 @@ CONFIG = {
     'ABA_COMPARATIVO_32':        'COMPARATIVO 32',
     # Prefixo das abas de máquinas do pipeline 32 fusos
     'PREFIXO_MODELOS_32':        'DADOS_32_',
+    # ── Pipeline 16 fusos ───────────────────────────────────────────────────
+    'ABA_PEDIDO_16':             'PEDIDO 16',
+    'ABA_RESULTADO_16':          'DISTRIBUIÇÃO 16',
+    'ABA_RELATORIO_16':          'RELATORIO 16',
+    'ABA_RELATORIO_MONTAGEM_16': 'RELATORIO MONTAGEM 16',
+    'ABA_COMPARATIVO_16':        'COMPARATIVO 16',
+    # Prefixo das abas de máquinas do pipeline 16 fusos
+    'PREFIXO_MODELOS_16':        'DADOS_16_',
     'HORAS_POR_DIA':        24,
     # Limiar 0 → qualquer combinação que reduza o custo lexicográfico (tardiness, makespan)
     # vence o EDD. Como a comparação é por tupla, qualquer redução de atraso é suficiente.
@@ -82,6 +90,8 @@ CONFIG = {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO', 'RELATORIO MONTAGEM',
         # Pipeline 32 fusos
         'PEDIDO 32', 'DISTRIBUIÇÃO 32', 'COMPARATIVO 32', 'RELATORIO 32', 'RELATORIO MONTAGEM 32',
+        # Pipeline 16 fusos
+        'PEDIDO 16', 'DISTRIBUIÇÃO 16', 'COMPARATIVO 16', 'RELATORIO 16', 'RELATORIO MONTAGEM 16',
         'DATAS FORA DE PROGRAMAÇÃO',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
     },
@@ -510,6 +520,7 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set,
             'deadline_horas':       deadline_horas,
             '_semana':              _semana_id(data_entrega),
             'data_especial':        data_esp,
+            'data_entrega_especial': data_ent_especial,
             'min_start':            min_start,
             'maquina_especial':     maquina_especial,
             'prioridade':           1,          # mantido para compatibilidade interna
@@ -540,12 +551,13 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
             if not nome.startswith(apenas_prefixo):
                 continue
         else:
-            # Pipeline padrão: só abas que começam com 'DADOS_' (com underscore)
-            # e que não pertencem ao pipeline 32 fusos.
+            # Pipeline padrão (48 fusos): só abas que começam com 'DADOS_' (com underscore)
+            # e que não pertencem a nenhum pipeline específico (32 fusos, 16 fusos, …).
             # Isso exclui automaticamente abas como DADOS2, DADOS3, etc.
             if not nome.startswith('DADOS_'):
                 continue
-            if nome.startswith(prefixo_32):
+            prefixos_especificos = [CONFIG['PREFIXO_MODELOS_32'], CONFIG['PREFIXO_MODELOS_16']]
+            if any(nome.startswith(p) for p in prefixos_especificos):
                 continue
         try:
             k1 = ws.acell('K1').value or ''
@@ -560,6 +572,7 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
 
             referencias = {}
             descricoes  = {}
+            e_chines    = 'CHINES' in nome.upper()  # DADOS_48_FUSOS_CHINES / DADOS_32_FUSOS_CHINES
             rows = ws.get_all_values()
             for linha in rows[1:]:
                 if len(linha) < 7:
@@ -567,11 +580,12 @@ def ler_modelos(spreadsheet, apenas_prefixo: str = None) -> dict:
                 descricao = ' '.join(linha[0].split())        # Coluna A = descrição completa
                 ref       = ' '.join(linha[6].split())        # Coluna G = REFERENCIA
                 cor_maq   = ' '.join(linha[5].split()) if len(linha) > 5 else ''  # Coluna F = COR
-                tempo_str = linha[1].strip()                  # Coluna B
                 if not ref:
                     continue
                 try:
-                    tempo = float(tempo_str.replace(',', '.'))
+                    tempo = float(linha[1].strip().replace(',', '.'))  # Coluna B
+                    if e_chines:
+                        tempo = tempo / 2
                 except (ValueError, AttributeError):
                     continue
                 if tempo <= 0:
@@ -711,6 +725,23 @@ def precomputar_maquinas(modelos: dict):
 
     ridx_map = {v: k for k, v in gidx_map.items()}
     return ref_data, num_machines, ridx_map
+
+
+# ── CLASSIFICAÇÃO DE RESTRIÇÕES ──────────────────────────────────────────────
+def _tem_restricao(p: dict) -> bool:
+    """
+    Retorna True se o pedido tem qualquer restrição de agendamento configurada
+    pelo usuário (col A = data inicial especial, col B = máquina especial,
+    col L = data de entrega especial).
+
+    Pedidos com restrição são alocados ANTES dos pedidos livres no
+    rolling-horizon — recebem direito de passagem sobre as máquinas.
+    """
+    return (
+        bool(p.get('maquina_especial')) or
+        float(p.get('min_start', 0.0)) > 0 or
+        bool(p.get('data_entrega_especial'))
+    )
 
 
 # ── PRÉ-COMPUTAÇÃO DE RESTRIÇÕES POR PEDIDO ───────────────────────────────────
@@ -1681,7 +1712,7 @@ def salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
              'Modelo', 'Aba', 'Máquinas', 'Tempo Prod. (h)',
              'Início', 'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
-    abas_ocultas = {CONFIG['ABA_RESULTADO'], CONFIG['ABA_RESULTADO_32']}
+    abas_ocultas = {CONFIG['ABA_RESULTADO'], CONFIG['ABA_RESULTADO_32'], CONFIG['ABA_RESULTADO_16']}
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_RESULTADO'], cols=ncols,
                          hidden=(aba or CONFIG['ABA_RESULTADO']) in abas_ocultas)
 
@@ -1866,7 +1897,7 @@ def salvar_comparativo(spreadsheet, melhor, ranking, num_pedidos, num_modelos,
                        aba: str = None):
     cab   = ['Posição', 'Estratégia', 'Descrição', 'Término Total (h)', 'Diferença vs Melhor (h)', 'Variação %']
     ncols = len(cab)
-    abas_ocultas = {CONFIG['ABA_COMPARATIVO'], CONFIG['ABA_COMPARATIVO_32']}
+    abas_ocultas = {CONFIG['ABA_COMPARATIVO'], CONFIG['ABA_COMPARATIVO_32'], CONFIG['ABA_COMPARATIVO_16']}
     b     = SheetBuilder(spreadsheet, aba or CONFIG['ABA_COMPARATIVO'], cols=ncols,
                          hidden=(aba or CONFIG['ABA_COMPARATIVO']) in abas_ocultas)
 
@@ -2155,6 +2186,187 @@ def _calc_eficiencia(np_, nm):
     f   = math.factorial(min(np_, 20))
     cob = min(99.99, ((f - 7) / f) * 100)
     return min(99, round(cob * 0.5 + 31.5 * 0.3 + 95 * 0.2))
+
+def _verificar_inviabilidade_restricoes(pedidos: list) -> str:
+    """
+    Analisa ANTES da otimização se algum pedido tem restrições que tornam
+    o cumprimento do prazo matematicamente impossível.
+
+    Condição de inviabilidade:
+        min_start + tempo_mínimo_de_produção > deadline_horas
+
+    Ou seja: mesmo que a máquina esteja completamente livre e o pedido
+    inicie no seu primeiro momento permitido (min_start), ainda assim
+    não terminaria antes do prazo.
+
+    Deve ser chamado após preparar_restricoes_pedidos(), pois usa _tempos
+    já filtrados pela maquina_especial.
+
+    Unidades: todas em horas corridas (calendário) a partir da data base.
+    """
+    inviaveis = []
+
+    for p in pedidos:
+        dl    = p.get('deadline_horas')
+        if dl is None:
+            continue                        # sem prazo → não há impossibilidade
+
+        tempos = p.get('_tempos')
+        if tempos is None or len(tempos) == 0:
+            continue                        # sem cadastro → tratado em sem_cadastro
+
+        min_s      = float(p.get('min_start', 0.0))
+        min_tempo  = float(np.min(tempos))  # máquina mais rápida disponível
+        fim_minimo = min_s + min_tempo      # término mais cedo possível
+
+        if fim_minimo <= dl:
+            continue                        # viável matematicamente
+
+        # Identifica quais restrições contribuem para a impossibilidade
+        restricoes = []
+        if p.get('maquina_especial'):
+            restricoes.append(f'máquina especial "{p["maquina_especial"]}"')
+        if p.get('data_especial'):
+            restricoes.append(
+                f'data inicial especial {p["data_especial"].strftime("%d/%m/%Y")}'
+            )
+        if p.get('data_entrega_especial'):
+            restricoes.append(
+                f'data de entrega especial {p["data_entrega_especial"].strftime("%d/%m/%Y")}'
+            )
+
+        deficit_dias = math.ceil((fim_minimo - dl) / 24)
+
+        inviaveis.append({
+            'referencia':    p['referencia'],
+            'produto':       p.get('produto', ''),
+            'cliente':       p.get('cliente', ''),
+            'deficit_dias':  deficit_dias,
+            'restricoes':    restricoes,
+        })
+
+    if not inviaveis:
+        return ''
+
+    linhas = [
+        '\n🚫 INVIÁVEL — Pedidos que NÃO podem cumprir o prazo com as restrições atuais:',
+        '   Mesmo com a máquina completamente livre, o prazo não seria atingido.',
+        '   Remova ou ajuste as restrições abaixo para que o otimizador tenha flexibilidade.',
+    ]
+    for info in inviaveis:
+        cli  = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+        rest = (', '.join(info['restricoes'])
+                if info['restricoes'] else 'prazo insuficiente para o tempo de produção')
+        linhas.append(
+            f"   • [{info['referencia']}] {info['produto']}{cli}"
+            f" — {info['deficit_dias']} dia(s) de déficit | CAUSA: {rest}"
+        )
+
+    return '\n'.join(linhas)
+
+
+def _avisos_restricoes(resultado: list, pedidos: list) -> str:
+    """
+    Analisa pedidos atrasados APÓS a otimização com dois passes
+    (restritos → livres).
+
+    Com o two-pass, pedidos com restrição já tiveram prioridade total sobre
+    as máquinas. Se mesmo assim ficaram atrasados, significa CONFLITO entre
+    as próprias restrições (ex.: duas ordens disputando a mesma máquina
+    especial no mesmo período).
+
+    Pedidos sem restrição atrasados significa capacidade insuficiente no
+    espaço que sobrou — os restritos consumiram slots que seriam necessários.
+    """
+    pedido_map = {p['linha_sheet']: p for p in pedidos}
+
+    conflito_restricoes = []   # restritos que ficaram atrasados mesmo com prioridade
+    capacidade_esgotada = []   # livres atrasados por falta de espaço
+
+    vistos = set()
+    for r in resultado:
+        if r.get('prazo_delta') is None or r['prazo_delta'] >= 0:
+            continue
+        ls = r.get('linha_sheet')
+        if ls in vistos:
+            continue
+        vistos.add(ls)
+
+        pedido    = pedido_map.get(ls, {})
+        restricoes = []
+        if pedido.get('maquina_especial'):
+            restricoes.append(f'máquina especial "{pedido["maquina_especial"]}"')
+        if pedido.get('data_especial'):
+            restricoes.append(
+                f'data inicial especial {pedido["data_especial"].strftime("%d/%m/%Y")}'
+            )
+        if pedido.get('data_entrega_especial'):
+            restricoes.append(
+                f'data de entrega especial {pedido["data_entrega_especial"].strftime("%d/%m/%Y")}'
+            )
+
+        info = {
+            'referencia':  r['referencia'],
+            'produto':     r['produto'],
+            'cliente':     r.get('cliente', ''),
+            'prazo_delta': r['prazo_delta'],
+            'restricoes':  restricoes,
+        }
+        if restricoes:
+            conflito_restricoes.append(info)
+        else:
+            capacidade_esgotada.append(info)
+
+    if not conflito_restricoes and not capacidade_esgotada:
+        return ''
+
+    linhas = ['\n⚠  AVISO — Pedidos que NÃO cumprirão o prazo:']
+
+    if conflito_restricoes:
+        linhas.append(
+            f'\n  🔴 Conflito entre restrições ({len(conflito_restricoes)} pedido(s)):'
+        )
+        linhas.append(
+            '     Estes pedidos tiveram PRIORIDADE TOTAL nas máquinas mas ainda ficaram atrasados.'
+        )
+        linhas.append(
+            '     Causa: restrições incompatíveis entre si (ex.: duas ordens disputando'
+        )
+        linhas.append(
+            '     a mesma máquina especial no mesmo período, ou data inicial muito tardia).'
+        )
+        linhas.append(
+            '     Solução: revise ou remova as restrições em conflito.'
+        )
+        for info in conflito_restricoes:
+            delta = abs(info['prazo_delta'])
+            rest  = ', '.join(info['restricoes'])
+            cli   = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+            linhas.append(
+                f"     • [{info['referencia']}] {info['produto']}{cli}"
+                f" — {delta} dia(s) atrasado — {rest}"
+            )
+
+    if capacidade_esgotada:
+        linhas.append(
+            f'\n  📋 Capacidade insuficiente ({len(capacidade_esgotada)} pedido(s) sem restrição):'
+        )
+        linhas.append(
+            '     O espaço restante após alocar os pedidos restritos não foi suficiente.'
+        )
+        linhas.append(
+            '     Considere reduzir restrições ou ampliar capacidade produtiva.'
+        )
+        for info in capacidade_esgotada:
+            delta = abs(info['prazo_delta'])
+            cli   = f' — cliente: {info["cliente"]}' if info['cliente'] else ''
+            linhas.append(
+                f"     • [{info['referencia']}] {info['produto']}{cli}"
+                f" — {delta} dia(s) atrasado"
+            )
+
+    return '\n'.join(linhas)
+
 
 def gerar_resumo(resultado, sem_cadastro, melhor, ranking):
     linhas = [
@@ -2540,49 +2752,42 @@ def _inserir_em_fila(fila: list, idx_atual: int, dia: int, pedidos_novos: list):
         fila.append({'bucket': dia, 'pedidos': list(pedidos_novos)})
 
 
-# ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
-def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
+# ── ROLLING-HORIZON: PASSAGEM ÚNICA ──────────────────────────────────────────
+def _rolling_horizon_pass(pedidos: list, modelos: dict, ref_data: dict,
+                           num_machines: int,
+                           filas_iniciais=None,
+                           prefixo_log: str = '') -> tuple:
     """
-    Otimização rolling-horizon: agrupa pedidos por dia de vencimento e aplica
-    toda a capacidade de análise (EDD/SA + 2-opt + SA encaixes) a cada bloco
-    separadamente, passando o estado das máquinas para o bloco seguinte.
+    Executa uma passagem completa do rolling-horizon EDD+SA+2-opt sobre
+    'pedidos', partindo do estado de máquinas em 'filas_iniciais'.
 
-    Vantagens sobre a otimização global:
-      • Pedidos atrasados usam as máquinas ANTES dos pedidos futuros —
-        restrição dura, não apenas peso na função de custo.
-      • Cada bloco é menor → mais iterações SA/2-opt por pedido.
-      • O "tetris" dentro de cada bloco é mais apertado.
-
-    Retorna (ordenados_total, choices_total, melhor_global).
-    'choices_total' é a concatenação dos choices de todos os blocos e pode
-    ser passado diretamente a otimizar_distribuicao como a lista de encaixes.
+    Retorna (ordenados, choices, filas_finais, tard_total,
+             decisao_partes, blocos_info).
     """
     hpd = CONFIG['HORAS_POR_DIA']
 
-    # ── Pré-simulação: blocos iniciais com restrições já no lugar certo ────────
-    # Roda simulação greedy de todos os pedidos para capturar estado das máquinas
-    # antes de cada bloco. Pedidos com maquina_especial ou min_start são realocados
-    # para o bloco onde de fato podem iniciar — antes de qualquer SA/2-opt.
+    if not pedidos:
+        filas = (filas_iniciais.copy() if filas_iniciais is not None
+                 else np.zeros(num_machines, dtype=np.float64))
+        return [], [], filas, 0.0, [], []
+
     fila_base = [{'bucket': b['bucket'], 'pedidos': list(b['pedidos'])}
                  for b in agrupar_por_dia_vencimento(pedidos)]
     fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
 
-    filas_atual     = np.zeros(num_machines, dtype=np.float64)
-    ordenados_total = []
-    choices_total   = []
-    decisao_partes  = []
-    blocos_info     = []   # para estrategiasPorGrupo no resultado
-    tard_total      = 0.0
-    idx             = 0    # índice corrente (fila pode crescer durante o loop)
+    filas_atual    = (filas_iniciais.copy() if filas_iniciais is not None
+                      else np.zeros(num_machines, dtype=np.float64))
+    ordenados      = []
+    choices        = []
+    decisao_partes = []
+    blocos_info    = []
+    tard_total     = 0.0
+    idx            = 0
 
     while idx < len(fila):
         bloco  = fila[idx]
         bucket = bloco['bucket']
 
-        # ── Realocar pedidos com restrições baseado no estado atual ─────────
-        # Após o bloco anterior rodar, máquinas podem estar ocupadas além
-        # da janela deste bloco — pedidos com maquina_especial ou min_start
-        # que não conseguem iniciar nesta janela vão para o bloco correto.
         ped_b, diferidos = _separar_diferidos(
             bloco['pedidos'], filas_atual, hpd, bucket)
 
@@ -2600,25 +2805,20 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
             label = f'dia +{bucket}'
 
         dif_s = f'  ↪ {n_dif} diferido{"s" if n_dif != 1 else ""}' if n_dif else ''
-        print(f'  Bloco {idx+1}/{len(fila)}: {label}  '
+        print(f'  {prefixo_log}Bloco {idx+1}/{len(fila)}: {label}  '
               f'({nb} pedido{"s" if nb != 1 else ""}{dif_s})')
 
         if nb == 0:
             idx += 1
             continue
 
-        # ── Escolher melhor ordenação dentro do bloco ──────────────────────
         grupos_b = agrupar_por_prioridade(ped_b)
-        # livre=True: SA e 2-opt podem reordenar qualquer pedido dentro do bloco.
-        # A prioridade entre blocos já está garantida pelo rolling-horizon.
-        # Dentro do bloco o único objetivo é liberar máquinas mais cedo possível.
         melhor_b, _ = escolher_melhor_estrategia(
             ped_b, modelos, grupos_b, ref_data, num_machines,
             filas_iniciais=filas_atual,
             livre=True,
         )
 
-        # ── 2-opt dentro do bloco ──────────────────────────────────────────
         ord_2opt, t_2opt = busca_local_2opt(
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
@@ -2631,12 +2831,11 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
             melhor_b['terminoTotal'] = t_2opt
             print(f'    2-opt −{ganho}%')
 
-        # ── SA encaixes dentro do bloco ────────────────────────────────────
         choices_sa = sa_encaixes(
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
         )
-        t_enc, _,  filas_enc = simular_com_atribuicao(
+        t_enc, _, filas_enc = simular_com_atribuicao(
             melhor_b['ordenados'], ref_data, num_machines,
             choices_sa, filas_iniciais=filas_atual,
         )
@@ -2654,15 +2853,72 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
             filas_atual   = filas_grd
             tard_total   += t_grd[0]
 
-        ordenados_total.extend(melhor_b['ordenados'])
-        choices_total.extend(choices_bloco)
+        ordenados.extend(melhor_b['ordenados'])
+        choices.extend(choices_bloco)
         decisao_partes.append(f'{label}:{melhor_b["id"]}')
         blocos_info.append({'bucket': bucket, 'nb': nb, 'est': melhor_b})
         idx += 1
 
-    n_blocos       = len(blocos_info)
-    makespan_total = float(filas_atual.max()) if len(filas_atual) else 0.0
-    t_global       = (tard_total, makespan_total)
+    return ordenados, choices, filas_atual, tard_total, decisao_partes, blocos_info
+
+
+# ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
+def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
+    """
+    Otimização rolling-horizon em dois passes:
+
+      Passo 1 — Pedidos COM restrição (col A, B ou L preenchidas) são alocados
+                PRIMEIRO, com prioridade total sobre as máquinas.
+                Usam o rolling-horizon EDD+SA+2-opt normalmente entre si.
+
+      Passo 2 — Pedidos SEM restrição preenchem o espaço que sobrou nas
+                máquinas após o passo 1. Recebem o estado das máquinas como
+                ponto de partida e competem livremente entre si.
+
+    Isso garante que as restrições configuradas pelo usuário sejam respeitadas
+    como "direito de passagem" — e o aviso de conflito dispara quando nem com
+    prioridade os pedidos restritos conseguem cumprir o prazo.
+
+    Retorna (ordenados_total, choices_total, melhor_global).
+    """
+    restritos = [p for p in pedidos if     _tem_restricao(p)]
+    livres    = [p for p in pedidos if not _tem_restricao(p)]
+
+    n_rest = len(restritos)
+    n_liv  = len(livres)
+
+    if n_rest and n_liv:
+        print(f'  Pedidos com restrição: {n_rest} (alocam primeiro)')
+        print(f'  Pedidos sem restrição: {n_liv} (preenchem espaço restante)')
+    elif n_rest:
+        print(f'  Todos os {n_rest} pedido(s) têm restrição.')
+    else:
+        print(f'  Nenhum pedido com restrição — passagem única.')
+
+    # ── Passo 1: restritos ────────────────────────────────────────────────────
+    prefixo_r = '[R] ' if (n_rest and n_liv) else ''
+    ord_r, ch_r, filas_r, tard_r, dec_r, bi_r = _rolling_horizon_pass(
+        restritos, modelos, ref_data, num_machines,
+        prefixo_log=prefixo_r,
+    )
+
+    # ── Passo 2: livres, partindo do estado deixado pelos restritos ───────────
+    prefixo_l = '[L] ' if (n_rest and n_liv) else ''
+    ord_l, ch_l, filas_l, tard_l, dec_l, bi_l = _rolling_horizon_pass(
+        livres, modelos, ref_data, num_machines,
+        filas_iniciais=filas_r,
+        prefixo_log=prefixo_l,
+    )
+
+    ordenados_total = ord_r + ord_l
+    choices_total   = ch_r  + ch_l
+    decisao_partes  = dec_r + dec_l
+    blocos_info     = bi_r  + bi_l
+    tard_total      = tard_r + tard_l
+    filas_final     = filas_l if n_liv else filas_r
+    makespan_total  = float(filas_final.max()) if len(filas_final) else 0.0
+    n_blocos        = len(blocos_info)
+    t_global        = (tard_total, makespan_total)
 
     decisao_str = (f'Blocos ({n_blocos}g): '
                    + ' | '.join(decisao_partes[:4])
@@ -2754,6 +3010,10 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas.')
 
+    aviso_inviavel = _verificar_inviabilidade_restricoes(pedidos)
+    if aviso_inviavel:
+        print(aviso_inviavel)
+
     print('5/7 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
     print(f'  {len(blocos_info)} bloco(s): '
@@ -2778,6 +3038,10 @@ def executar_pipeline(spreadsheet, cfg: dict, datas_bloqueadas: set):
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, '
           f'{len(sugestoes)} sugestões.')
+
+    aviso_restricoes = _avisos_restricoes(resultado, pedidos)
+    if aviso_restricoes:
+        print(aviso_restricoes)
 
     print('7/7 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor,
@@ -2842,6 +3106,17 @@ def main():
         'aba_relatorio':      CONFIG['ABA_RELATORIO_32'],
         'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM_32'],
         'apenas_prefixo':     CONFIG['PREFIXO_MODELOS_32'],  # só abas DADOS_32_*
+    }, datas_bloqueadas)
+
+    # ── Pipeline 16 fusos: PEDIDO 16 → DISTRIBUIÇÃO 16 / RELATORIO 16 / …
+    executar_pipeline(spreadsheet, {
+        'label':              '16 fusos',
+        'aba_pedido':         CONFIG['ABA_PEDIDO_16'],
+        'aba_resultado':      CONFIG['ABA_RESULTADO_16'],
+        'aba_comparativo':    CONFIG['ABA_COMPARATIVO_16'],
+        'aba_relatorio':      CONFIG['ABA_RELATORIO_16'],
+        'aba_relatorio_mont': CONFIG['ABA_RELATORIO_MONTAGEM_16'],
+        'apenas_prefixo':     CONFIG['PREFIXO_MODELOS_16'],  # só abas DADOS_16_*
     }, datas_bloqueadas)
 
     tempo_total = time.time() - t0
