@@ -2068,35 +2068,61 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict, aba: str = None
     b.freeze(5)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
-    for i, r in enumerate(ordenado):
+
+    # Expande cada alocação em rodadas e coleta tudo para ordenar por data
+    linhas = []
+    for r in ordenado:
         pd = r.get('prazo_delta')
         if pd is not None and pd < 0:
-            bg = '#FFCDD2'   # atrasado
+            bg = '#FFCDD2'
         elif pd == 0:
-            bg = '#FFF9C4'   # no limite
+            bg = '#FFF9C4'
         elif pd is not None and pd > 0:
-            bg = '#C8E6C9'   # antecipado
+            bg = '#C8E6C9'
         else:
-            bg = cores_base[i % 2]
+            bg = '#FFFFFF'   # será recolorido por índice após ordenação
 
-        inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M')  if r.get('dt_inicio')   else ''
-        termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
-        entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
+        dt_inicio  = r.get('dt_inicio')
+        dt_termino = r.get('dt_termino')
+        if not dt_inicio or not dt_termino:
+            continue
 
         total_rodadas = r['maquinas_alocadas']
         total_modelo  = r.get('total_maquinas_modelo', total_rodadas)
         if _e_modelo_chines_48(r.get('nome_modelo', '')):
             total_rodadas = math.ceil(total_rodadas / 2)
             total_modelo  = math.ceil(total_modelo  / 2)
-        maq_dia = min(total_rodadas, total_modelo)
 
-        b.write([
-            inicio_s, termino_s,
-            r['referencia'], r.get('produto', ''), r.get('cor', ''),
-            r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maq_dia, total_rodadas,
-            entrega_s, r.get('prazo_str', ''),
-        ], bg=bg)
+        n_rodadas      = math.ceil(total_rodadas / total_modelo)
+        duracao_total  = dt_termino - dt_inicio
+        dur_por_rodada = duracao_total / n_rodadas if n_rodadas else duracao_total
+        entrega_s      = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
+
+        restante = total_rodadas
+        for j in range(n_rodadas):
+            if restante <= 0:
+                break
+            maq_hoje    = min(restante, total_modelo)
+            dt_r_inicio = dt_inicio + j * dur_por_rodada
+            dt_r_fim    = dt_inicio + (j + 1) * dur_por_rodada if j < n_rodadas - 1 else dt_termino
+            linhas.append({
+                'dt_inicio_r': dt_r_inicio,
+                'row': [
+                    dt_r_inicio.strftime('%d/%m/%Y %H:%M'),
+                    dt_r_fim.strftime('%d/%m/%Y %H:%M'),
+                    r['referencia'], r.get('produto', ''), r.get('cor', ''),
+                    r.get('cliente', ''), r.get('ordem_compra', ''),
+                    r['nome_modelo'], maq_hoje, total_rodadas,
+                    entrega_s, r.get('prazo_str', ''),
+                ],
+                'bg': bg,
+            })
+            restante -= maq_hoje
+
+    linhas.sort(key=lambda x: x['dt_inicio_r'])
+    for idx, l in enumerate(linhas):
+        bg_final = l['bg'] if l['bg'] != '#FFFFFF' else cores_base[idx % 2]
+        b.write(l['row'], bg=bg_final)
 
     b.flush()
 
@@ -2123,8 +2149,9 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
     b.freeze(3)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
-    linha = 0   # contador global para alternância de cor
 
+    # Coleta todas as rodadas de todos os modelos para ordenar por data
+    linhas = []
     for r in ordenado:
         total_rodadas = r['maquinas_alocadas']
         total_modelo  = r.get('total_maquinas_modelo', total_rodadas)
@@ -2134,14 +2161,9 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
 
         dt_inicio  = r.get('dt_inicio')
         dt_termino = r.get('dt_termino')
-
         if not dt_inicio or not dt_termino:
             continue
 
-        # Distribui as máquinas pelas rodadas: cada rodada recebe até a
-        # capacidade física do modelo; a última recebe o restante.
-        # A data de início de cada rodada é calculada proporcionalmente
-        # ao período total (dt_inicio + i * duracao_por_rodada).
         n_rodadas      = math.ceil(total_rodadas / total_modelo)
         duracao_total  = dt_termino - dt_inicio
         dur_por_rodada = duracao_total / n_rodadas if n_rodadas else duracao_total
@@ -2152,17 +2174,23 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list, aba: str = None):
                 break
             maq_hoje    = min(restante, total_modelo)
             dt_inicio_r = dt_inicio + i * dur_por_rodada
-            b.write([
-                dt_inicio_r.strftime('%d/%m/%Y %H:%M'),
-                r.get('referencia', ''),
-                r.get('nome_modelo', ''),
-                maq_hoje,
-                r.get('produto', ''),
-                r.get('cliente', ''),
-                r.get('ordem_compra', ''),
-            ], bg=cores_base[linha % 2])
+            linhas.append({
+                'dt_inicio_r': dt_inicio_r,
+                'row': [
+                    dt_inicio_r.strftime('%d/%m/%Y %H:%M'),
+                    r.get('referencia', ''),
+                    r.get('nome_modelo', ''),
+                    maq_hoje,
+                    r.get('produto', ''),
+                    r.get('cliente', ''),
+                    r.get('ordem_compra', ''),
+                ],
+            })
             restante -= maq_hoje
-            linha    += 1
+
+    linhas.sort(key=lambda x: x['dt_inicio_r'])
+    for idx, l in enumerate(linhas):
+        b.write(l['row'], bg=cores_base[idx % 2])
 
     b.flush()
 
