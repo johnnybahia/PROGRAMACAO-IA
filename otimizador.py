@@ -432,34 +432,53 @@ def _build_chines_mask(num_machines: int, ridx_map: dict, modelos: dict) -> np.n
     return mask
 
 
+# Horizonte máximo de planejamento em dias.
+# Array numpy pré-alocado (N_DIAS, 2): coluna 0 = total inícios, coluna 1 = inícios chinesas.
+# Usar numpy em vez de dict Python reduz o tempo de cópia no loop do SA em ~100×.
+_DS_MAX_DIAS = 2000
+
+
+def _ds_novo() -> np.ndarray:
+    """Cria um array de daily_starts zerado (2000 dias × 2 contadores)."""
+    return np.zeros((_DS_MAX_DIAS, 2), dtype=np.int32)
+
+
 def _aplicar_limite_diario(start: float, is_chines: bool,
-                            daily_starts: dict,
+                            daily_starts: np.ndarray,
                             lim_chines, lim_total) -> float:
     """
     Dado um horário de início proposto (em horas virtuais), retorna o horário
     de início real após respeitar os limites diários de inícios de máquinas.
 
+    Comportamento de "preencher ao máximo":
+      O algoritmo greedy processa pedidos em ordem EDD e tenta sempre iniciar
+      no dia mais cedo possível. Isso garante naturalmente que cada dia é
+      preenchido até o limite ANTES de avançar para o dia seguinte — sem
+      nenhuma lógica extra de "empacotamento".
+
     Regras:
       - Máximo lim_chines inícios de máquinas chinesas por dia calendário.
       - Máximo lim_total  inícios totais (todos os modelos) por dia calendário.
-      - Se o dia corrente está cheio, empurra para o início do dia seguinte (24 h).
+      - Se o dia corrente está cheio, empurra para o INÍCIO do próximo dia (× 24 h).
+      - Restrições EDD e maquina_especial/min_start já foram aplicadas antes
+        desta função — a ordem dos pedidos e a escolha da máquina já são fixas.
 
-    Atualiza daily_starts in-place com o início confirmado.
+    Parâmetro daily_starts: array numpy (N_DIAS, 2) modificado in-place.
+      Coluna 0 = total de inícios no dia | Coluna 1 = inícios de chinesas no dia.
     Retorna o horário de início ajustado (pode ser igual ao original).
     """
     day = int(start // 24)
-    while True:
-        ds        = daily_starts.get(day)
-        total_ok  = (lim_total  is None) or (ds is None) or (ds.get('total',  0) < lim_total)
-        chines_ok = (not is_chines) or (lim_chines is None) or (ds is None) or (ds.get('chines', 0) < lim_chines)
+    while day < _DS_MAX_DIAS:
+        total_ok  = (lim_total  is None) or (daily_starts[day, 0] < lim_total)
+        chines_ok = (not is_chines) or (lim_chines is None) or (daily_starts[day, 1] < lim_chines)
         if total_ok and chines_ok:
             break
         day  += 1
         start = float(day * 24)
-    ds = daily_starts.setdefault(day, {'chines': 0, 'total': 0})
-    ds['total'] += 1
-    if is_chines:
-        ds['chines'] += 1
+    if day < _DS_MAX_DIAS:
+        daily_starts[day, 0] += 1
+        if is_chines:
+            daily_starts[day, 1] += 1
     return start
 
 
@@ -819,8 +838,8 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
     """
     filas        = (filas_iniciais.copy() if filas_iniciais is not None
                     else np.zeros(num_machines, dtype=np.float64))
-    daily_starts = ({k: dict(v) for k, v in daily_starts_ini.items()}
-                    if daily_starts_ini else {})
+    daily_starts = (daily_starts_ini.copy()
+                    if daily_starts_ini is not None else _ds_novo())
     lim_chines   = limites.get('chines') if limites else None
     lim_total    = limites.get('total')  if limites else None
     tem_limite   = (lim_chines is not None) or (lim_total is not None)
@@ -879,8 +898,8 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    daily_starts    = ({k: dict(v) for k, v in daily_starts_ini.items()}
-                       if daily_starts_ini else {})
+    daily_starts    = (daily_starts_ini.copy()
+                       if daily_starts_ini is not None else _ds_novo())
     lim_chines      = limites.get('chines') if limites else None
     lim_total       = limites.get('total')  if limites else None
     tem_limite      = (lim_chines is not None) or (lim_total is not None)
@@ -963,8 +982,8 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    daily_starts    = ({k: dict(v) for k, v in daily_starts_ini.items()}
-                       if daily_starts_ini else {})
+    daily_starts    = (daily_starts_ini.copy()
+                       if daily_starts_ini is not None else _ds_novo())
     lim_chines      = limites.get('chines') if limites else None
     lim_total       = limites.get('total')  if limites else None
     tem_limite      = (lim_chines is not None) or (lim_total is not None)
@@ -1559,8 +1578,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
     limites/chines_mask/daily_starts_ini: limites diários de inícios de máquinas.
     """
     filas        = np.zeros(num_machines, dtype=np.float64)
-    daily_starts = ({k: dict(v) for k, v in daily_starts_ini.items()}
-                    if daily_starts_ini else {})
+    daily_starts = (daily_starts_ini.copy()
+                    if daily_starts_ini is not None else _ds_novo())
     lim_chines   = limites.get('chines') if limites else None
     lim_total    = limites.get('total')  if limites else None
     tem_limite   = (lim_chines is not None) or (lim_total is not None)
@@ -2652,7 +2671,7 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
     fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
 
     filas_atual          = np.zeros(num_machines, dtype=np.float64)
-    daily_starts_atual   = {}   # estado acumulado de inícios por dia — propagado entre blocos
+    daily_starts_atual   = _ds_novo()   # estado acumulado de inícios por dia — propagado entre blocos
     ordenados_total      = []
     choices_total        = []
     decisao_partes       = []
