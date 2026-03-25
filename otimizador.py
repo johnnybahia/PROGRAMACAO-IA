@@ -1938,9 +1938,9 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         key=lambda r: (r.get('dt_inicio') or datetime.min, r.get('dt_termino') or datetime.min)
     )
 
-    cab   = ['Início', 'Término', 'Referência', 'Produto', 'Cor',
+    cab   = ['Início', 'Referência', 'Produto', 'Cor',
              'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
-             'Data Entrega', 'Prazo']
+             'Término', 'Data Entrega', 'Prazo']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, CONFIG['ABA_RELATORIO'], cols=ncols)
 
@@ -2001,10 +2001,10 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                 maquinas  = math.ceil(n_slots / 2) if e_chines else n_slots
                 b.write([
                     dt_ini_b.strftime('%d/%m/%Y %H:%M'),
-                    dt_ter_b.strftime('%d/%m/%Y %H:%M'),
                     r['referencia'], r.get('produto', ''), r.get('cor', ''),
                     r.get('cliente', ''), r.get('ordem_compra', ''),
                     nome_modelo, maquinas,
+                    dt_ter_b.strftime('%d/%m/%Y %H:%M'),
                     entrega_s, r.get('prazo_str', ''),
                 ], bg=bg)
                 linha_cor += 1
@@ -2014,11 +2014,11 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
             termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino') else ''
             maquinas  = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
             b.write([
-                inicio_s, termino_s,
+                inicio_s,
                 r['referencia'], r.get('produto', ''), r.get('cor', ''),
                 r.get('cliente', ''), r.get('ordem_compra', ''),
                 nome_modelo, maquinas,
-                entrega_s, r.get('prazo_str', ''),
+                termino_s, entrega_s, r.get('prazo_str', ''),
             ], bg=bg)
             linha_cor += 1
 
