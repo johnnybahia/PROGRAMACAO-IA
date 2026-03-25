@@ -389,99 +389,6 @@ def ler_data_base(spreadsheet) -> date:
     return d
 
 
-def ler_limites_diarios(spreadsheet) -> dict:
-    """
-    Lê limites diários de inícios de máquinas da aba DADOS1.
-      N1 → máximo de inícios de máquinas chinesas por dia
-      O1 → máximo de inícios totais de máquinas por dia (todos os modelos)
-
-    Retorna {'chines': int|None, 'total': int|None}.
-    None = sem limite (comportamento padrão).
-    """
-    try:
-        ws  = spreadsheet.worksheet('DADOS1')
-        n1  = ws.acell('N1').value or ''
-        o1  = ws.acell('O1').value or ''
-        def _parse(v):
-            try:
-                return int(float(v.replace(',', '.'))) if v.strip() else None
-            except (ValueError, AttributeError):
-                return None
-        lim_chines = _parse(n1)
-        lim_total  = _parse(o1)
-        if lim_chines is not None or lim_total is not None:
-            print(f'  ✔ Limites diários — chinesas: {lim_chines}/dia, total: {lim_total}/dia')
-        else:
-            print('  ℹ DADOS1 encontrado mas N1/O1 vazios — sem limite diário.')
-        return {'chines': lim_chines, 'total': lim_total}
-    except gspread.WorksheetNotFound:
-        print('  ℹ Aba "DADOS1" não encontrada — sem limite diário de máquinas.')
-        return {'chines': None, 'total': None}
-
-
-def _build_chines_mask(num_machines: int, ridx_map: dict, modelos: dict) -> np.ndarray:
-    """
-    Retorna array booleano de tamanho num_machines onde True indica que o
-    índice global corresponde a uma máquina do modelo chinês (48 fusos).
-    Calculado uma única vez e reutilizado em todas as simulações.
-    """
-    mask = np.zeros(num_machines, dtype=bool)
-    for gidx, (aba, _) in ridx_map.items():
-        if _e_modelo_chines_48(modelos[aba]['nome_modelo']):
-            mask[gidx] = True
-    return mask
-
-
-# Horizonte máximo de planejamento em dias.
-# Array numpy pré-alocado (N_DIAS, 2): coluna 0 = total inícios, coluna 1 = inícios chinesas.
-# Usar numpy em vez de dict Python reduz o tempo de cópia no loop do SA em ~100×.
-_DS_MAX_DIAS = 2000
-
-
-def _ds_novo() -> np.ndarray:
-    """Cria um array de daily_starts zerado (2000 dias × 2 contadores)."""
-    return np.zeros((_DS_MAX_DIAS, 2), dtype=np.int32)
-
-
-def _aplicar_limite_diario(start: float, is_chines: bool,
-                            daily_starts: np.ndarray,
-                            lim_chines, lim_total) -> float:
-    """
-    Dado um horário de início proposto (em horas virtuais), retorna o horário
-    de início real após respeitar os limites diários de inícios de máquinas.
-
-    Comportamento de "preencher ao máximo":
-      O algoritmo greedy processa pedidos em ordem EDD e tenta sempre iniciar
-      no dia mais cedo possível. Isso garante naturalmente que cada dia é
-      preenchido até o limite ANTES de avançar para o dia seguinte — sem
-      nenhuma lógica extra de "empacotamento".
-
-    Regras:
-      - Máximo lim_chines inícios de máquinas chinesas por dia calendário.
-      - Máximo lim_total  inícios totais (todos os modelos) por dia calendário.
-      - Se o dia corrente está cheio, empurra para o INÍCIO do próximo dia (× 24 h).
-      - Restrições EDD e maquina_especial/min_start já foram aplicadas antes
-        desta função — a ordem dos pedidos e a escolha da máquina já são fixas.
-
-    Parâmetro daily_starts: array numpy (N_DIAS, 2) modificado in-place.
-      Coluna 0 = total de inícios no dia | Coluna 1 = inícios de chinesas no dia.
-    Retorna o horário de início ajustado (pode ser igual ao original).
-    """
-    day = int(start // 24)
-    while day < _DS_MAX_DIAS:
-        total_ok  = (lim_total  is None) or (daily_starts[day, 0] < lim_total)
-        chines_ok = (not is_chines) or (lim_chines is None) or (daily_starts[day, 1] < lim_chines)
-        if total_ok and chines_ok:
-            break
-        day  += 1
-        start = float(day * 24)
-    if day < _DS_MAX_DIAS:
-        daily_starts[day, 0] += 1
-        if is_chines:
-            daily_starts[day, 1] += 1
-    return start
-
-
 def ler_datas_bloqueadas(spreadsheet) -> set:
     """Lê as datas bloqueadas da aba 'DATAS FORA DE PROGRAMAÇÃO'."""
     bloqueadas = set()
@@ -820,8 +727,7 @@ def _chave_pedido(p: dict, ref_data: dict) -> str:
 
 # ── SIMULAÇÃO (núcleo quente) ────────────────────────────────────────────────
 def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
-                     filas_iniciais=None,
-                     limites=None, chines_mask=None, daily_starts_ini=None) -> float:
+                     filas_iniciais=None) -> float:
     """
     Simula tempo total de produção respeitando min_start e maquina_especial de cada pedido.
     Usa arrays pré-computados (_gidxs/_tempos) quando disponíveis — assim a restrição
@@ -831,19 +737,10 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
     filas_iniciais: estado inicial das máquinas (numpy array). Quando fornecido, as
     máquinas partem do estado deixado pelo grupo/bloco anterior — usado na otimização
     rolling-horizon por bloco de prazo. None = começa do zero (comportamento padrão).
-
-    limites: dict {'chines': int|None, 'total': int|None} com máx. inícios por dia.
-    chines_mask: array bool (num_machines,) — True se a máquina é do modelo chinês.
-    daily_starts_ini: estado inicial de inícios por dia (herdado do bloco anterior).
     """
-    filas        = (filas_iniciais.copy() if filas_iniciais is not None
-                    else np.zeros(num_machines, dtype=np.float64))
-    daily_starts = (daily_starts_ini.copy()
-                    if daily_starts_ini is not None else _ds_novo())
-    lim_chines   = limites.get('chines') if limites else None
-    lim_total    = limites.get('total')  if limites else None
-    tem_limite   = (lim_chines is not None) or (lim_total is not None)
-    maior        = 0.0
+    filas = (filas_iniciais.copy() if filas_iniciais is not None
+             else np.zeros(num_machines, dtype=np.float64))
+    maior = 0.0
     for p in pedidos:
         gidxs = p.get('_gidxs')
         if gidxs is None:
@@ -858,13 +755,7 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
             available = np.maximum(filas[gidxs], min_s)
             ft   = available + tempos
             best = int(np.argmin(ft))
-            if tem_limite:
-                start    = float(max(filas[gidxs[best]], min_s))
-                is_ch    = bool(chines_mask[gidxs[best]]) if chines_mask is not None else False
-                start    = _aplicar_limite_diario(start, is_ch, daily_starts, lim_chines, lim_total)
-                fim      = start + float(tempos[best])
-            else:
-                fim = float(ft[best])
+            fim  = float(ft[best])
             filas[gidxs[best]] = fim
             if fim > maior:
                 maior = fim
@@ -874,9 +765,7 @@ def simular_termino(pedidos: list, ref_data: dict, num_machines: int,
 # ── SIMULAÇÃO COM GRAVAÇÃO / REPRODUÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────
 def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
                             choices: list | None = None,
-                            filas_iniciais=None,
-                            limites=None, chines_mask=None,
-                            daily_starts_ini=None) -> tuple:
+                            filas_iniciais=None) -> tuple:
     """
     Versão do simulador que grava OU reproduz quais máquinas foram atribuídas.
 
@@ -889,20 +778,14 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
 
     filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
 
-    limites: dict {'chines': int|None, 'total': int|None} com máx. inícios por dia.
-    chines_mask: array bool (num_machines,) — True se a máquina é do modelo chinês.
-    daily_starts_ini: estado inicial de inícios por dia (herdado do bloco anterior).
+    Retorna ((total_tardiness, makespan), choices_feitas, filas_finais) — a terceira
+    posição contém o numpy array com o estado das máquinas ao fim da simulação,
+    necessário para encadear blocos de prazo na otimização rolling-horizon.
 
-    Retorna ((total_tardiness, makespan), choices_feitas, filas_finais, daily_starts_finais).
     Thread-safe: todos os estados são locais.
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    daily_starts    = (daily_starts_ini.copy()
-                       if daily_starts_ini is not None else _ds_novo())
-    lim_chines      = limites.get('chines') if limites else None
-    lim_total       = limites.get('total')  if limites else None
-    tem_limite      = (lim_chines is not None) or (lim_total is not None)
     maior           = 0.0
     total_tardiness = 0.0
     choices_feitas  = []
@@ -930,13 +813,7 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
                 k = int(np.argmin(ft))       # greedy
             choices_feitas.append(k)
             ptr += 1
-            if tem_limite:
-                start = float(max(filas[gidxs[k]], min_s))
-                is_ch = bool(chines_mask[gidxs[k]]) if chines_mask is not None else False
-                start = _aplicar_limite_diario(start, is_ch, daily_starts, lim_chines, lim_total)
-                fim   = start + float(tempos[k])
-            else:
-                fim = float(ft[k])
+            fim = float(ft[k])
             filas[gidxs[k]] = fim
             if fim > maior:
                 maior = fim
@@ -954,13 +831,12 @@ def simular_com_atribuicao(pedidos: list, ref_data: dict, num_machines: int,
             urgencia = 1.0 + dias_ja_atrasado
             total_tardiness += urgencia * tardiness
 
-    return (total_tardiness, maior), choices_feitas, filas, daily_starts
+    return (total_tardiness, maior), choices_feitas, filas
 
 
 # ── CUSTO LEXICOGRÁFICO: (tardiness, makespan) ───────────────────────────────
 def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
-                   filas_iniciais=None,
-                   limites=None, chines_mask=None, daily_starts_ini=None) -> tuple:
+                   filas_iniciais=None) -> tuple:
     """
     Retorna (total_tardiness, makespan) — objetivo lexicográfico.
 
@@ -976,17 +852,9 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
     Thread-safe (cria 'filas' local).
 
     filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
-    limites: dict {'chines': int|None, 'total': int|None} com máx. inícios por dia.
-    chines_mask: array bool (num_machines,) — True se a máquina é do modelo chinês.
-    daily_starts_ini: estado inicial de inícios por dia (herdado do bloco anterior).
     """
     filas           = (filas_iniciais.copy() if filas_iniciais is not None
                        else np.zeros(num_machines, dtype=np.float64))
-    daily_starts    = (daily_starts_ini.copy()
-                       if daily_starts_ini is not None else _ds_novo())
-    lim_chines      = limites.get('chines') if limites else None
-    lim_total       = limites.get('total')  if limites else None
-    tem_limite      = (lim_chines is not None) or (lim_total is not None)
     maior           = 0.0
     total_tardiness = 0.0
     for p in pedidos:
@@ -1004,13 +872,7 @@ def simular_custo(pedidos: list, ref_data: dict, num_machines: int,
             available = np.maximum(filas[gidxs], min_s)
             ft   = available + tempos
             best = int(np.argmin(ft))
-            if tem_limite:
-                start = float(max(filas[gidxs[best]], min_s))
-                is_ch = bool(chines_mask[gidxs[best]]) if chines_mask is not None else False
-                start = _aplicar_limite_diario(start, is_ch, daily_starts, lim_chines, lim_total)
-                fim   = start + float(tempos[best])
-            else:
-                fim = float(ft[best])
+            fim  = float(ft[best])
             filas[gidxs[best]] = fim
             if fim > maior:
                 maior = fim
@@ -1061,8 +923,7 @@ def _sort_by_edd(pedidos: list) -> list:
 
 
 def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
-                      filas_iniciais=None, livre=False,
-                      limites=None, chines_mask=None, daily_starts_ini=None) -> list:
+                      filas_iniciais=None, livre=False) -> list:
     """Cria as estratégias como closures sobre modelos e ref_data."""
 
     def _mc_iter(n):
@@ -1160,9 +1021,8 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
         ]
         current = min(candidatos_ini,
                       key=lambda o: simular_custo(o, ref_data, num_machines,
-                                                  filas_iniciais, limites, chines_mask, daily_starts_ini))
-        current_t = simular_custo(current, ref_data, num_machines, filas_iniciais,
-                                  limites, chines_mask, daily_starts_ini)
+                                                  filas_iniciais))
+        current_t = simular_custo(current, ref_data, num_machines, filas_iniciais)
         best, best_t = list(current), current_t
 
         # Duas temperaturas: uma para tardiness (prioridade), outra para makespan (desempate).
@@ -1189,8 +1049,7 @@ def make_estrategias(modelos: dict, ref_data: dict, num_machines: int,
                     continue
             neighbor = list(current)
             neighbor[a], neighbor[b] = neighbor[b], neighbor[a]
-            neighbor_t  = simular_custo(neighbor, ref_data, num_machines, filas_iniciais,
-                                        limites, chines_mask, daily_starts_ini)
+            neighbor_t  = simular_custo(neighbor, ref_data, num_machines, filas_iniciais)
             n_tard, n_make = neighbor_t
             c_tard, c_make = current_t
             # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
@@ -1333,8 +1192,7 @@ def gerar_combinacoes(num_grupos: int, num_estrategias: int) -> list:
 
 # ── 2-OPT LOCAL SEARCH ────────────────────────────────────────────────────────
 def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
-                      filas_iniciais=None, livre=False,
-                      limites=None, chines_mask=None, daily_starts_ini=None):
+                      filas_iniciais=None, livre=False):
     """
     Refinamento por busca local 2-opt.
 
@@ -1354,11 +1212,10 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
     n = len(ordenados)
     if n < 2:
         return list(ordenados), simular_custo(ordenados, ref_data, num_machines,
-                                              filas_iniciais, limites, chines_mask, daily_starts_ini)
+                                              filas_iniciais)
 
     melhor   = list(ordenados)
-    melhor_t = simular_custo(melhor, ref_data, num_machines, filas_iniciais,
-                              limites, chines_mask, daily_starts_ini)
+    melhor_t = simular_custo(melhor, ref_data, num_machines, filas_iniciais)
     max_n    = CONFIG['2OPT_MAX_N']
 
     for _ in range(CONFIG['2OPT_PASSES']):
@@ -1380,8 +1237,7 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
                     continue
             cand      = list(melhor)
             cand[a], cand[b] = cand[b], cand[a]
-            t = simular_custo(cand, ref_data, num_machines, filas_iniciais,
-                              limites, chines_mask, daily_starts_ini)
+            t = simular_custo(cand, ref_data, num_machines, filas_iniciais)
             if t < melhor_t:
                 melhor, melhor_t = cand, t
                 melhorou = True
@@ -1393,8 +1249,7 @@ def busca_local_2opt(ordenados: list, ref_data: dict, num_machines: int,
 
 # ── SA DE ENCAIXES — OTIMIZAÇÃO DE ATRIBUIÇÃO DE MÁQUINAS ────────────────────
 def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
-                 filas_iniciais=None,
-                 limites=None, chines_mask=None, daily_starts_ini=None) -> list:
+                 filas_iniciais=None) -> list:
     """
     Simulated Annealing sobre ATRIBUIÇÃO DE MÁQUINAS para ordem EDD fixa.
 
@@ -1425,9 +1280,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
     menor custo encontrado, pronta para ser usada em otimizar_distribuicao.
     """
     # Semente greedy
-    current_t, current_choices, _, _ = simular_com_atribuicao(
-        pedidos, ref_data, num_machines, filas_iniciais=filas_iniciais,
-        limites=limites, chines_mask=chines_mask, daily_starts_ini=daily_starts_ini)
+    current_t, current_choices, _ = simular_com_atribuicao(
+        pedidos, ref_data, num_machines, filas_iniciais=filas_iniciais)
     best_t      = current_t
     best_choices = list(current_choices)
 
@@ -1457,10 +1311,8 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
         # O módulo em simular_com_atribuicao garante que o índice é válido.
         neighbor[idx] = current_choices[idx] + random.randint(1, max(1, num_machines - 1))
 
-        neighbor_t, _, _, _ = simular_com_atribuicao(
-            pedidos, ref_data, num_machines, neighbor,
-            filas_iniciais=filas_iniciais,
-            limites=limites, chines_mask=chines_mask, daily_starts_ini=daily_starts_ini)
+        neighbor_t, _, _ = simular_com_atribuicao(pedidos, ref_data, num_machines, neighbor,
+                                                    filas_iniciais=filas_iniciais)
         n_tard, n_make = neighbor_t
         c_tard, c_make = current_t
         # Aceitação lexicográfica: tardiness é objetivo primário, makespan é desempate.
@@ -1485,8 +1337,7 @@ def sa_encaixes(pedidos: list, ref_data: dict, num_machines: int,
 
 # ── ESCOLHA DA MELHOR ESTRATÉGIA (EDD estrito + SA intra-prazo) ───────────────
 def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
-                                filas_iniciais=None, livre=False,
-                                limites=None, chines_mask=None, daily_starts_ini=None):
+                                filas_iniciais=None, livre=False):
     """
     livre=False (padrão): EDD estrito entre pedidos de prazos diferentes.
     livre=True  (blocos): SA livre para reordenar qualquer pedido dentro do bloco
@@ -1494,25 +1345,21 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
                           garantida pelo rolling-horizon.
 
     filas_iniciais: estado inicial das máquinas para otimização rolling-horizon.
-    limites/chines_mask/daily_starts_ini: limites diários de inícios de máquinas.
     """
     estrategias = make_estrategias(modelos, ref_data, num_machines, filas_iniciais,
-                                   livre=livre, limites=limites, chines_mask=chines_mask,
-                                   daily_starts_ini=daily_starts_ini)
+                                   livre=livre)
     idx_edd = next(i for i, e in enumerate(estrategias) if e['id'] == 'edd')
     idx_sa  = next(i for i, e in enumerate(estrategias) if e['id'] == 'sa')
 
     # EDD puro — base sempre respeitada
     print('  Calculando ordenação EDD base...')
     ordenados_edd = estrategias[idx_edd]['fn'](pedidos)
-    t_edd         = simular_custo(ordenados_edd, ref_data, num_machines, filas_iniciais,
-                                  limites, chines_mask, daily_starts_ini)
+    t_edd         = simular_custo(ordenados_edd, ref_data, num_machines, filas_iniciais)
 
     # SA — otimiza DENTRO de grupos de mesmo prazo (nunca troca pedidos de datas diferentes)
     print('  Refinando com SA dentro dos grupos de mesmo prazo...')
     ordenados_sa = estrategias[idx_sa]['fn'](pedidos)
-    t_sa         = simular_custo(ordenados_sa, ref_data, num_machines, filas_iniciais,
-                                 limites, chines_mask, daily_starts_ini)
+    t_sa         = simular_custo(ordenados_sa, ref_data, num_machines, filas_iniciais)
 
     # Decisão: SA só ganha se melhorar o custo lexicográfico
     if t_sa < t_edd:
@@ -1534,8 +1381,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
     ranking = []
     for est in estrategias:
         ord_ = est['fn'](pedidos)
-        t_   = simular_custo(ord_, ref_data, num_machines, filas_iniciais,
-                             limites, chines_mask, daily_starts_ini)
+        t_   = simular_custo(ord_, ref_data, num_machines, filas_iniciais)
         diff = _round(t_[1] - tempo_final[1])
         perc = _round(((t_[1] - tempo_final[1]) / tempo_final[1]) * 100) if tempo_final[1] > 0 else 0
         ranking.append({**est, 'terminoTotal': t_, 'terminoHoras': _round(t_[1]),
@@ -1564,8 +1410,7 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
 # ── OTIMIZAR DISTRIBUIÇÃO ────────────────────────────────────────────────────
 def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map,
                            data_base: date, datas_bloqueadas: set,
-                           choices: list | None = None,
-                           limites=None, chines_mask=None, daily_starts_ini=None):
+                           choices: list | None = None):
     """
     Distribui pedidos nas máquinas e gera o resultado final.
 
@@ -1574,15 +1419,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
       Cada inteiro é o índice (dentro do gidxs local do pedido) da máquina
       escolhida para aquele slot — exatamente o mesmo mecanismo do simulador.
       None → comportamento greedy original.
-
-    limites/chines_mask/daily_starts_ini: limites diários de inícios de máquinas.
     """
     filas        = np.zeros(num_machines, dtype=np.float64)
-    daily_starts = (daily_starts_ini.copy()
-                    if daily_starts_ini is not None else _ds_novo())
-    lim_chines   = limites.get('chines') if limites else None
-    lim_total    = limites.get('total')  if limites else None
-    tem_limite   = (lim_chines is not None) or (lim_total is not None)
     resultado    = []
     sem_cadastro = []
     choice_ptr   = 0   # ponteiro na lista de choices do SA
@@ -1628,12 +1466,9 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             else:
                 best = int(np.argmin(ft))
             choice_ptr += 1
-            inicio = float(max(filas[gidxs[best]], min_s))
-            if tem_limite:
-                is_ch  = bool(chines_mask[gidxs[best]]) if chines_mask is not None else False
-                inicio = _aplicar_limite_diario(inicio, is_ch, daily_starts, lim_chines, lim_total)
-            fim = inicio + float(tempos[best])
+            fim   = float(ft[best])
             aba, _li = aba_idx[best]
+            inicio = float(max(filas[gidxs[best]], min_s))
             filas[gidxs[best]] = fim
 
             if aba not in por_modelo:
@@ -2639,8 +2474,7 @@ def _inserir_em_fila(fila: list, idx_atual: int, dia: int, pedidos_novos: list):
 
 
 # ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
-def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
-                        limites=None, chines_mask=None):
+def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     """
     Otimização rolling-horizon: agrupa pedidos por dia de vencimento e aplica
     toda a capacidade de análise (EDD/SA + 2-opt + SA encaixes) a cada bloco
@@ -2651,10 +2485,6 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
         restrição dura, não apenas peso na função de custo.
       • Cada bloco é menor → mais iterações SA/2-opt por pedido.
       • O "tetris" dentro de cada bloco é mais apertado.
-
-    limites/chines_mask: limites diários de inícios de máquinas. O estado de
-    inícios acumulados (daily_starts_atual) é propagado entre blocos da mesma
-    forma que filas_atual — garante que o limite do dia é respeitado globalmente.
 
     Retorna (ordenados_total, choices_total, melhor_global).
     'choices_total' é a concatenação dos choices de todos os blocos e pode
@@ -2670,14 +2500,13 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
                  for b in agrupar_por_dia_vencimento(pedidos)]
     fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
 
-    filas_atual          = np.zeros(num_machines, dtype=np.float64)
-    daily_starts_atual   = _ds_novo()   # estado acumulado de inícios por dia — propagado entre blocos
-    ordenados_total      = []
-    choices_total        = []
-    decisao_partes       = []
-    blocos_info          = []   # para estrategiasPorGrupo no resultado
-    tard_total           = 0.0
-    idx                  = 0    # índice corrente (fila pode crescer durante o loop)
+    filas_atual     = np.zeros(num_machines, dtype=np.float64)
+    ordenados_total = []
+    choices_total   = []
+    decisao_partes  = []
+    blocos_info     = []   # para estrategiasPorGrupo no resultado
+    tard_total      = 0.0
+    idx             = 0    # índice corrente (fila pode crescer durante o loop)
 
     while idx < len(fila):
         bloco  = fila[idx]
@@ -2720,8 +2549,6 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
             ped_b, modelos, grupos_b, ref_data, num_machines,
             filas_iniciais=filas_atual,
             livre=True,
-            limites=limites, chines_mask=chines_mask,
-            daily_starts_ini=daily_starts_atual,
         )
 
         # ── 2-opt dentro do bloco ──────────────────────────────────────────
@@ -2729,8 +2556,6 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
             livre=True,
-            limites=limites, chines_mask=chines_mask,
-            daily_starts_ini=daily_starts_atual,
         )
         if t_2opt < melhor_b['terminoTotal']:
             ganho = _round(((melhor_b['terminoTotal'][1] - t_2opt[1])
@@ -2743,32 +2568,24 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines,
         choices_sa = sa_encaixes(
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
-            limites=limites, chines_mask=chines_mask,
-            daily_starts_ini=daily_starts_atual,
         )
-        t_enc, _, filas_enc, ds_enc = simular_com_atribuicao(
+        t_enc, _,  filas_enc = simular_com_atribuicao(
             melhor_b['ordenados'], ref_data, num_machines,
             choices_sa, filas_iniciais=filas_atual,
-            limites=limites, chines_mask=chines_mask,
-            daily_starts_ini=daily_starts_atual,
         )
-        t_grd, choices_grd, filas_grd, ds_grd = simular_com_atribuicao(
+        t_grd, choices_grd, filas_grd = simular_com_atribuicao(
             melhor_b['ordenados'], ref_data, num_machines,
             filas_iniciais=filas_atual,
-            limites=limites, chines_mask=chines_mask,
-            daily_starts_ini=daily_starts_atual,
         )
 
         if t_enc < t_grd:
-            choices_bloco      = choices_sa
-            filas_atual        = filas_enc
-            daily_starts_atual = ds_enc
-            tard_total        += t_enc[0]
+            choices_bloco = choices_sa
+            filas_atual   = filas_enc
+            tard_total   += t_enc[0]
         else:
-            choices_bloco      = choices_grd
-            filas_atual        = filas_grd
-            daily_starts_atual = ds_grd
-            tard_total        += t_grd[0]
+            choices_bloco = choices_grd
+            filas_atual   = filas_grd
+            tard_total   += t_grd[0]
 
         ordenados_total.extend(melhor_b['ordenados'])
         choices_total.extend(choices_bloco)
@@ -2859,13 +2676,6 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
-    # Limites diários de inícios de máquinas (DADOS1: N1=chinesas, O1=total)
-    limites      = ler_limites_diarios(spreadsheet)
-    chines_mask  = _build_chines_mask(num_machines, ridx_map, modelos)
-    n_ch = int(chines_mask.sum())
-    if n_ch:
-        print(f'  ✔ {n_ch} máquina(s) chinesa(s) identificada(s).')
-
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
     print(f'  {len(blocos_info)} bloco(s): '
@@ -2876,21 +2686,18 @@ def main():
               for b in blocos_info
           ))
     ordenados_total, choices_total, melhor = otimizar_em_blocos(
-        pedidos, modelos, ref_data, num_machines,
-        limites=limites, chines_mask=chines_mask)
+        pedidos, modelos, ref_data, num_machines)
     print(f'  ✔ {melhor["decisao"]}')
 
     print('7/8 Gerando distribuição final...')
     resultado, sem_cadastro = otimizar_distribuicao(
         ordenados_total, modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas, choices=choices_total,
-        limites=limites, chines_mask=chines_mask,
+        data_base, datas_bloqueadas, choices=choices_total
     )
     # ranking informativo (apenas EDD global para comparação)
     grupos  = agrupar_por_prioridade(pedidos)
     _, ranking = escolher_melhor_estrategia(
-        pedidos, modelos, grupos, ref_data, num_machines,
-        limites=limites, chines_mask=chines_mask)
+        pedidos, modelos, grupos, ref_data, num_machines)
     sugestoes = calcular_sugestoes(modelos)
     print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
 
