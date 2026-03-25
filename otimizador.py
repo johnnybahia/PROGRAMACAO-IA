@@ -3029,17 +3029,39 @@ def main():
     if limite_h_zona > 0:
         estado_salvo = ler_estado_planejamento(spreadsheet, data_base, limite_h_zona)
         if estado_salvo:
-            frozen_linhas_set      = estado_salvo['frozen_linhas']
-            filas_iniciais_glob    = estado_salvo['filas']
-            frozen_intervals_glob  = estado_salvo['frozen_intervals'] or None
-            resultado_congelado    = estado_salvo['resultado_congelado']
+            linhas_atuais = {p['linha_sheet'] for p in pedidos_orig}
+
+            # ── Reconciliação: remove pedidos apagados da aba PEDIDO ──────────
+            frozen_linhas_set     = estado_salvo['frozen_linhas'] & linhas_atuais
+            deletados             = estado_salvo['frozen_linhas'] - linhas_atuais
+            resultado_congelado   = [r for r in estado_salvo['resultado_congelado']
+                                     if r['linha_sheet'] in frozen_linhas_set]
+
+            if deletados:
+                print(f'  ⚠ {len(deletados)} pedido(s) congelado(s) apagado(s) da aba PEDIDO '
+                      f'— espaço liberado e pedidos abaixo serão reorganizados.')
+                # Recalcula filas e intervalos SEM os pedidos deletados
+                # (feito após precomputar_maquinas, mais abaixo — sinaliza com None)
+                filas_iniciais_glob   = None
+                frozen_intervals_glob = None
+                _recalcular_filas_frozen = True
+            else:
+                filas_iniciais_glob   = estado_salvo['filas']
+                frozen_intervals_glob = estado_salvo['frozen_intervals'] or None
+                _recalcular_filas_frozen = False
+
             for r in resultado_congelado:
                 r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
                 r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
             pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
             print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
                   f'{len(pedidos)} a otimizar.'
-                  + (' [Tetris ativo]' if frozen_intervals_glob else ''))
+                  + (' [Tetris ativo]' if frozen_intervals_glob else '')
+                  + (' [filas serão recalculadas]' if _recalcular_filas_frozen else ''))
+        else:
+            _recalcular_filas_frozen = False
+    else:
+        _recalcular_filas_frozen = False
 
     print('4/8 Lendo modelos de máquinas...')
     modelos = ler_modelos(spreadsheet)
@@ -3060,6 +3082,16 @@ def main():
 
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
+
+    # ── Recalcula filas/intervalos quando pedidos congelados foram deletados ──
+    if _recalcular_filas_frozen and frozen_linhas_set:
+        pedidos_frozen_remanescentes = [p for p in pedidos_orig
+                                        if p['linha_sheet'] in frozen_linhas_set]
+        preparar_restricoes_pedidos(pedidos_frozen_remanescentes, ref_data, modelos)
+        filas_iniciais_glob, frozen_intervals_glob = _calcular_filas_congeladas(
+            pedidos_frozen_remanescentes, ref_data, num_machines)
+        print(f'  ✔ Filas e intervalos recalculados com {len(pedidos_frozen_remanescentes)} '
+              f'pedido(s) congelado(s) remanescentes.')
 
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
