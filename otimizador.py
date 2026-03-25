@@ -1479,10 +1479,12 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                     'slots':          0,
                     'inicio':         inicio,
                     'termino':        fim,
+                    'slot_times':     [],
                 }
             por_modelo[aba]['slots']   += 1
             por_modelo[aba]['termino']  = max(por_modelo[aba]['termino'], fim)
             por_modelo[aba]['inicio']   = min(por_modelo[aba]['inicio'],  inicio)
+            por_modelo[aba]['slot_times'].append((inicio, fim))
 
         for aba, aloc in por_modelo.items():
             dt_inicio  = horas_para_data(data_base, aloc['inicio'],  datas_bloqueadas)
@@ -1508,6 +1510,7 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                 'tempo_producao':    aloc['tempo_producao'],
                 'inicio_horas':      _round(aloc['inicio']),
                 'termino_horas':     _round(aloc['termino']),
+                'slot_times':        aloc['slot_times'],
                 'dt_inicio':         dt_inicio,
                 'dt_termino':        dt_termino,
                 'data_entrega':      data_entrega,
@@ -1927,7 +1930,8 @@ def _e_modelo_chines_48(nome_modelo: str) -> bool:
     return '48' in n and 'fuso' in n and 'chin' in n
 
 
-def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
+def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
+                     data_base=None, datas_bloqueadas=None):
     """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
     ordenado = sorted(
         resultado,
@@ -1960,37 +1964,69 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict):
     b.freeze(5)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
-    for i, r in enumerate(ordenado):
+    linha_cor  = 0   # contador separado para alternar cores entre linhas escritas
+
+    for r in ordenado:
         pd = r.get('prazo_delta')
         if pd is not None and pd < 0:
-            bg = '#FFCDD2'   # atrasado
+            bg = '#FFCDD2'
         elif pd == 0:
-            bg = '#FFF9C4'   # no limite
+            bg = '#FFF9C4'
         elif pd is not None and pd > 0:
-            bg = '#C8E6C9'   # antecipado
+            bg = '#C8E6C9'
         else:
-            bg = cores_base[i % 2]
+            bg = cores_base[linha_cor % 2]
 
-        inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M')  if r.get('dt_inicio')   else ''
-        termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino')  else ''
-        entrega_s = r['data_entrega'].strftime('%d/%m/%Y')      if r.get('data_entrega') else ''
+        entrega_s    = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
+        nome_modelo  = r.get('nome_modelo', '')
+        e_chines     = _e_modelo_chines_48(nome_modelo)
+        slot_times   = r.get('slot_times') or []
 
-        maquinas = r['maquinas_alocadas']
-        if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
+        # Agrupa slots por horário de início — cada grupo vira uma linha separada
+        # para que o operador saiba QUANDO montar cada lote de máquinas.
+        if slot_times and data_base is not None and datas_bloqueadas is not None:
+            grupos = {}
+            for ini, fim in slot_times:
+                key = round(ini, 6)
+                if key not in grupos:
+                    grupos[key] = {'ini_real': ini, 'fins': []}
+                grupos[key]['fins'].append(fim)
 
-        b.write([
-            inicio_s, termino_s,
-            r['referencia'], r.get('produto', ''), r.get('cor', ''),
-            r.get('cliente', ''), r.get('ordem_compra', ''),
-            r['nome_modelo'], maquinas,
-            entrega_s, r.get('prazo_str', ''),
-        ], bg=bg)
+            for key in sorted(grupos):
+                g         = grupos[key]
+                n_slots   = len(g['fins'])
+                termino_h = max(g['fins'])
+                dt_ini_b  = horas_para_data(data_base, g['ini_real'], datas_bloqueadas)
+                dt_ter_b  = horas_para_data(data_base, termino_h,     datas_bloqueadas)
+                maquinas  = math.ceil(n_slots / 2) if e_chines else n_slots
+                b.write([
+                    dt_ini_b.strftime('%d/%m/%Y %H:%M'),
+                    dt_ter_b.strftime('%d/%m/%Y %H:%M'),
+                    r['referencia'], r.get('produto', ''), r.get('cor', ''),
+                    r.get('cliente', ''), r.get('ordem_compra', ''),
+                    nome_modelo, maquinas,
+                    entrega_s, r.get('prazo_str', ''),
+                ], bg=bg)
+                linha_cor += 1
+        else:
+            # fallback sem slot_times (não deve ocorrer em uso normal)
+            inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M') if r.get('dt_inicio')  else ''
+            termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino') else ''
+            maquinas  = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
+            b.write([
+                inicio_s, termino_s,
+                r['referencia'], r.get('produto', ''), r.get('cor', ''),
+                r.get('cliente', ''), r.get('ordem_compra', ''),
+                nome_modelo, maquinas,
+                entrega_s, r.get('prazo_str', ''),
+            ], bg=bg)
+            linha_cor += 1
 
     b.flush()
 
 
-def salvar_relatorio_montagem(spreadsheet, resultado: list):
+def salvar_relatorio_montagem(spreadsheet, resultado: list,
+                              data_base=None, datas_bloqueadas=None):
     """Cria aba RELATORIO MONTAGEM para uso dos montadores na produção."""
     ordenado = sorted(
         resultado,
@@ -2008,28 +2044,47 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list):
     b.freeze(3)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
-    for i, r in enumerate(ordenado):
-        bg = cores_base[i % 2]
+    linha_cor  = 0
 
-        # Data de início como valor de data puro (para permitir filtro por data)
-        dt_inicio = r.get('dt_inicio')
-        if dt_inicio:
-            inicio_val = dt_inicio.strftime('%d/%m/%Y')
+    for r in ordenado:
+        bg          = cores_base[linha_cor % 2]
+        nome_modelo = r.get('nome_modelo', '')
+        e_chines    = _e_modelo_chines_48(nome_modelo)
+        slot_times  = r.get('slot_times') or []
+
+        if slot_times and data_base is not None and datas_bloqueadas is not None:
+            grupos = {}
+            for ini, fim in slot_times:
+                key = round(ini, 6)
+                if key not in grupos:
+                    grupos[key] = {'ini_real': ini, 'fins': []}
+                grupos[key]['fins'].append(fim)
+
+            for key in sorted(grupos):
+                g        = grupos[key]
+                n_slots  = len(g['fins'])
+                maquinas = math.ceil(n_slots / 2) if e_chines else n_slots
+                dt_ini_b = horas_para_data(data_base, g['ini_real'], datas_bloqueadas)
+                b.write([
+                    dt_ini_b.strftime('%d/%m/%Y'),
+                    maquinas,
+                    nome_modelo,
+                    r.get('produto', ''),
+                    r.get('cliente', ''),
+                    r.get('ordem_compra', ''),
+                ], bg=bg)
+                linha_cor += 1
         else:
-            inicio_val = ''
-
-        maquinas = r['maquinas_alocadas']
-        if _e_modelo_chines_48(r.get('nome_modelo', '')):
-            maquinas = math.ceil(maquinas / 2)
-
-        b.write([
-            inicio_val,
-            maquinas,
-            r.get('nome_modelo', ''),
-            r.get('produto', ''),
-            r.get('cliente', ''),
-            r.get('ordem_compra', ''),
-        ], bg=bg)
+            dt_inicio = r.get('dt_inicio')
+            inicio_val = dt_inicio.strftime('%d/%m/%Y') if dt_inicio else ''
+            maquinas = r['maquinas_alocadas']
+            if e_chines:
+                maquinas = math.ceil(maquinas / 2)
+            b.write([
+                inicio_val, maquinas, nome_modelo,
+                r.get('produto', ''), r.get('cliente', ''), r.get('ordem_compra', ''),
+            ], bg=bg)
+            linha_cor += 1
 
     b.flush()
 
@@ -2706,8 +2761,10 @@ def main():
     salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos),
                        pedidos=pedidos, modelos=modelos, resultado=resultado,
                        data_base=data_base)
-    salvar_relatorio(spreadsheet, resultado, melhor)
-    salvar_relatorio_montagem(spreadsheet, resultado)
+    salvar_relatorio(spreadsheet, resultado, melhor,
+                     data_base=data_base, datas_bloqueadas=datas_bloqueadas)
+    salvar_relatorio_montagem(spreadsheet, resultado,
+                              data_base=data_base, datas_bloqueadas=datas_bloqueadas)
     escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
 
     tempo_total = time.time() - t0
