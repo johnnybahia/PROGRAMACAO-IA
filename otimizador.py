@@ -377,6 +377,186 @@ def _semana_id(data_entrega) -> int | None:
     return int(iso[0]) * 100 + int(iso[1])
 
 
+# ── ZONA CONGELADA ────────────────────────────────────────────────────────────
+_ABA_ESTADO = 'ESTADO_PLANEJAMENTO'
+
+_RESULTADO_COLS = [
+    'referencia', 'produto', 'cor', 'cliente', 'ordem_compra',
+    'nome_modelo', 'aba', 'maquinas_alocadas', 'tempo_producao',
+    'inicio_horas', 'termino_horas', 'data_entrega_str',
+    'prazo_str', 'prazo_delta', 'linha_sheet', 'slot_times_json',
+]
+
+
+def ler_dias_congelados(spreadsheet) -> int:
+    """Lê quantos dias devem ser congelados da célula N1 da aba DADOS1."""
+    try:
+        ws  = spreadsheet.worksheet('DADOS1')
+        val = (ws.acell('N1').value or '').strip()
+        return max(0, int(float(val.replace(',', '.')))) if val else 0
+    except Exception:
+        return 0
+
+
+def ler_estado_planejamento(spreadsheet, data_base: date, dias_congelados: int):
+    """
+    Lê o estado salvo da zona congelada.
+
+    Retorna dict com:
+      'filas'               — numpy array com estado das máquinas ao fim da zona
+      'frozen_linhas'       — set de linha_sheet congelados
+      'resultado_congelado' — lista de dicts do resultado (sem dt_inicio/dt_termino)
+    ou None se o estado não existe ou está desatualizado.
+    """
+    import json as _json
+    try:
+        ws   = spreadsheet.worksheet(_ABA_ESTADO)
+        rows = ws.get_all_values()
+    except gspread.WorksheetNotFound:
+        return None
+
+    if len(rows) < 3:
+        return None
+
+    # Linha 0: [data_base_str, dias_congelados, fila0, fila1, ...]
+    meta = rows[0]
+    if len(meta) < 3:
+        return None
+    try:
+        saved_db   = parse_data(meta[0])
+        saved_dias = int(float(meta[1]))
+    except (ValueError, TypeError):
+        return None
+
+    if saved_db != data_base or saved_dias != dias_congelados:
+        print('  ℹ Zona congelada desatualizada (data_base ou dias mudaram) — recalculando tudo.')
+        return None
+
+    try:
+        filas = np.array([float(v) for v in meta[2:] if v != ''], dtype=np.float64)
+    except ValueError:
+        return None
+
+    # Linha 1: ['LINHAS', linha_sheet0, linha_sheet1, ...]
+    linhas_row = rows[1]
+    if not linhas_row or linhas_row[0] != 'LINHAS':
+        return None
+    try:
+        frozen_linhas = [int(v) for v in linhas_row[1:] if v != '']
+    except ValueError:
+        return None
+
+    # Linhas 2+: resultado (linha 2 = headers, linhas 3+ = dados)
+    resultado_congelado = []
+    if len(rows) >= 4:
+        for row in rows[3:]:
+            if not any(row):
+                continue
+            if len(row) < len(_RESULTADO_COLS):
+                row = row + [''] * (len(_RESULTADO_COLS) - len(row))
+            r = dict(zip(_RESULTADO_COLS, row))
+            try:
+                r['maquinas_alocadas'] = int(float(r['maquinas_alocadas']))
+                r['tempo_producao']    = float(r['tempo_producao'])
+                r['inicio_horas']      = float(r['inicio_horas'])
+                r['termino_horas']     = float(r['termino_horas'])
+                r['prazo_delta']       = (int(float(r['prazo_delta']))
+                                          if r.get('prazo_delta') not in ('', None) else None)
+                r['linha_sheet']       = int(float(r['linha_sheet']))
+                r['data_entrega']      = parse_data(r.get('data_entrega_str', ''))
+                st_raw                 = r.get('slot_times_json') or '[]'
+                r['slot_times']        = [tuple(x) for x in _json.loads(st_raw)]
+            except (ValueError, TypeError, KeyError):
+                pass
+            resultado_congelado.append(r)
+
+    return {
+        'filas':               filas,
+        'frozen_linhas':       set(frozen_linhas),
+        'resultado_congelado': resultado_congelado,
+    }
+
+
+def salvar_estado_planejamento(spreadsheet, data_base: date, dias_congelados: int,
+                                filas_frozen: np.ndarray, resultado_congelado: list,
+                                frozen_linhas_ordered: list):
+    """Persiste o estado da zona congelada na aba ESTADO_PLANEJAMENTO."""
+    import json as _json
+    try:
+        try:
+            ws = spreadsheet.worksheet(_ABA_ESTADO)
+            ws.clear()
+        except gspread.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(_ABA_ESTADO, rows=5000, cols=220)
+
+        rows_out = []
+
+        # Linha 0: metadata + filas
+        rows_out.append(
+            [data_base.strftime('%d/%m/%Y'), str(dias_congelados)]
+            + [str(round(float(f), 6)) for f in filas_frozen]
+        )
+
+        # Linha 1: linhas congeladas em ordem de processamento
+        rows_out.append(['LINHAS'] + [str(ln) for ln in frozen_linhas_ordered])
+
+        # Linha 2: cabeçalhos
+        rows_out.append(_RESULTADO_COLS)
+
+        # Linhas 3+: resultado congelado
+        for r in resultado_congelado:
+            de  = r.get('data_entrega')
+            rows_out.append([
+                r.get('referencia', ''),
+                r.get('produto', ''),
+                r.get('cor', ''),
+                r.get('cliente', ''),
+                r.get('ordem_compra', ''),
+                r.get('nome_modelo', ''),
+                r.get('aba', ''),
+                str(r.get('maquinas_alocadas', 0)),
+                str(r.get('tempo_producao', 0)),
+                str(r.get('inicio_horas', 0)),
+                str(r.get('termino_horas', 0)),
+                de.strftime('%d/%m/%Y') if de else '',
+                r.get('prazo_str', ''),
+                str(r.get('prazo_delta', '')),
+                str(r.get('linha_sheet', '')),
+                _json.dumps(r.get('slot_times') or []),
+            ])
+
+        ws.update(rows_out, value_input_option='RAW')
+        print(f'  ✔ Estado congelado salvo ({len(resultado_congelado)} alocações, {dias_congelados} dias).')
+    except Exception:
+        print('\n  ⚠ Não foi possível salvar ESTADO_PLANEJAMENTO:')
+        traceback.print_exc()
+
+
+def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
+                                num_machines: int) -> np.ndarray:
+    """
+    Re-simula (greedy) apenas os pedidos congelados para obter o estado
+    das máquinas ao fim da zona congelada.
+    """
+    filas = np.zeros(num_machines, dtype=np.float64)
+    for p in pedidos_frozen:
+        gidxs = p.get('_gidxs')
+        if gidxs is None:
+            d = ref_data.get(_chave_pedido(p, ref_data))
+            if d is None:
+                continue
+            gidxs, tempos = d['gidxs'], d['tempos']
+        else:
+            tempos = p['_tempos']
+        min_s = float(p.get('min_start', 0.0))
+        for _ in range(p['maquinas_necessarias']):
+            available        = np.maximum(filas[gidxs], min_s)
+            ft               = available + tempos
+            best             = int(np.argmin(ft))
+            filas[gidxs[best]] = float(ft[best])
+    return filas
+
+
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
 def ler_data_base(spreadsheet) -> date:
     """Lê a data base de início (célula M1) da aba PEDIDO."""
@@ -1410,7 +1590,8 @@ def escolher_melhor_estrategia(pedidos, modelos, grupos, ref_data, num_machines,
 # ── OTIMIZAR DISTRIBUIÇÃO ────────────────────────────────────────────────────
 def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ridx_map,
                            data_base: date, datas_bloqueadas: set,
-                           choices: list | None = None):
+                           choices: list | None = None,
+                           filas_iniciais=None):
     """
     Distribui pedidos nas máquinas e gera o resultado final.
 
@@ -1419,8 +1600,12 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
       Cada inteiro é o índice (dentro do gidxs local do pedido) da máquina
       escolhida para aquele slot — exatamente o mesmo mecanismo do simulador.
       None → comportamento greedy original.
+
+    filas_iniciais: estado das máquinas herdado da zona congelada.
+      None → começa do zero (comportamento padrão).
     """
-    filas        = np.zeros(num_machines, dtype=np.float64)
+    filas        = (filas_iniciais.copy() if filas_iniciais is not None
+                    else np.zeros(num_machines, dtype=np.float64))
     resultado    = []
     sem_cadastro = []
     choice_ptr   = 0   # ponteiro na lista de choices do SA
@@ -2704,12 +2889,34 @@ def main():
     datas_bloqueadas = ler_datas_bloqueadas(spreadsheet)
     print(f'  ✔ Data base: {data_base.strftime("%d/%m/%Y")}')
 
-    print('3/8 Lendo pedidos...')
-    pedidos = ler_pedidos(spreadsheet, data_base, datas_bloqueadas)
+    print('3/8 Lendo pedidos e zona congelada...')
+    pedidos          = ler_pedidos(spreadsheet, data_base, datas_bloqueadas)
+    dias_congelados  = ler_dias_congelados(spreadsheet)
     if not pedidos:
         print('❌ Nenhum pedido encontrado na aba PEDIDO.')
         sys.exit(1)
-    print(f'  ✔ {len(pedidos)} pedidos.')
+    print(f'  ✔ {len(pedidos)} pedidos | zona congelada: {dias_congelados} dia(s).')
+
+    # ── Carregar estado congelado (se existir e for válido) ───────────────────
+    estado_salvo        = None
+    resultado_congelado = []
+    filas_iniciais_glob = None
+    frozen_linhas_set   = set()
+
+    if dias_congelados > 0:
+        estado_salvo = ler_estado_planejamento(spreadsheet, data_base, dias_congelados)
+        if estado_salvo:
+            frozen_linhas_set   = estado_salvo['frozen_linhas']
+            filas_iniciais_glob = estado_salvo['filas']
+            resultado_congelado = estado_salvo['resultado_congelado']
+            # Reconstrói dt_inicio / dt_termino (dependem de data_base e datas_bloqueadas)
+            for r in resultado_congelado:
+                r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
+                r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
+            pedidos_orig = pedidos
+            pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
+            print(f'  ✔ Zona congelada: {len(frozen_linhas_set)} pedido(s) preservados, '
+                  f'{len(pedidos)} pedido(s) a otimizar.')
 
     print('4/8 Lendo modelos de máquinas...')
     modelos = ler_modelos(spreadsheet)
@@ -2745,21 +2952,64 @@ def main():
     print(f'  ✔ {melhor["decisao"]}')
 
     print('7/8 Gerando distribuição final...')
-    resultado, sem_cadastro = otimizar_distribuicao(
+    resultado_novos, sem_cadastro = otimizar_distribuicao(
         ordenados_total, modelos, ref_data, num_machines, ridx_map,
-        data_base, datas_bloqueadas, choices=choices_total
+        data_base, datas_bloqueadas, choices=choices_total,
+        filas_iniciais=filas_iniciais_glob,
     )
+
+    # Mescla resultado congelado (inalterado) com novos pedidos otimizados
+    resultado = resultado_congelado + resultado_novos
+
+    # ── Atualizar zona congelada ──────────────────────────────────────────────
+    if dias_congelados > 0:
+        from collections import defaultdict as _dd
+        limite_h = dias_congelados * 24.0
+
+        # Pedido é congelado se seu início mais cedo ficar dentro da zona
+        min_ini = _dd(lambda: float('inf'))
+        for r in resultado:
+            min_ini[r['linha_sheet']] = min(min_ini[r['linha_sheet']],
+                                            r.get('inicio_horas', float('inf')))
+        frozen_linhas_new = {ln for ln, ini in min_ini.items() if ini < limite_h}
+
+        # Pedidos congelados em ordem de otimização (para re-simulação consistente)
+        todos_pedidos = (pedidos_orig if estado_salvo else pedidos)
+        pedidos_frozen_ord = [p for p in ordenados_total
+                              if p['linha_sheet'] in frozen_linhas_new]
+        # Inclui pedidos que já estavam congelados e não foram re-otimizados
+        linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
+        for p in todos_pedidos:
+            if (p['linha_sheet'] in frozen_linhas_new
+                    and p['linha_sheet'] not in linhas_ja_na_lista):
+                pedidos_frozen_ord.append(p)
+                linhas_ja_na_lista.add(p['linha_sheet'])
+
+        preparar_restricoes_pedidos(pedidos_frozen_ord, ref_data, modelos)
+        filas_frozen = _calcular_filas_congeladas(pedidos_frozen_ord, ref_data, num_machines)
+
+        resultado_para_salvar = [r for r in resultado
+                                  if r['linha_sheet'] in frozen_linhas_new]
+        frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
+
+        salvar_estado_planejamento(
+            spreadsheet, data_base, dias_congelados,
+            filas_frozen, resultado_para_salvar, frozen_linhas_ordered,
+        )
+
     # ranking informativo (apenas EDD global para comparação)
-    grupos  = agrupar_por_prioridade(pedidos)
+    pedidos_para_ranking = pedidos_orig if estado_salvo else pedidos
+    grupos  = agrupar_por_prioridade(pedidos_para_ranking)
     _, ranking = escolher_melhor_estrategia(
-        pedidos, modelos, grupos, ref_data, num_machines)
+        pedidos_para_ranking, modelos, grupos, ref_data, num_machines)
     sugestoes = calcular_sugestoes(modelos)
-    print(f'  ✔ {len(resultado)} alocações, {len(sem_cadastro)} sem cadastro, {len(sugestoes)} sugestões.')
+    print(f'  ✔ {len(resultado)} alocações ({len(resultado_congelado)} congeladas + '
+          f'{len(resultado_novos)} novas), {len(sem_cadastro)} sem cadastro.')
 
     print('8/8 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
-    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos), len(modelos),
-                       pedidos=pedidos, modelos=modelos, resultado=resultado,
+    salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos_para_ranking), len(modelos),
+                       pedidos=pedidos_para_ranking, modelos=modelos, resultado=resultado,
                        data_base=data_base)
     salvar_relatorio(spreadsheet, resultado, melhor,
                      data_base=data_base, datas_bloqueadas=datas_bloqueadas)
