@@ -2228,11 +2228,6 @@ def _e_modelo_chines_48(nome_modelo: str) -> bool:
 def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                      data_base=None, datas_bloqueadas=None):
     """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
-    ordenado = sorted(
-        resultado,
-        key=lambda r: (r.get('dt_inicio') or datetime.min, r.get('dt_termino') or datetime.min)
-    )
-
     cab   = ['Início', 'Referência', 'Produto', 'Cor',
              'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
              'Término', 'Data Entrega', 'Prazo']
@@ -2242,7 +2237,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
     hoje  = date.today().strftime('%d/%m/%Y')
 
     # Aviso de ajuste para máquinas chinesas (aparece antes do cabeçalho)
-    tem_chines = any(_e_modelo_chines_48(r.get('nome_modelo', '')) for r in ordenado)
+    tem_chines = any(_e_modelo_chines_48(r.get('nome_modelo', '')) for r in resultado)
     if tem_chines:
         b.banner(
             '⚠ ATENÇÃO: Máquinas chinesas ajustada a quantidade para Espula grande '
@@ -2259,23 +2254,21 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
     b.freeze(5)
 
     cores_base = ['#FFFFFF', '#F5F5F5']
-    linha_cor  = 0   # contador separado para alternar cores entre linhas escritas
+    # Épica do Google Sheets: dias desde 30/12/1899
+    _GS_EPOCH  = datetime(1899, 12, 30)
 
-    for r in ordenado:
-        pd = r.get('prazo_delta')
-        if pd is not None and pd < 0:
-            bg = '#FFCDD2'
-        elif pd == 0:
-            bg = '#FFF9C4'
-        elif pd is not None and pd > 0:
-            bg = '#C8E6C9'
-        else:
-            bg = cores_base[linha_cor % 2]
+    def _gs_serial(dt):
+        return (dt - _GS_EPOCH).total_seconds() / 86400
 
-        entrega_s    = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
-        nome_modelo  = r.get('nome_modelo', '')
-        e_chines     = _e_modelo_chines_48(nome_modelo)
-        slot_times   = r.get('slot_times') or []
+    # ── Coleta todas as linhas expandidas antes de escrever ──────────────────
+    # Isso garante ordenação global por Início, independente da ordem do resultado.
+    all_rows = []  # list of {'dt_ini_b': datetime, 'prazo_delta': ..., 'values': [...]}
+
+    for r in resultado:
+        entrega_s   = r['data_entrega'].strftime('%d/%m/%Y') if r.get('data_entrega') else ''
+        nome_modelo = r.get('nome_modelo', '')
+        e_chines    = _e_modelo_chines_48(nome_modelo)
+        slot_times  = r.get('slot_times') or []
 
         # Agrupa slots por horário de início — cada grupo vira uma linha separada
         # para que o operador saiba QUANDO montar cada lote de máquinas.
@@ -2294,28 +2287,73 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                 dt_ini_b  = horas_para_data(data_base, g['ini_real'], datas_bloqueadas)
                 dt_ter_b  = horas_para_data(data_base, termino_h,     datas_bloqueadas)
                 maquinas  = math.ceil(n_slots / 2) if e_chines else n_slots
-                b.write([
-                    dt_ini_b.strftime('%d/%m/%Y %H:%M'),
+                all_rows.append({
+                    'dt_ini_b':    dt_ini_b,
+                    'prazo_delta': r.get('prazo_delta'),
+                    'values': [
+                        _gs_serial(dt_ini_b),
+                        r['referencia'], r.get('produto', ''), r.get('cor', ''),
+                        r.get('cliente', ''), r.get('ordem_compra', ''),
+                        nome_modelo, maquinas,
+                        _gs_serial(dt_ter_b),
+                        entrega_s, r.get('prazo_str', ''),
+                    ],
+                })
+        else:
+            # fallback sem slot_times (não deve ocorrer em uso normal)
+            dt_ini_b = r.get('dt_inicio') or datetime.min
+            dt_ter_b = r.get('dt_termino') or datetime.min
+            maquinas = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
+            ini_val  = _gs_serial(dt_ini_b) if dt_ini_b != datetime.min else ''
+            ter_val  = _gs_serial(dt_ter_b) if dt_ter_b != datetime.min else ''
+            all_rows.append({
+                'dt_ini_b':    dt_ini_b,
+                'prazo_delta': r.get('prazo_delta'),
+                'values': [
+                    ini_val,
                     r['referencia'], r.get('produto', ''), r.get('cor', ''),
                     r.get('cliente', ''), r.get('ordem_compra', ''),
                     nome_modelo, maquinas,
-                    dt_ter_b.strftime('%d/%m/%Y %H:%M'),
-                    entrega_s, r.get('prazo_str', ''),
-                ], bg=bg)
-                linha_cor += 1
+                    ter_val, entrega_s, r.get('prazo_str', ''),
+                ],
+            })
+
+    # ordena globalmente por data de início — resolve a coluna Início fora de ordem
+    all_rows.sort(key=lambda x: x['dt_ini_b'])
+
+    # ── Escreve todas as linhas já ordenadas ─────────────────────────────────
+    data_start = b.row
+    for linha_cor, row_data in enumerate(all_rows):
+        pd = row_data['prazo_delta']
+        if pd is not None and pd < 0:
+            bg = '#FFCDD2'
+        elif pd == 0:
+            bg = '#FFF9C4'
+        elif pd is not None and pd > 0:
+            bg = '#C8E6C9'
         else:
-            # fallback sem slot_times (não deve ocorrer em uso normal)
-            inicio_s  = r['dt_inicio'].strftime('%d/%m/%Y %H:%M') if r.get('dt_inicio')  else ''
-            termino_s = r['dt_termino'].strftime('%d/%m/%Y %H:%M') if r.get('dt_termino') else ''
-            maquinas  = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
-            b.write([
-                inicio_s,
-                r['referencia'], r.get('produto', ''), r.get('cor', ''),
-                r.get('cliente', ''), r.get('ordem_compra', ''),
-                nome_modelo, maquinas,
-                termino_s, entrega_s, r.get('prazo_str', ''),
-            ], bg=bg)
-            linha_cor += 1
+            bg = cores_base[linha_cor % 2]
+        b.write(row_data['values'], bg=bg)
+
+    # Aplica formato de data/hora nas colunas Início (col 1) e Término (col 9)
+    # para que o Sheets reconheça como data e permita filtros/ordenação.
+    data_end = b.row
+    if data_end > data_start:
+        dt_fmt = {'type': 'DATE_TIME', 'pattern': 'dd/mm/yyyy hh:mm'}
+        for col0 in (0, 8):   # col 1 (Início) e col 9 (Término), índice 0-based
+            b.formats.append({
+                'repeatCell': {
+                    'range': {
+                        'sheetId':          b._sid,
+                        'startRowIndex':    data_start - 1,
+                        'endRowIndex':      data_end - 1,
+                        'startColumnIndex': col0,
+                        'endColumnIndex':   col0 + 1,
+                    },
+                    'cell':   {'userEnteredFormat': {'numberFormat': dt_fmt}},
+                    'fields': 'userEnteredFormat.numberFormat',
+                }
+            })
 
     b.flush()
 
