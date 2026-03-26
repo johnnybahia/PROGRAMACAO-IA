@@ -1812,6 +1812,11 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                 'prazo_str':         prazo_str,
                 'prazo_delta':       prazo_delta,
                 'linha_sheet':       linha_sheet,
+                # campos de restrição — usados para coluna "Restrições" no RELATORIO
+                'data_especial':     pedido.get('data_especial'),
+                'maquina_especial':  pedido.get('maquina_especial') or '',
+                'min_start':         min_s,
+                'congelado':         False,
             })
 
     return resultado, sem_cadastro
@@ -2230,7 +2235,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
     """Cria aba RELATORIO com pedidos ordenados por data de início, para impressão."""
     cab   = ['Início', 'Referência', 'Produto', 'Cor',
              'Cliente', 'Ordem de Compra', 'Modelo', 'Máquinas',
-             'Término', 'Data Entrega', 'Prazo']
+             'Término', 'Data Entrega', 'Prazo', 'Restrições']
     ncols = len(cab)
     b     = SheetBuilder(spreadsheet, CONFIG['ABA_RELATORIO'], cols=ncols)
 
@@ -2260,6 +2265,23 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
     def _gs_serial(dt):
         return (dt - _GS_EPOCH).total_seconds() / 86400
 
+    def _montar_restricoes(r: dict) -> str:
+        """Monta texto explicativo das restrições que afetaram o posicionamento do pedido."""
+        partes = []
+        if r.get('congelado'):
+            partes.append('CONGELADO — posição preservada da execucao anterior')
+        if r.get('maquina_especial'):
+            partes.append(f'Maquina restrita: {r["maquina_especial"]}')
+        data_esp = r.get('data_especial')
+        if data_esp:
+            partes.append(f'Inicio nao antes de {data_esp.strftime("%d/%m/%Y")} (col A)')
+        pd = r.get('prazo_delta')
+        if pd is not None and pd < 0:
+            partes.append(f'ATRASADO {abs(pd)} dia(s) em relacao a entrega')
+        if not partes:
+            partes.append('Ordem otimizada por prazo de entrega (EDD/SA)')
+        return ' | '.join(partes)
+
     # ── Coleta todas as linhas expandidas antes de escrever ──────────────────
     # Isso garante ordenação global por Início, independente da ordem do resultado.
     all_rows = []  # list of {'dt_ini_b': datetime, 'prazo_delta': ..., 'values': [...]}
@@ -2280,6 +2302,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                     grupos[key] = {'ini_real': ini, 'fins': []}
                 grupos[key]['fins'].append(fim)
 
+            restricoes = _montar_restricoes(r)
             for key in sorted(grupos):
                 g         = grupos[key]
                 n_slots   = len(g['fins'])
@@ -2296,16 +2319,17 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                         r.get('cliente', ''), r.get('ordem_compra', ''),
                         nome_modelo, maquinas,
                         _gs_serial(dt_ter_b),
-                        entrega_s, r.get('prazo_str', ''),
+                        entrega_s, r.get('prazo_str', ''), restricoes,
                     ],
                 })
         else:
             # fallback sem slot_times (não deve ocorrer em uso normal)
-            dt_ini_b = r.get('dt_inicio') or datetime.min
-            dt_ter_b = r.get('dt_termino') or datetime.min
-            maquinas = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
-            ini_val  = _gs_serial(dt_ini_b) if dt_ini_b != datetime.min else ''
-            ter_val  = _gs_serial(dt_ter_b) if dt_ter_b != datetime.min else ''
+            dt_ini_b   = r.get('dt_inicio') or datetime.min
+            dt_ter_b   = r.get('dt_termino') or datetime.min
+            maquinas   = math.ceil(r['maquinas_alocadas'] / 2) if e_chines else r['maquinas_alocadas']
+            ini_val    = _gs_serial(dt_ini_b) if dt_ini_b != datetime.min else ''
+            ter_val    = _gs_serial(dt_ter_b) if dt_ter_b != datetime.min else ''
+            restricoes = _montar_restricoes(r)
             all_rows.append({
                 'dt_ini_b':    dt_ini_b,
                 'prazo_delta': r.get('prazo_delta'),
@@ -2314,7 +2338,7 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
                     r['referencia'], r.get('produto', ''), r.get('cor', ''),
                     r.get('cliente', ''), r.get('ordem_compra', ''),
                     nome_modelo, maquinas,
-                    ter_val, entrega_s, r.get('prazo_str', ''),
+                    ter_val, entrega_s, r.get('prazo_str', ''), restricoes,
                 ],
             })
 
@@ -3091,6 +3115,7 @@ def main():
             for r in resultado_congelado:
                 r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
                 r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
+                r['congelado']  = True
             pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
             print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
                   f'{len(pedidos)} a otimizar.'
