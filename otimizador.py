@@ -297,7 +297,9 @@ def parse_data(s):
     s = str(s).strip()
     if not s:
         return None
-    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%y', '%Y/%m/%d'):
+    for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M',
+                '%d/%m/%Y', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M',
+                '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%y', '%Y/%m/%d'):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
