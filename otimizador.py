@@ -766,10 +766,15 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             'data_entrega':         data_entrega,
             'deadline_horas':       deadline_horas,
             '_semana':              _semana_id(data_entrega),
-            'data_especial':        data_esp,
-            'min_start':            min_start,
-            'maquina_especial':     maquina_especial,
-            'prioridade':           1,          # mantido para compatibilidade interna
+            'data_especial':          data_esp,
+            'data_entrega_especial':  data_ent_especial,   # col L — None se não preenchida
+            'min_start':              min_start,
+            'maquina_especial':       maquina_especial,
+            # Hierarquia de prioridade (maior = atendido primeiro):
+            #   3 = máquina especial definida (col B) — ocupa a máquina certa antes
+            #   2 = data de início especial definida (col A) — reserva slot a partir da data
+            #   1 = padrão — otimizado por prazo de entrega (EDD/SA)
+            'prioridade': (3 if maquina_especial else 2 if data_esp else 1),
         })
 
     return pedidos
@@ -879,8 +884,14 @@ def agrupar_por_dia_vencimento(pedidos: list) -> list:
             bucket = ms_day if ms_day > 0 else 'vencido'
         else:
             dl_day = int(dl // 24)         # 0 = vence hoje, 1 = amanhã, …
-            # usa o bloco mais tardio entre prazo e min_start
-            bucket = max(dl_day, ms_day)
+            if ms_day > 0:
+                # data de início especial definida: prioriza o bucket do min_start
+                # para que o pedido ocupe as máquinas a partir dessa data antes
+                # que outros pedidos (sem restrição de início) as tomem.
+                # O prazo ainda é respeitado pelo custo da otimização.
+                bucket = ms_day
+            else:
+                bucket = dl_day
 
         mapa.setdefault(bucket, []).append(p)
 
@@ -1831,10 +1842,11 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                 'prazo_delta':       prazo_delta,
                 'linha_sheet':       linha_sheet,
                 # campos de restrição — usados para coluna "Restrições" no RELATORIO
-                'data_especial':     pedido.get('data_especial'),
-                'maquina_especial':  pedido.get('maquina_especial') or '',
-                'min_start':         min_s,
-                'congelado':         False,
+                'data_especial':         pedido.get('data_especial'),
+                'data_entrega_especial': pedido.get('data_entrega_especial'),
+                'maquina_especial':      pedido.get('maquina_especial') or '',
+                'min_start':             min_s,
+                'congelado':             False,
             })
 
     return resultado, sem_cadastro
@@ -2287,12 +2299,15 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         """Monta texto explicativo das restrições que afetaram o posicionamento do pedido."""
         partes = []
         if r.get('congelado'):
-            partes.append('CONGELADO — posição preservada da execucao anterior')
+            partes.append('CONGELADO — posicao preservada da execucao anterior')
         if r.get('maquina_especial'):
             partes.append(f'Maquina restrita: {r["maquina_especial"]}')
         data_esp = r.get('data_especial')
         if data_esp:
             partes.append(f'Inicio nao antes de {data_esp.strftime("%d/%m/%Y")} (col A)')
+        ent_esp = r.get('data_entrega_especial')
+        if ent_esp:
+            partes.append(f'Prazo especial (col L): {ent_esp.strftime("%d/%m/%Y")} — usado como nova data de entrega')
         pd = r.get('prazo_delta')
         if pd is not None and pd < 0:
             partes.append(f'ATRASADO {abs(pd)} dia(s) em relacao a entrega')
@@ -2970,56 +2985,71 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
             idx += 1
             continue
 
-        # ── Escolher melhor ordenação dentro do bloco ──────────────────────
-        grupos_b = agrupar_por_prioridade(ped_b)
-        # livre=True: SA e 2-opt podem reordenar qualquer pedido dentro do bloco.
-        # A prioridade entre blocos já está garantida pelo rolling-horizon.
-        # Dentro do bloco o único objetivo é liberar máquinas mais cedo possível.
-        melhor_b, _ = escolher_melhor_estrategia(
-            ped_b, modelos, grupos_b, ref_data, num_machines,
-            filas_iniciais=filas_atual,
-            livre=True,
-        )
+        # ── Separar bloco em 3 tiers de prioridade (hard boundary) ────────
+        # Tier 3 — máquina especial (col B): ocupa a máquina certa antes de todos
+        # Tier 2 — data de início especial (col A): reserva slot a partir da data
+        # Tier 1 — sem restrição especial: otimizado por prazo de entrega (EDD/SA)
+        tier3 = [p for p in ped_b if p.get('maquina_especial')]
+        tier2 = [p for p in ped_b if not p.get('maquina_especial')
+                 and float(p.get('min_start', 0)) > 0]
+        tier1 = [p for p in ped_b if not p.get('maquina_especial')
+                 and float(p.get('min_start', 0)) <= 0]
 
-        # ── 2-opt dentro do bloco ──────────────────────────────────────────
-        ord_2opt, t_2opt = busca_local_2opt(
-            melhor_b['ordenados'], ref_data, num_machines,
-            filas_iniciais=filas_atual,
-            livre=True,
-        )
-        if t_2opt < melhor_b['terminoTotal']:
-            ganho = _round(((melhor_b['terminoTotal'][1] - t_2opt[1])
-                            / melhor_b['terminoTotal'][1]) * 100) if melhor_b['terminoTotal'][1] > 0 else 0
-            melhor_b['ordenados']    = ord_2opt
-            melhor_b['terminoTotal'] = t_2opt
-            print(f'    2-opt −{ganho}%')
+        filas_tier  = filas_atual.copy()
+        ord_bloco   = []
+        cho_bloco   = []
+        melhor_b    = None   # para blocos_info — usa o do último tier com pedidos
 
-        # ── SA encaixes dentro do bloco ────────────────────────────────────
-        choices_sa = sa_encaixes(
-            melhor_b['ordenados'], ref_data, num_machines,
-            filas_iniciais=filas_atual,
-        )
-        t_enc, _,  filas_enc = simular_com_atribuicao(
-            melhor_b['ordenados'], ref_data, num_machines,
-            choices_sa, filas_iniciais=filas_atual,
-        )
-        t_grd, choices_grd, filas_grd = simular_com_atribuicao(
-            melhor_b['ordenados'], ref_data, num_machines,
-            filas_iniciais=filas_atual,
-        )
+        for tier_ped in (tier3, tier2, tier1):
+            if not tier_ped:
+                continue
 
-        if t_enc < t_grd:
-            choices_bloco = choices_sa
-            filas_atual   = filas_enc
-            tard_total   += t_enc[0]
-        else:
-            choices_bloco = choices_grd
-            filas_atual   = filas_grd
-            tard_total   += t_grd[0]
+            grupos_t = agrupar_por_prioridade(tier_ped)
+            melhor_t, _ = escolher_melhor_estrategia(
+                tier_ped, modelos, grupos_t, ref_data, num_machines,
+                filas_iniciais=filas_tier,
+                livre=True,
+            )
 
-        ordenados_total.extend(melhor_b['ordenados'])
-        choices_total.extend(choices_bloco)
-        decisao_partes.append(f'{label}:{melhor_b["id"]}')
+            ord_2opt_t, t_2opt_t = busca_local_2opt(
+                melhor_t['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_tier,
+                livre=True,
+            )
+            if t_2opt_t < melhor_t['terminoTotal']:
+                melhor_t['ordenados']    = ord_2opt_t
+                melhor_t['terminoTotal'] = t_2opt_t
+
+            choices_sa_t = sa_encaixes(
+                melhor_t['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_tier,
+            )
+            t_enc_t, _, filas_enc_t = simular_com_atribuicao(
+                melhor_t['ordenados'], ref_data, num_machines,
+                choices_sa_t, filas_iniciais=filas_tier,
+            )
+            t_grd_t, choices_grd_t, filas_grd_t = simular_com_atribuicao(
+                melhor_t['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_tier,
+            )
+
+            if t_enc_t < t_grd_t:
+                cho_bloco.extend(choices_sa_t)
+                filas_tier  = filas_enc_t
+                tard_total += t_enc_t[0]
+            else:
+                cho_bloco.extend(choices_grd_t)
+                filas_tier  = filas_grd_t
+                tard_total += t_grd_t[0]
+
+            ord_bloco.extend(melhor_t['ordenados'])
+            melhor_b = melhor_t
+
+        filas_atual = filas_tier
+        ordenados_total.extend(ord_bloco)
+        choices_total.extend(cho_bloco)
+        tier_info = (f'T3={len(tier3)} T2={len(tier2)} T1={len(tier1)}')
+        decisao_partes.append(f'{label}:{melhor_b["id"]}({tier_info})')
         blocos_info.append({'bucket': bucket, 'nb': nb, 'est': melhor_b})
         idx += 1
 
