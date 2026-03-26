@@ -766,9 +766,10 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             'data_entrega':         data_entrega,
             'deadline_horas':       deadline_horas,
             '_semana':              _semana_id(data_entrega),
-            'data_especial':        data_esp,
-            'min_start':            min_start,
-            'maquina_especial':     maquina_especial,
+            'data_especial':          data_esp,
+            'data_entrega_especial':  data_ent_especial,   # col L — None se não preenchida
+            'min_start':              min_start,
+            'maquina_especial':       maquina_especial,
             # Hierarquia de prioridade (maior = atendido primeiro):
             #   3 = máquina especial definida (col B) — ocupa a máquina certa antes
             #   2 = data de início especial definida (col A) — reserva slot a partir da data
@@ -1841,10 +1842,11 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
                 'prazo_delta':       prazo_delta,
                 'linha_sheet':       linha_sheet,
                 # campos de restrição — usados para coluna "Restrições" no RELATORIO
-                'data_especial':     pedido.get('data_especial'),
-                'maquina_especial':  pedido.get('maquina_especial') or '',
-                'min_start':         min_s,
-                'congelado':         False,
+                'data_especial':         pedido.get('data_especial'),
+                'data_entrega_especial': pedido.get('data_entrega_especial'),
+                'maquina_especial':      pedido.get('maquina_especial') or '',
+                'min_start':             min_s,
+                'congelado':             False,
             })
 
     return resultado, sem_cadastro
@@ -2297,12 +2299,15 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         """Monta texto explicativo das restrições que afetaram o posicionamento do pedido."""
         partes = []
         if r.get('congelado'):
-            partes.append('CONGELADO — posição preservada da execucao anterior')
+            partes.append('CONGELADO — posicao preservada da execucao anterior')
         if r.get('maquina_especial'):
             partes.append(f'Maquina restrita: {r["maquina_especial"]}')
         data_esp = r.get('data_especial')
         if data_esp:
             partes.append(f'Inicio nao antes de {data_esp.strftime("%d/%m/%Y")} (col A)')
+        ent_esp = r.get('data_entrega_especial')
+        if ent_esp:
+            partes.append(f'Prazo especial (col L): {ent_esp.strftime("%d/%m/%Y")} — usado como nova data de entrega')
         pd = r.get('prazo_delta')
         if pd is not None and pd < 0:
             partes.append(f'ATRASADO {abs(pd)} dia(s) em relacao a entrega')
