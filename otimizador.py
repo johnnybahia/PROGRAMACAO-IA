@@ -67,9 +67,10 @@ CONFIG = {
     # vence o EDD. Como a comparação é por tupla, qualquer redução de atraso é suficiente.
     'LIMIAR_TROCA_PERCENT': 0,
     'ABAS_IGNORAR': {
-        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO',
-        'DATAS FORA DE PROGRAMAÇÃO',
-        'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS', 'DADOS',
+        'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO', 'RELATORIO MONTAGEM',
+        'DATAS FORA DE PROGRAMAÇÃO', 'ESTADO_PLANEJAMENTO',
+        'DADOS1', 'DADOS',
+        'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS',
     },
     # Monte Carlo / SA base: > 1000 → 50 iter | > 500 → 100 | > 200 → 200 | ≤ 200 → 500
     'MC_ITER': [(1000, 50), (500, 100), (200, 200), (0, 500)],
@@ -281,11 +282,21 @@ class SheetBuilder:
 
 
 # ── UTILITÁRIOS DE DATA ───────────────────────────────────────────────────────
-def parse_data(s: str):
-    """Parseia string de data em vários formatos. Retorna date ou None."""
-    if not s or not s.strip():
+def parse_data(s):
+    """Parseia string ou número serial de data em vários formatos. Retorna date ou None."""
+    if s is None:
         return None
-    s = s.strip()
+    # Google Sheets às vezes retorna serial numérico quando a célula é formatada como data
+    try:
+        serial = float(str(s).replace(',', '.').strip())
+        if serial > 1000:   # evita confundir números pequenos com serial
+            from datetime import timedelta
+            return (date(1899, 12, 30) + timedelta(days=int(serial)))
+    except (ValueError, TypeError):
+        pass
+    s = str(s).strip()
+    if not s:
+        return None
     for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%y', '%Y/%m/%d'):
         try:
             return datetime.strptime(s, fmt).date()
@@ -398,12 +409,17 @@ def ler_configuracao_congelamento(spreadsheet) -> tuple:
     """
     try:
         ws     = spreadsheet.worksheet('DADOS1')
-        n1_val = (ws.acell('N1').value or '').strip()
-        n2_val = (ws.acell('N2').value or '').strip()
-        dias   = max(0, int(float(n1_val.replace(',', '.')))) if n1_val else 0
-        data_l = parse_data(n2_val) if n2_val else None
+        n1_val = ws.acell('N1').value
+        n2_val = ws.acell('N2').value
+        n1_str = str(n1_val).strip() if n1_val is not None else ''
+        n2_str = str(n2_val).strip() if n2_val is not None else ''
+        dias   = max(0, int(float(n1_str.replace(',', '.')))) if n1_str else 0
+        data_l = parse_data(n2_val) if n2_val is not None and n2_str else None
+        if n2_str and data_l is None:
+            print(f'  ⚠ DADOS1!N2 = "{n2_str}" — formato não reconhecido, congelamento por data ignorado.')
         return dias, data_l
-    except Exception:
+    except Exception as e:
+        print(f'  ⚠ Erro ao ler configuração de congelamento (DADOS1): {e}')
         return 0, None
 
 
