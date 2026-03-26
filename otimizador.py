@@ -879,8 +879,14 @@ def agrupar_por_dia_vencimento(pedidos: list) -> list:
             bucket = ms_day if ms_day > 0 else 'vencido'
         else:
             dl_day = int(dl // 24)         # 0 = vence hoje, 1 = amanhã, …
-            # usa o bloco mais tardio entre prazo e min_start
-            bucket = max(dl_day, ms_day)
+            if ms_day > 0:
+                # data de início especial definida: prioriza o bucket do min_start
+                # para que o pedido ocupe as máquinas a partir dessa data antes
+                # que outros pedidos (sem restrição de início) as tomem.
+                # O prazo ainda é respeitado pelo custo da otimização.
+                bucket = ms_day
+            else:
+                bucket = dl_day
 
         mapa.setdefault(bucket, []).append(p)
 
