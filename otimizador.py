@@ -884,14 +884,7 @@ def agrupar_por_dia_vencimento(pedidos: list) -> list:
             bucket = ms_day if ms_day > 0 else 'vencido'
         else:
             dl_day = int(dl // 24)         # 0 = vence hoje, 1 = amanhã, …
-            if ms_day > 0:
-                # data de início especial definida: prioriza o bucket do min_start
-                # para que o pedido ocupe as máquinas a partir dessa data antes
-                # que outros pedidos (sem restrição de início) as tomem.
-                # O prazo ainda é respeitado pelo custo da otimização.
-                bucket = ms_day
-            else:
-                bucket = dl_day
+            bucket = dl_day                # especiais já foram removidos antes deste loop
 
         mapa.setdefault(bucket, []).append(p)
 
@@ -2921,149 +2914,166 @@ def _inserir_em_fila(fila: list, idx_atual: int, dia: int, pedidos_novos: list):
 # ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
 def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     """
-    Otimização rolling-horizon: agrupa pedidos por dia de vencimento e aplica
-    toda a capacidade de análise (EDD/SA + 2-opt + SA encaixes) a cada bloco
-    separadamente, passando o estado das máquinas para o bloco seguinte.
+    Otimização em duas fases:
 
-    Vantagens sobre a otimização global:
-      • Pedidos atrasados usam as máquinas ANTES dos pedidos futuros —
-        restrição dura, não apenas peso na função de custo.
-      • Cada bloco é menor → mais iterações SA/2-opt por pedido.
-      • O "tetris" dentro de cada bloco é mais apertado.
+    FASE ESPECIAL (fura fila — processada primeiro):
+      Fase A — col A + col B (data início + máquina específica):
+               alocados exatamente na data e máquina indicadas, antes de tudo.
+      Fase B — col A apenas (data início, qualquer máquina):
+               alocados a partir da data indicada, antes dos pedidos normais.
+      Dentro de cada fase a ordem é por min_start, depois por deadline.
+      A máquina especial (col B) só tem efeito quando col A também está preenchida.
+
+    FASE NORMAL (rolling-horizon EDD):
+      Todos os pedidos sem col A, incluindo vencidos.
+      Usa o estado das máquinas deixado pelas fases especiais como ponto de
+      partida — o algoritmo greedy preenche as lacunas naturalmente (Tetris).
+      SA + 2-opt + SA encaixes rodados por bloco de prazo.
 
     Retorna (ordenados_total, choices_total, melhor_global).
-    'choices_total' é a concatenação dos choices de todos os blocos e pode
-    ser passado diretamente a otimizar_distribuicao como a lista de encaixes.
     """
     hpd = CONFIG['HORAS_POR_DIA']
 
-    # ── Pré-simulação: blocos iniciais com restrições já no lugar certo ────────
-    # Roda simulação greedy de todos os pedidos para capturar estado das máquinas
-    # antes de cada bloco. Pedidos com maquina_especial ou min_start são realocados
-    # para o bloco onde de fato podem iniciar — antes de qualquer SA/2-opt.
-    fila_base = [{'bucket': b['bucket'], 'pedidos': list(b['pedidos'])}
-                 for b in agrupar_por_dia_vencimento(pedidos)]
-    fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
+    def _sort_especial(lst):
+        """Ordena especiais: min_start crescente, depois deadline crescente."""
+        return sorted(lst, key=lambda p: (
+            float(p.get('min_start', 0)),
+            p.get('deadline_horas') if p.get('deadline_horas') is not None else float('inf'),
+        ))
+
+    # ── Separação dos grupos ─────────────────────────────────────────────────
+    tem_start = [p for p in pedidos if float(p.get('min_start', 0)) > 0]
+    fase_a = _sort_especial([p for p in tem_start if p.get('maquina_especial')])
+    fase_b = _sort_especial([p for p in tem_start if not p.get('maquina_especial')])
+    normais = [p for p in pedidos if float(p.get('min_start', 0)) <= 0]
 
     filas_atual     = np.zeros(num_machines, dtype=np.float64)
     ordenados_total = []
     choices_total   = []
-    decisao_partes  = []
-    blocos_info     = []   # para estrategiasPorGrupo no resultado
     tard_total      = 0.0
-    idx             = 0    # índice corrente (fila pode crescer durante o loop)
+    decisao_partes  = []
+    blocos_info     = []
 
-    while idx < len(fila):
-        bloco  = fila[idx]
-        bucket = bloco['bucket']
+    n_esp = len(fase_a) + len(fase_b)
+    if n_esp:
+        print(f'  Fase especial (fura fila): {len(fase_a)} com máquina+data, '
+              f'{len(fase_b)} só data.')
 
-        # ── Realocar pedidos com restrições baseado no estado atual ─────────
-        # Após o bloco anterior rodar, máquinas podem estar ocupadas além
-        # da janela deste bloco — pedidos com maquina_especial ou min_start
-        # que não conseguem iniciar nesta janela vão para o bloco correto.
-        ped_b, diferidos = _separar_diferidos(
-            bloco['pedidos'], filas_atual, hpd, bucket)
-
-        for dia_ef, ped_dif in sorted(diferidos.items()):
-            _inserir_em_fila(fila, idx, dia_ef, ped_dif)
-
-        nb    = len(ped_b)
-        n_dif = sum(len(v) for v in diferidos.values())
-
-        if bucket == 'vencido':
-            label = 'vencidos'
-        elif bucket == 'sem_prazo':
-            label = 'sem prazo'
-        else:
-            label = f'dia +{bucket}'
-
-        dif_s = f'  ↪ {n_dif} diferido{"s" if n_dif != 1 else ""}' if n_dif else ''
-        print(f'  Bloco {idx+1}/{len(fila)}: {label}  '
-              f'({nb} pedido{"s" if nb != 1 else ""}{dif_s})')
-
-        if nb == 0:
-            idx += 1
+    # ── Fases A e B: especiais, alocadas antes dos normais ───────────────────
+    for fase_label, fase_ped in (('A(maq+data)', fase_a), ('B(data)', fase_b)):
+        if not fase_ped:
             continue
 
-        # ── Separar bloco em 3 tiers de prioridade (hard boundary) ────────
-        # Tier 3 — máquina especial (col B): ocupa a máquina certa antes de todos
-        # Tier 2 — data de início especial (col A): reserva slot a partir da data
-        # Tier 1 — sem restrição especial: otimizado por prazo de entrega (EDD/SA)
-        tier3 = [p for p in ped_b if p.get('maquina_especial')]
-        tier2 = [p for p in ped_b if not p.get('maquina_especial')
-                 and float(p.get('min_start', 0)) > 0]
-        tier1 = [p for p in ped_b if not p.get('maquina_especial')
-                 and float(p.get('min_start', 0)) <= 0]
+        # Ordem já fixada por min_start — usa greedy puro (sem SA encaixes).
+        # SA encaixes otimiza makespan global e pode sacrificar o início de um
+        # item específico para ganhar eficiência total. Para itens que "furam
+        # fila", isso é inaceitável: cada item deve pegar a primeira máquina
+        # disponível a partir do seu min_start, sem atrasos impostos pelo SA.
+        t_grd, choices_grd, filas_grd = simular_com_atribuicao(
+            fase_ped, ref_data, num_machines,
+            filas_iniciais=filas_atual)
 
-        filas_tier  = filas_atual.copy()
-        ord_bloco   = []
-        cho_bloco   = []
-        melhor_b    = None   # para blocos_info — usa o do último tier com pedidos
+        choices_total.extend(choices_grd)
+        filas_atual  = filas_grd
+        tard_total  += t_grd[0]
 
-        for tier_ped in (tier3, tier2, tier1):
-            if not tier_ped:
+        ordenados_total.extend(fase_ped)
+        decisao_partes.append(f'{fase_label}({len(fase_ped)}p)')
+        blocos_info.append({'bucket': fase_label, 'nb': len(fase_ped),
+                            'est': {'id': 'especial', 'nome': fase_label,
+                                    'terminoTotal': (0, 0), 'terminoHoras': 0}})
+
+    # ── Fase normal: rolling-horizon EDD partindo do estado das fases especiais
+    # filas_atual já reflete onde cada máquina está ocupada após as fases A+B.
+    # O greedy de cada bloco preenche as lacunas disponíveis (efeito Tetris).
+    if normais:
+        fila_base = [{'bucket': b['bucket'], 'pedidos': list(b['pedidos'])}
+                     for b in agrupar_por_dia_vencimento(normais)]
+        fila: list = _pre_simular_restritos(fila_base, num_machines, hpd)
+
+        idx = 0
+        while idx < len(fila):
+            bloco  = fila[idx]
+            bucket = bloco['bucket']
+
+            ped_b, diferidos = _separar_diferidos(
+                bloco['pedidos'], filas_atual, hpd, bucket)
+
+            for dia_ef, ped_dif in sorted(diferidos.items()):
+                _inserir_em_fila(fila, idx, dia_ef, ped_dif)
+
+            nb    = len(ped_b)
+            n_dif = sum(len(v) for v in diferidos.values())
+
+            if bucket == 'vencido':
+                label = 'vencidos'
+            elif bucket == 'sem_prazo':
+                label = 'sem prazo'
+            else:
+                label = f'dia+{bucket}'
+
+            dif_s = f'  ↪ {n_dif} diferido{"s" if n_dif != 1 else ""}' if n_dif else ''
+            print(f'  Bloco {idx+1}/{len(fila)}: {label}  '
+                  f'({nb} pedido{"s" if nb != 1 else ""}{dif_s})')
+
+            if nb == 0:
+                idx += 1
                 continue
 
-            grupos_t = agrupar_por_prioridade(tier_ped)
-            melhor_t, _ = escolher_melhor_estrategia(
-                tier_ped, modelos, grupos_t, ref_data, num_machines,
-                filas_iniciais=filas_tier,
+            grupos_b = agrupar_por_prioridade(ped_b)
+            melhor_b, _ = escolher_melhor_estrategia(
+                ped_b, modelos, grupos_b, ref_data, num_machines,
+                filas_iniciais=filas_atual,
                 livre=True,
             )
 
-            ord_2opt_t, t_2opt_t = busca_local_2opt(
-                melhor_t['ordenados'], ref_data, num_machines,
-                filas_iniciais=filas_tier,
+            ord_2opt, t_2opt = busca_local_2opt(
+                melhor_b['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_atual,
                 livre=True,
             )
-            if t_2opt_t < melhor_t['terminoTotal']:
-                melhor_t['ordenados']    = ord_2opt_t
-                melhor_t['terminoTotal'] = t_2opt_t
+            if t_2opt < melhor_b['terminoTotal']:
+                melhor_b['ordenados']    = ord_2opt
+                melhor_b['terminoTotal'] = t_2opt
 
-            choices_sa_t = sa_encaixes(
-                melhor_t['ordenados'], ref_data, num_machines,
-                filas_iniciais=filas_tier,
+            choices_sa = sa_encaixes(
+                melhor_b['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_atual,
             )
-            t_enc_t, _, filas_enc_t = simular_com_atribuicao(
-                melhor_t['ordenados'], ref_data, num_machines,
-                choices_sa_t, filas_iniciais=filas_tier,
+            t_enc, _, filas_enc = simular_com_atribuicao(
+                melhor_b['ordenados'], ref_data, num_machines,
+                choices_sa, filas_iniciais=filas_atual,
             )
-            t_grd_t, choices_grd_t, filas_grd_t = simular_com_atribuicao(
-                melhor_t['ordenados'], ref_data, num_machines,
-                filas_iniciais=filas_tier,
+            t_grd, choices_grd, filas_grd = simular_com_atribuicao(
+                melhor_b['ordenados'], ref_data, num_machines,
+                filas_iniciais=filas_atual,
             )
 
-            if t_enc_t < t_grd_t:
-                cho_bloco.extend(choices_sa_t)
-                filas_tier  = filas_enc_t
-                tard_total += t_enc_t[0]
+            if t_enc < t_grd:
+                choices_total.extend(choices_sa)
+                filas_atual  = filas_enc
+                tard_total  += t_enc[0]
             else:
-                cho_bloco.extend(choices_grd_t)
-                filas_tier  = filas_grd_t
-                tard_total += t_grd_t[0]
+                choices_total.extend(choices_grd)
+                filas_atual  = filas_grd
+                tard_total  += t_grd[0]
 
-            ord_bloco.extend(melhor_t['ordenados'])
-            melhor_b = melhor_t
-
-        filas_atual = filas_tier
-        ordenados_total.extend(ord_bloco)
-        choices_total.extend(cho_bloco)
-        tier_info = (f'T3={len(tier3)} T2={len(tier2)} T1={len(tier1)}')
-        decisao_partes.append(f'{label}:{melhor_b["id"]}({tier_info})')
-        blocos_info.append({'bucket': bucket, 'nb': nb, 'est': melhor_b})
-        idx += 1
+            ordenados_total.extend(melhor_b['ordenados'])
+            decisao_partes.append(f'{label}:{melhor_b["id"]}')
+            blocos_info.append({'bucket': bucket, 'nb': nb, 'est': melhor_b})
+            idx += 1
 
     n_blocos       = len(blocos_info)
     makespan_total = float(filas_atual.max()) if len(filas_atual) else 0.0
     t_global       = (tard_total, makespan_total)
 
-    decisao_str = (f'Blocos ({n_blocos}g): '
-                   + ' | '.join(decisao_partes[:4])
-                   + ('…' if len(decisao_partes) > 4 else ''))
+    decisao_str = (f'Esp({n_esp}p)+Blocos({len(blocos_info) - (1 if fase_a else 0) - (1 if fase_b else 0)}g): '
+                   + ' | '.join(decisao_partes[:5])
+                   + ('…' if len(decisao_partes) > 5 else ''))
 
     melhor_global = {
         'id':                  'blocos',
-        'nome':                f'Blocos por prazo ({n_blocos} grupos)',
+        'nome':                f'Fases especiais + Blocos por prazo',
         'terminoTotal':        t_global,
         'terminoHoras':        _round(makespan_total),
         'ordenados':           ordenados_total,
@@ -3072,7 +3082,7 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         'totalCombinacoes':    n_blocos,
         'estrategiasPorGrupo': [
             {'grupo': i + 1,
-             'estrategia': {'id': 'blocos', 'nome': bi['bucket']},
+             'estrategia': {'id': 'blocos', 'nome': str(bi['bucket'])},
              'quantidadePedidos': bi['nb']}
             for i, bi in enumerate(blocos_info)
         ],
