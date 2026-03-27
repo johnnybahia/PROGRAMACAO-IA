@@ -506,9 +506,16 @@ def ler_estado_planejamento(spreadsheet, data_base: date, limite_h: float):
     except (ValueError, TypeError):
         return None
 
-    if saved_db != data_base or abs(saved_lim - limite_h) > 0.5:
-        print('  ℹ Zona congelada desatualizada (data_base ou limite mudaram) — recalculando tudo.')
+    if saved_db != data_base:
+        print('  ℹ Zona congelada desatualizada (data_base mudou) — recalculando tudo.')
         return None
+
+    if abs(saved_lim - limite_h) > 0.5:
+        # Limite mudou (usuário alterou N1/N2 ou parse da data mudou).
+        # Não descarta: reusa os pedidos congelados que ainda cabem no novo limite.
+        print(f'  ℹ Limite da zona congelada mudou '
+              f'({round(saved_lim/24,1)}d → {round(limite_h/24,1)}d) — '
+              f'pedidos já congelados serão preservados dentro do novo limite.')
 
     try:
         filas = np.array([float(v) for v in meta[2:] if v != ''], dtype=np.float64)
