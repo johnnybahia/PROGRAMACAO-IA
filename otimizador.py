@@ -313,6 +313,14 @@ def _dia_util(d: date, datas_bloqueadas: set) -> bool:
     return d not in datas_bloqueadas
 
 
+def _dia_util_anterior(dt: date, datas_bloqueadas: set) -> date:
+    """Retorna o dia útil imediatamente anterior a dt, pulando dias bloqueados."""
+    d = dt - timedelta(days=1)
+    while not _dia_util(d, datas_bloqueadas):
+        d -= timedelta(days=1)
+    return d
+
+
 def horas_para_data(base_date: date, horas_offset: float, datas_bloqueadas: set) -> datetime:
     """
     Converte offset em horas virtuais (excluindo dias bloqueados) para datetime real.
@@ -2499,7 +2507,9 @@ def salvar_espuladeira(spreadsheet, resultado: list,
         slot_times  = r.get('slot_times') or []
 
         def _linha(dt_prod, maquinas):
-            dt_prep = (dt_prod - timedelta(days=1)) if dt_prod else None
+            dt_prep = (_dia_util_anterior(dt_prod, datas_bloqueadas)
+                       if dt_prod and datas_bloqueadas is not None
+                       else (dt_prod - timedelta(days=1) if dt_prod else None))
             return {
                 'dt_prep':    dt_prep,
                 'tipo':       tipo,
