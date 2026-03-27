@@ -1712,30 +1712,37 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
     """
     Distribui pedidos nas máquinas e gera o resultado final.
 
-    choices: lista de índices retornada por sa_encaixes().
-      Quando fornecida, usa o encaixe otimizado pelo SA em vez de greedy.
-      None → comportamento greedy original.
+    choices: parâmetro mantido por compatibilidade — ignorado desde que o modo
+      Tetris se tornou padrão (ver abaixo).
 
-    filas_iniciais: estado das máquinas herdado da zona congelada.
-      None → começa do zero (comportamento padrão).
+    filas_iniciais: estado das máquinas herdado da zona congelada (legado).
+      Quando frozen_intervals não está disponível, codificado como blocos
+      sólidos (0, filas[i]) para que o Tetris respeite a ocupação prévia.
 
     frozen_intervals: dict {machine_idx: [(ini,fim),...]} da zona congelada.
-      Quando fornecido, ativa modo Tetris: novos pedidos preenchem lacunas
-      deixadas pelos congelados em vez de enfileirar após o último término.
-      Neste modo os choices do SA são ignorados (layout por intervalos).
+      Inicializa o _IntervalMachineState com os intervalos já comprometidos.
+
+    Modo Tetris sempre ativo:
+      Todos os pedidos usam _IntervalMachineState.earliest_fit() para encontrar
+      o primeiro intervalo livre ≥ min_start.  Isso garante que lacunas entre
+      data_base e o min_start de itens de Fase A/B sejam preenchidas pelos
+      pedidos normais (Fase N), maximizando a utilização das máquinas.
     """
-    tetris = frozen_intervals is not None
-    if tetris:
-        ms    = _IntervalMachineState(num_machines, frozen_intervals)
-        filas = ms.to_filas(num_machines)   # referência para código comum abaixo
+    # ── Inicializa estado de intervalo ──────────────────────────────────────
+    if frozen_intervals is not None:
+        ms = _IntervalMachineState(num_machines, frozen_intervals)
+    elif filas_iniciais is not None:
+        # Estado legado (salvo sem intervalos): codifica como bloco sólido
+        # (0, filas[i]) para impedir alocações antes da ocupação congelada.
+        synthetic = {i: [(0.0, float(filas_iniciais[i]))]
+                     for i in range(num_machines) if filas_iniciais[i] > 0.0}
+        ms = _IntervalMachineState(num_machines, synthetic)
     else:
-        filas = (filas_iniciais.copy() if filas_iniciais is not None
-                 else np.zeros(num_machines, dtype=np.float64))
-        ms = None
+        ms = _IntervalMachineState(num_machines, {})
+    filas = ms.to_filas(num_machines)  # referência auxiliar (compatibilidade)
 
     resultado    = []
     sem_cadastro = []
-    choice_ptr   = 0
 
     for pedido in pedidos_ordenados:
         ref          = pedido['referencia']
@@ -1769,29 +1776,16 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
         ng = len(gidxs)
 
         for _ in range(slots):
-            if tetris:
-                # ── Modo Tetris: encontra a primeira lacuna livre por máquina ──
-                ft = np.array([
-                    ms.earliest_fit(int(gidxs[i]), float(tempos[i]), min_s) + float(tempos[i])
-                    for i in range(ng)
-                ])
-                best   = int(np.argmin(ft))
-                inicio = ms.earliest_fit(int(gidxs[best]), float(tempos[best]), min_s)
-                fim    = inicio + float(tempos[best])
-                ms.allocate(int(gidxs[best]), inicio, fim)
-                filas[gidxs[best]] = ms.last_end(int(gidxs[best]))
-            else:
-                # ── Modo normal (greedy / choices SA) ─────────────────────────
-                available = np.maximum(filas[gidxs], min_s)
-                ft        = available + tempos
-                if choices is not None and choice_ptr < len(choices):
-                    best = int(choices[choice_ptr]) % ng
-                else:
-                    best = int(np.argmin(ft))
-                inicio = float(max(filas[gidxs[best]], min_s))
-                fim    = float(ft[best])
-                filas[gidxs[best]] = fim
-            choice_ptr += 1
+            # ── Tetris: encontra a primeira lacuna livre ≥ min_s por máquina ──
+            ft = np.array([
+                ms.earliest_fit(int(gidxs[i]), float(tempos[i]), min_s) + float(tempos[i])
+                for i in range(ng)
+            ])
+            best   = int(np.argmin(ft))
+            inicio = ms.earliest_fit(int(gidxs[best]), float(tempos[best]), min_s)
+            fim    = inicio + float(tempos[best])
+            ms.allocate(int(gidxs[best]), inicio, fim)
+            filas[gidxs[best]] = ms.last_end(int(gidxs[best]))
 
             aba, _li = aba_idx[best]
 
