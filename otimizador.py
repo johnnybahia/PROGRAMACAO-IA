@@ -68,6 +68,7 @@ CONFIG = {
     'LIMIAR_TROCA_PERCENT': 0,
     'ABAS_IGNORAR': {
         'PEDIDO', 'DISTRIBUIÇÃO', 'COMPARATIVO', 'RELATORIO', 'RELATORIO MONTAGEM',
+        'ESPULADEIRA',
         'DATAS FORA DE PROGRAMAÇÃO', 'ESTADO_PLANEJAMENTO',
         'DADOS1', 'DADOS',
         'Página1', 'Sheet1', 'Resumo', 'DADOS_GERAIS',
@@ -2473,6 +2474,106 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list,
     b.flush()
 
 
+# ── ESPULADEIRA ───────────────────────────────────────────────────────────────
+_ESPULAS_POR_MAQUINA = 48
+
+def salvar_espuladeira(spreadsheet, resultado: list,
+                       data_base=None, datas_bloqueadas=None):
+    """
+    Cria aba ESPULADEIRA com as necessidades de preparação para o setor.
+
+    Regras:
+      - Data = dia de produção − 1 dia calendário (preparar na véspera).
+      - ESPULA GRANDE : modelos '48 fusos Chines' (_e_modelo_chines_48).
+      - ESPULA PEQUENA: todos os demais modelos.
+      - Quantidade    : máquinas × 48 espulas por máquina.
+    """
+    _ESPULADEIRA_ABA = 'ESPULADEIRA'
+
+    # ── Montar linhas brutas ─────────────────────────────────────────────────
+    linhas = []
+    for r in resultado:
+        nome_modelo = r.get('nome_modelo', '')
+        e_chines    = _e_modelo_chines_48(nome_modelo)
+        tipo        = 'ESPULA GRANDE' if e_chines else 'ESPULA PEQUENA'
+        slot_times  = r.get('slot_times') or []
+
+        def _linha(dt_prod, maquinas):
+            dt_prep = (dt_prod - timedelta(days=1)) if dt_prod else None
+            return {
+                'dt_prep':    dt_prep,
+                'tipo':       tipo,
+                'referencia': r.get('referencia', ''),
+                'cor':        r.get('cor', '') or '-',
+                'produto':    r.get('produto', ''),
+                'cliente':    r.get('cliente', ''),
+                'oc':         r.get('ordem_compra', ''),
+                'modelo':     nome_modelo,
+                'maquinas':   maquinas,
+                'qtd':        maquinas * _ESPULAS_POR_MAQUINA,
+            }
+
+        if slot_times and data_base is not None and datas_bloqueadas is not None:
+            grupos = {}
+            for ini, fim in slot_times:
+                key = round(ini, 6)
+                if key not in grupos:
+                    grupos[key] = {'ini_real': ini, 'fins': []}
+                grupos[key]['fins'].append(fim)
+            for key in sorted(grupos):
+                g       = grupos[key]
+                n_slots = len(g['fins'])
+                maq     = math.ceil(n_slots / 2) if e_chines else n_slots
+                dt_ini_b = horas_para_data(data_base, g['ini_real'], datas_bloqueadas)
+                linhas.append(_linha(dt_ini_b.date(), maq))
+        else:
+            dt_inicio = r.get('dt_inicio')
+            maq       = r['maquinas_alocadas']
+            if e_chines:
+                maq = math.ceil(maq / 2)
+            linhas.append(_linha(dt_inicio.date() if dt_inicio else None, maq))
+
+    # ── Ordenar: data prep → GRANDE antes de PEQUENA → referência → cor ─────
+    linhas.sort(key=lambda x: (
+        x['dt_prep'] or date.min,
+        0 if x['tipo'] == 'ESPULA GRANDE' else 1,
+        x['referencia'],
+        x['cor'],
+    ))
+
+    # ── Escrever na aba ──────────────────────────────────────────────────────
+    cab   = ['Data Prep.', 'Tipo', 'Referência', 'Cor', 'Produto',
+             'Cliente', 'OC', 'Modelo', 'Máquinas', 'Qtd Espulas']
+    ncols = len(cab)
+    b     = SheetBuilder(spreadsheet, _ESPULADEIRA_ABA, cols=ncols)
+
+    hoje = date.today().strftime('%d/%m/%Y')
+    b.banner(f'🧵 ESPULADEIRA — Gerado em {hoje}', '#1A237E', font_size=13)
+    b.blank()
+    b.write(cab, bg='#37474F', fg='#FFFFFF', bold=True, h_align='CENTER')
+    b.freeze(3)
+
+    cor_bg_grande  = ['#E3F2FD', '#BBDEFB']   # azul claro para GRANDE
+    cor_bg_pequena = ['#FFFFFF', '#F5F5F5']    # branco/cinza para PEQUENA
+    cont_grande = cont_pequena = 0
+
+    for l in linhas:
+        dt_s = l['dt_prep'].strftime('%d/%m/%Y') if l['dt_prep'] else ''
+        if l['tipo'] == 'ESPULA GRANDE':
+            bg = cor_bg_grande[cont_grande % 2]
+            cont_grande += 1
+        else:
+            bg = cor_bg_pequena[cont_pequena % 2]
+            cont_pequena += 1
+        b.write([
+            dt_s, l['tipo'], l['referencia'], l['cor'],
+            l['produto'], l['cliente'], l['oc'], l['modelo'],
+            l['maquinas'], l['qtd'],
+        ], bg=bg)
+
+    b.flush()
+
+
 def _secao_cientifica(b: SheetBuilder, num_pedidos: int, num_modelos: int):
     b.banner('🔬 ANÁLISE CIENTÍFICA — Algoritmo vs Planejador Humano', '#4A148C', font_size=12)
     ef = _calc_eficiencia(num_pedidos, num_modelos)
@@ -3295,6 +3396,8 @@ def main():
                      data_base=data_base, datas_bloqueadas=datas_bloqueadas)
     salvar_relatorio_montagem(spreadsheet, resultado,
                               data_base=data_base, datas_bloqueadas=datas_bloqueadas)
+    salvar_espuladeira(spreadsheet, resultado,
+                       data_base=data_base, datas_bloqueadas=datas_bloqueadas)
     escrever_resultado_pedido(spreadsheet, resultado, sem_cadastro)
 
     tempo_total = time.time() - t0
