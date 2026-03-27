@@ -2964,24 +2964,18 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         if not fase_ped:
             continue
 
-        # Ordem já definida por min_start — apenas SA encaixes para qual slot
-        choices_sa = sa_encaixes(fase_ped, ref_data, num_machines,
-                                 filas_iniciais=filas_atual)
-        t_enc, _, filas_enc = simular_com_atribuicao(
-            fase_ped, ref_data, num_machines,
-            choices_sa, filas_iniciais=filas_atual)
+        # Ordem já fixada por min_start — usa greedy puro (sem SA encaixes).
+        # SA encaixes otimiza makespan global e pode sacrificar o início de um
+        # item específico para ganhar eficiência total. Para itens que "furam
+        # fila", isso é inaceitável: cada item deve pegar a primeira máquina
+        # disponível a partir do seu min_start, sem atrasos impostos pelo SA.
         t_grd, choices_grd, filas_grd = simular_com_atribuicao(
             fase_ped, ref_data, num_machines,
             filas_iniciais=filas_atual)
 
-        if t_enc < t_grd:
-            choices_total.extend(choices_sa)
-            filas_atual  = filas_enc
-            tard_total  += t_enc[0]
-        else:
-            choices_total.extend(choices_grd)
-            filas_atual  = filas_grd
-            tard_total  += t_grd[0]
+        choices_total.extend(choices_grd)
+        filas_atual  = filas_grd
+        tard_total  += t_grd[0]
 
         ordenados_total.extend(fase_ped)
         decisao_partes.append(f'{fase_label}({len(fase_ped)}p)')
