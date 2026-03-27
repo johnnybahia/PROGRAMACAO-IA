@@ -2943,10 +2943,13 @@ def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
         ))
 
     # ── Separação dos grupos ─────────────────────────────────────────────────
-    tem_start = [p for p in pedidos if float(p.get('min_start', 0)) > 0]
+    # Usa data_especial (col A preenchida) como critério, não min_start > 0.
+    # Quando data_esp = data_base, min_start = 0 mas o item ainda deve ser
+    # tratado como especial (Fase A/B) para respeitar a máquina específica.
+    tem_start = [p for p in pedidos if p.get('data_especial') is not None]
     fase_a = _sort_especial([p for p in tem_start if p.get('maquina_especial')])
     fase_b = _sort_especial([p for p in tem_start if not p.get('maquina_especial')])
-    normais = [p for p in pedidos if float(p.get('min_start', 0)) <= 0]
+    normais = [p for p in pedidos if p.get('data_especial') is None]
 
     filas_atual     = np.zeros(num_machines, dtype=np.float64)
     ordenados_total = []
