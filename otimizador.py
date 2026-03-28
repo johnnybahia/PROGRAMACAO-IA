@@ -520,11 +520,9 @@ def ler_estado_planejamento(spreadsheet, data_base: date, limite_h: float):
         return None
 
     if abs(saved_lim - limite_h) > 0.5:
-        # Limite mudou (usuário alterou N1/N2 ou parse da data mudou).
-        # Não descarta: reusa os pedidos congelados que ainda cabem no novo limite.
         print(f'  ℹ Limite da zona congelada mudou '
               f'({round(saved_lim/24,1)}d → {round(limite_h/24,1)}d) — '
-              f'pedidos já congelados serão preservados dentro do novo limite.')
+              f'pedidos serão re-selecionados pelo novo limite.')
 
     try:
         filas = np.array([float(v) for v in meta[2:] if v != ''], dtype=np.float64)
@@ -581,6 +579,7 @@ def ler_estado_planejamento(spreadsheet, data_base: date, limite_h: float):
         'frozen_intervals':    frozen_intervals,
         'frozen_linhas':       set(frozen_linhas),
         'resultado_congelado': resultado_congelado,
+        'saved_lim':           saved_lim,
     }
 
 
@@ -646,7 +645,13 @@ def salvar_estado_planejamento(spreadsheet, data_base: date, limite_h: float,
 def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
                                 num_machines: int) -> tuple:
     """
-    Re-simula (greedy) os pedidos congelados.
+    Reconstrói o estado congelado a partir dos slot_times salvos.
+
+    Quando slot_times contém o índice global da máquina (formato novo: (ini, fim, midx)),
+    usa esses índices diretamente — sem re-simular. Isso garante que uma mudança
+    na quantidade de máquinas não corrompa o estado do dia congelado.
+
+    Fallback para re-simulação greedy quando slot_times está no formato antigo (ini, fim).
 
     Retorna (filas: np.ndarray, frozen_intervals: dict).
       filas             — último término por máquina (índice numpy)
@@ -654,7 +659,20 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     """
     state = _IntervalMachineState(num_machines)
     filas = np.zeros(num_machines, dtype=np.float64)
+
     for p in pedidos_frozen:
+        slot_times = p.get('slot_times') or []
+
+        # ── Formato novo: (ini, fim, machine_idx) — usa índices salvos ────────
+        if slot_times and len(slot_times[0]) >= 3:
+            for slot in slot_times:
+                ini, fim, midx = float(slot[0]), float(slot[1]), int(slot[2])
+                if midx < num_machines:
+                    state.allocate(midx, ini, fim)
+                    filas[midx] = max(filas[midx], fim)
+            continue
+
+        # ── Formato legado: (ini, fim) — re-simula greedy ────────────────────
         gidxs = p.get('_gidxs')
         if gidxs is None:
             d = ref_data.get(_chave_pedido(p, ref_data))
@@ -676,6 +694,196 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     frozen_intervals = {i: state._ivs[i] for i in range(num_machines)
                         if state._ivs[i]}
     return filas, frozen_intervals
+
+
+def _frozen_intervals_from_resultado(resultado_congelado: list,
+                                     ridx_map: dict,
+                                     num_machines: int) -> tuple:
+    """
+    Reconstrói frozen_intervals e filas a partir dos resultados salvos.
+
+    Usa o formato novo de slot_times — (ini, fim, aba, local_idx) — para mapear
+    cada slot ao índice global ATUAL via ridx_map, tornando a reconstrução robusta
+    a mudanças na quantidade de máquinas entre execuções.
+
+    Se num_machines mudou (ex: 32 → 19 chinesas):
+      - Slots em máquinas que ainda existem → mapeados corretamente.
+      - Slots em máquinas removidas → ignorados (máquina não existe mais).
+      - Máquinas de outros modelos → índices remapeados automaticamente.
+
+    Fallback: slots no formato legado (ini, fim) ou (ini, fim, global_idx) são
+    simplesmente ignorados (a re-simulação via _calcular_filas_congeladas cobre
+    o caminho legado).
+    """
+    # Mapeia (aba, local_idx) → global_idx atual
+    gidx_fwd: dict = {v: k for k, v in ridx_map.items()}
+
+    state = _IntervalMachineState(num_machines)
+    filas = np.zeros(num_machines, dtype=np.float64)
+
+    for r in resultado_congelado:
+        for slot in (r.get('slot_times') or []):
+            if len(slot) < 4:
+                continue   # formato legado — não reconhece
+            ini, fim, aba, loc = float(slot[0]), float(slot[1]), slot[2], int(slot[3])
+            midx = gidx_fwd.get((aba, loc))
+            if midx is not None and midx < num_machines:
+                state.allocate(midx, ini, fim)
+                filas[midx] = max(filas[midx], fim)
+
+    frozen_intervals = {i: state._ivs[i] for i in range(num_machines)
+                        if state._ivs[i]}
+    return filas, frozen_intervals
+
+
+def replanejar_congelados(resultado_congelado: list, pedidos_orig: list,
+                          ridx_map: dict, num_machines: int,
+                          data_base, datas_bloqueadas: set) -> tuple:
+    """
+    Re-planeja os pedidos congelados após deleção de um item, preservando o
+    modelo de máquina (aba) original de cada pedido.
+
+    Regras:
+      - Cada pedido usa SOMENTE máquinas do mesmo modelo (aba) que foi originalmente
+        atribuído — o tipo de máquina não muda.
+      - A ordenação interna é EDD (menor atraso de entrega primeiro).
+      - Tetris preenche lacunas: quem ficou abaixo do deletado sobe para ocupar
+        o slot vago, desde que seja do mesmo modelo.
+      - min_start (data início especial) é respeitado.
+      - Pedidos de modelos diferentes não interferem uns nos outros.
+
+    Retorna (resultado_novo, filas_frozen, frozen_intervals_novo).
+    """
+    from collections import defaultdict as _dd
+
+    pedidos_idx = {p['linha_sheet']: p for p in pedidos_orig}
+
+    # Mapeia aba → lista de global machine indices disponíveis atualmente
+    aba_machines: dict = _dd(list)
+    for gidx, (aba, _loc) in ridx_map.items():
+        aba_machines[aba].append(gidx)
+    for aba in aba_machines:
+        aba_machines[aba].sort()
+
+    # Uma unidade de agendamento por (linha_sheet × aba)
+    unidades = []
+    for r in resultado_congelado:
+        ln    = r['linha_sheet']
+        aba   = r['aba']
+        p     = pedidos_idx.get(ln, {})
+        maq   = r['maquinas_alocadas']
+        tempo = float(r['tempo_producao'])
+
+        gidxs_aba = aba_machines.get(aba, [])
+        if not gidxs_aba:
+            continue   # modelo removido da config — ignora
+
+        gidxs_arr  = np.array(gidxs_aba, dtype=np.int32)
+        tempos_arr = np.full(len(gidxs_aba), tempo, dtype=np.float64)
+
+        # Deadline: usa data_entrega_especial como prazo prioritário se existir
+        deadline = p.get('deadline_horas')
+        ent_esp  = p.get('data_entrega_especial')
+        if ent_esp is not None:
+            try:
+                deadline = data_para_horas_corridas(data_base, ent_esp)
+            except Exception:
+                pass
+
+        unidades.append({
+            'linha_sheet':    ln,
+            'aba':            aba,
+            'referencia':     r.get('referencia', ''),
+            'produto':        r.get('produto', ''),
+            'cor':            r.get('cor', '') or '-',
+            'cliente':        r.get('cliente', ''),
+            'ordem_compra':   r.get('ordem_compra', ''),
+            'nome_modelo':    r.get('nome_modelo', ''),
+            'maq':            maq,
+            'tempo_producao': tempo,
+            'deadline_horas': deadline,
+            'min_start':      float(p.get('min_start', 0.0)),
+            'data_entrega':   p.get('data_entrega'),
+            '_gidxs':         gidxs_arr,
+            '_tempos':        tempos_arr,
+        })
+
+    # Ordena EDD: deadline crescente, depois min_start crescente
+    unidades.sort(key=lambda u: (
+        u['deadline_horas'] if u['deadline_horas'] is not None else float('inf'),
+        u['min_start'],
+    ))
+
+    ms    = _IntervalMachineState(num_machines)
+    filas = np.zeros(num_machines, dtype=np.float64)
+    resultado_novo = []
+
+    for u in unidades:
+        gidxs  = u['_gidxs']
+        tempos = u['_tempos']
+        ng     = len(gidxs)
+        min_s  = u['min_start']
+        ini_slot = float('inf')
+        fim_slot = 0.0
+        slot_times = []
+
+        for _ in range(u['maq']):
+            ft = np.array([
+                ms.earliest_fit(int(gidxs[i]), float(tempos[i]), min_s) + float(tempos[i])
+                for i in range(ng)
+            ])
+            best   = int(np.argmin(ft))
+            inicio = ms.earliest_fit(int(gidxs[best]), float(tempos[best]), min_s)
+            fim    = inicio + float(tempos[best])
+            ms.allocate(int(gidxs[best]), inicio, fim)
+            filas[gidxs[best]] = ms.last_end(int(gidxs[best]))
+
+            aba_slot, loc_idx = ridx_map[int(gidxs[best])]
+            slot_times.append((inicio, fim, aba_slot, loc_idx))
+            ini_slot = min(ini_slot, inicio)
+            fim_slot = max(fim_slot, fim)
+
+        dt_inicio  = horas_para_data(data_base, ini_slot,  datas_bloqueadas)
+        dt_termino = horas_para_data(data_base, fim_slot,  datas_bloqueadas)
+        data_entrega = u['data_entrega']
+
+        prazo_delta = None
+        prazo_str   = ''
+        if data_entrega:
+            delta       = (data_entrega - dt_termino.date()).days
+            prazo_delta = delta
+            prazo_str   = (f'{delta} dias antecipado' if delta >= 0
+                           else f'{delta} dias atrasado')
+
+        p = pedidos_idx.get(u['linha_sheet'], {})
+        resultado_novo.append({
+            'referencia':            u['referencia'],
+            'produto':               u['produto'],
+            'cor':                   u['cor'],
+            'cliente':               u['cliente'],
+            'ordem_compra':          u['ordem_compra'],
+            'nome_modelo':           u['nome_modelo'],
+            'aba':                   u['aba'],
+            'maquinas_alocadas':     u['maq'],
+            'tempo_producao':        u['tempo_producao'],
+            'inicio_horas':          _round(ini_slot),
+            'termino_horas':         _round(fim_slot),
+            'slot_times':            slot_times,
+            'dt_inicio':             dt_inicio,
+            'dt_termino':            dt_termino,
+            'data_entrega':          data_entrega,
+            'prazo_str':             prazo_str,
+            'prazo_delta':           prazo_delta,
+            'linha_sheet':           u['linha_sheet'],
+            'congelado':             True,
+            'data_especial':         p.get('data_especial'),
+            'data_entrega_especial': p.get('data_entrega_especial'),
+            'maquina_especial':      p.get('maquina_especial') or '',
+            'min_start':             u['min_start'],
+        })
+
+    frozen_intervals = {i: ms._ivs[i] for i in range(num_machines) if ms._ivs[i]}
+    return resultado_novo, filas, frozen_intervals
 
 
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
@@ -1811,7 +2019,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             por_modelo[aba]['slots']   += 1
             por_modelo[aba]['termino']  = max(por_modelo[aba]['termino'], fim)
             por_modelo[aba]['inicio']   = min(por_modelo[aba]['inicio'],  inicio)
-            por_modelo[aba]['slot_times'].append((inicio, fim))
+            _aba_slot, _loc_idx = aba_idx[best]   # (nome_aba, índice_local_na_aba)
+            por_modelo[aba]['slot_times'].append((inicio, fim, _aba_slot, _loc_idx))
 
         for aba, aloc in por_modelo.items():
             dt_inicio  = horas_para_data(data_base, aloc['inicio'],  datas_bloqueadas)
@@ -2332,7 +2541,8 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         # para que o operador saiba QUANDO montar cada lote de máquinas.
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
@@ -2447,7 +2657,8 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list,
 
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
@@ -2525,7 +2736,8 @@ def salvar_espuladeira(spreadsheet, resultado: list,
 
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
@@ -3254,6 +3466,7 @@ def main():
     print(f'  ✔ {len(pedidos)} pedidos | zona congelada: {info_zona}.')
 
     # ── Carregar estado congelado (se existir e for válido) ───────────────────
+    # Sempre tenta carregar — permite ativar congelamento sem re-executar duas vezes.
     estado_salvo        = None
     resultado_congelado = []
     filas_iniciais_glob = None
@@ -3261,43 +3474,60 @@ def main():
     frozen_linhas_set   = set()
     pedidos_orig        = pedidos
 
-    if limite_h_zona > 0:
-        estado_salvo = ler_estado_planejamento(spreadsheet, data_base, limite_h_zona)
-        if estado_salvo:
-            linhas_atuais = {p['linha_sheet'] for p in pedidos_orig}
+    estado_salvo = ler_estado_planejamento(spreadsheet, data_base, limite_h_zona)
 
-            # ── Reconciliação: remove pedidos apagados da aba PEDIDO ──────────
-            frozen_linhas_set     = estado_salvo['frozen_linhas'] & linhas_atuais
-            deletados             = estado_salvo['frozen_linhas'] - linhas_atuais
-            resultado_congelado   = [r for r in estado_salvo['resultado_congelado']
-                                     if r['linha_sheet'] in frozen_linhas_set]
+    if estado_salvo and limite_h_zona > 0:
+        linhas_atuais = {p['linha_sheet'] for p in pedidos_orig}
+        saved_lim     = estado_salvo.get('saved_lim', limite_h_zona)
 
-            if deletados:
-                print(f'  ⚠ {len(deletados)} pedido(s) congelado(s) apagado(s) da aba PEDIDO '
-                      f'— espaço liberado e pedidos abaixo serão reorganizados.')
-                # Recalcula filas e intervalos SEM os pedidos deletados
-                # (feito após precomputar_maquinas, mais abaixo — sinaliza com None)
-                filas_iniciais_glob   = None
-                frozen_intervals_glob = None
-                _recalcular_filas_frozen = True
-            else:
-                filas_iniciais_glob   = estado_salvo['filas']
-                frozen_intervals_glob = estado_salvo['frozen_intervals'] or None
-                _recalcular_filas_frozen = False
-
-            for r in resultado_congelado:
-                r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
-                r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
-                r['congelado']  = True
-            pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
-            print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
-                  f'{len(pedidos)} a otimizar.'
-                  + (' [Tetris ativo]' if frozen_intervals_glob else '')
-                  + (' [filas serão recalculadas]' if _recalcular_filas_frozen else ''))
+        # ── Se o limite mudou (inclusive de 0→N), re-seleciona congelados ────
+        # Usa inicio_horas do resultado salvo para determinar quem cabe no novo limite.
+        if abs(saved_lim - limite_h_zona) > 0.5:
+            min_ini_saved: dict = {}
+            for r in estado_salvo['resultado_congelado']:
+                ln  = r.get('linha_sheet')
+                ini = r.get('inicio_horas', float('inf'))
+                if ln is not None and (ln not in min_ini_saved or ini < min_ini_saved[ln]):
+                    min_ini_saved[ln] = ini
+            frozen_linhas_set    = {ln for ln, ini in min_ini_saved.items()
+                                    if ini < limite_h_zona and ln in linhas_atuais}
+            _recalcular_filas_frozen = True   # filas/intervalos precisam ser recalculados
         else:
+            # Limite não mudou: usa frozen_linhas salvas diretamente
+            frozen_linhas_set        = estado_salvo['frozen_linhas'] & linhas_atuais
             _recalcular_filas_frozen = False
+
+        # ── Pedidos apagados da aba PEDIDO ────────────────────────────────────
+        anteriores = (set(min_ini_saved.keys()) if abs(saved_lim - limite_h_zona) > 0.5
+                      else estado_salvo['frozen_linhas'])
+        deletados  = anteriores - linhas_atuais
+        if deletados:
+            print(f'  ⚠ {len(deletados)} pedido(s) congelado(s) apagado(s) da aba PEDIDO '
+                  f'— zona congelada será re-planejada preservando modelos de máquina.')
+            _recalcular_filas_frozen  = True
+            _replanear_congelados     = True
+        else:
+            _replanear_congelados     = False
+
+        resultado_congelado = [r for r in estado_salvo['resultado_congelado']
+                               if r['linha_sheet'] in frozen_linhas_set]
+
+        if not _recalcular_filas_frozen:
+            filas_iniciais_glob   = estado_salvo['filas']
+            frozen_intervals_glob = estado_salvo['frozen_intervals'] or None
+
+        for r in resultado_congelado:
+            r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
+            r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
+            r['congelado']  = True
+        pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
+        print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
+              f'{len(pedidos)} a otimizar.'
+              + (' [Tetris ativo]' if frozen_intervals_glob else '')
+              + (' [filas serão recalculadas]' if _recalcular_filas_frozen else ''))
     else:
         _recalcular_filas_frozen = False
+        _replanear_congelados    = False
 
     print('4/8 Lendo modelos de máquinas...')
     modelos = ler_modelos(spreadsheet)
@@ -3319,15 +3549,46 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
-    # ── Recalcula filas/intervalos quando pedidos congelados foram deletados ──
+    # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
-        pedidos_frozen_remanescentes = [p for p in pedidos_orig
-                                        if p['linha_sheet'] in frozen_linhas_set]
-        preparar_restricoes_pedidos(pedidos_frozen_remanescentes, ref_data, modelos)
-        filas_iniciais_glob, frozen_intervals_glob = _calcular_filas_congeladas(
-            pedidos_frozen_remanescentes, ref_data, num_machines)
-        print(f'  ✔ Filas e intervalos recalculados com {len(pedidos_frozen_remanescentes)} '
-              f'pedido(s) congelado(s) remanescentes.')
+
+        if _replanear_congelados:
+            # ── Pedido deletado: re-planeja congelados preservando modelo ─────
+            # Ordena por EDD dentro do congelado, cada pedido fica restrito ao
+            # mesmo modelo (aba) que foi originalmente atribuído.
+            resultado_congelado, filas_iniciais_glob, frozen_intervals_glob = \
+                replanejar_congelados(
+                    resultado_congelado, pedidos_orig, ridx_map,
+                    num_machines, data_base, datas_bloqueadas)
+            # Atualiza o conjunto de linhas congeladas com o resultado re-planejado
+            frozen_linhas_set = {r['linha_sheet'] for r in resultado_congelado}
+            pedidos = [p for p in pedidos_orig
+                       if p['linha_sheet'] not in frozen_linhas_set]
+            print(f'  ✔ Zona congelada re-planejada: {len(resultado_congelado)} alocações '
+                  f'(modelos preservados, EDD interno, Tetris ativo).')
+
+        else:
+            # ── Limite mudou ou config de máquinas mudou: só reconstrói intervalos
+            tem_formato_novo = any(
+                len((r.get('slot_times') or [[]])[0]) >= 4
+                for r in resultado_congelado if r.get('slot_times')
+            )
+            if tem_formato_novo:
+                filas_iniciais_glob, frozen_intervals_glob = \
+                    _frozen_intervals_from_resultado(
+                        resultado_congelado, ridx_map, num_machines)
+                print(f'  ✔ Intervalos congelados reconstruídos via slot_times '
+                      f'({len(resultado_congelado)} alocações) — índices remapeados '
+                      f'para configuração atual de {num_machines} máquinas.')
+            else:
+                # Fallback legado: re-simula com config atual
+                pedidos_frozen_rem = [p for p in pedidos_orig
+                                      if p['linha_sheet'] in frozen_linhas_set]
+                preparar_restricoes_pedidos(pedidos_frozen_rem, ref_data, modelos)
+                filas_iniciais_glob, frozen_intervals_glob = _calcular_filas_congeladas(
+                    pedidos_frozen_rem, ref_data, num_machines)
+                print(f'  ✔ Filas e intervalos recalculados (legado) com '
+                      f'{len(pedidos_frozen_rem)} pedido(s) congelado(s).')
 
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
@@ -3353,40 +3614,51 @@ def main():
     # Mescla resultado congelado (inalterado) com novos pedidos otimizados
     resultado = resultado_congelado + resultado_novos
 
-    # ── Atualizar zona congelada ──────────────────────────────────────────────
+    # ── Salvar estado para referência futura ─────────────────────────────────
+    # Sempre salva o resultado completo, independente de limite_h_zona estar ativo.
+    # Isso permite que o usuário ative o congelamento numa execução futura e o
+    # código encontre as posições corretas a partir do inicio_horas de cada pedido.
+    from collections import defaultdict as _dd
+
+    min_ini = _dd(lambda: float('inf'))
+    for r in resultado:
+        min_ini[r['linha_sheet']] = min(min_ini[r['linha_sheet']],
+                                        r.get('inicio_horas', float('inf')))
+
+    # frozen_linhas_new: somente os que efetivamente estão dentro do limite atual
     if limite_h_zona > 0:
-        from collections import defaultdict as _dd
-
-        # Pedido é congelado se seu início mais cedo ficar dentro da zona
-        min_ini = _dd(lambda: float('inf'))
-        for r in resultado:
-            min_ini[r['linha_sheet']] = min(min_ini[r['linha_sheet']],
-                                            r.get('inicio_horas', float('inf')))
         frozen_linhas_new = {ln for ln, ini in min_ini.items() if ini < limite_h_zona}
+    else:
+        frozen_linhas_new = set()
 
-        # Pedidos congelados em ordem de otimização (para re-simulação consistente)
-        pedidos_frozen_ord = [p for p in ordenados_total
-                              if p['linha_sheet'] in frozen_linhas_new]
-        linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
-        for p in pedidos_orig:
-            if (p['linha_sheet'] in frozen_linhas_new
-                    and p['linha_sheet'] not in linhas_ja_na_lista):
-                pedidos_frozen_ord.append(p)
-                linhas_ja_na_lista.add(p['linha_sheet'])
+    # Calcula filas/intervalos apenas para pedidos dentro do limite (para Tetris)
+    pedidos_frozen_ord = [p for p in ordenados_total
+                          if p['linha_sheet'] in frozen_linhas_new]
+    linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
+    for p in pedidos_orig:
+        if (p['linha_sheet'] in frozen_linhas_new
+                and p['linha_sheet'] not in linhas_ja_na_lista):
+            pedidos_frozen_ord.append(p)
+            linhas_ja_na_lista.add(p['linha_sheet'])
 
+    if pedidos_frozen_ord:
         preparar_restricoes_pedidos(pedidos_frozen_ord, ref_data, modelos)
-        filas_frozen, frozen_intervals_new = _calcular_filas_congeladas(
+        filas_frozen, frozen_intervals_new_dict = _calcular_filas_congeladas(
             pedidos_frozen_ord, ref_data, num_machines)
+    else:
+        filas_frozen             = np.zeros(num_machines, dtype=np.float64)
+        frozen_intervals_new_dict = {}
 
-        resultado_para_salvar = [r for r in resultado
-                                  if r['linha_sheet'] in frozen_linhas_new]
-        frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
+    frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
 
-        salvar_estado_planejamento(
-            spreadsheet, data_base, limite_h_zona,
-            filas_frozen, frozen_intervals_new,
-            resultado_para_salvar, frozen_linhas_ordered,
-        )
+    # Salva o resultado COMPLETO — não apenas os congelados — para que execuções
+    # futuras possam re-selecionar quais pedidos congelar com base no novo limite.
+    salvar_estado_planejamento(
+        spreadsheet, data_base, limite_h_zona,
+        filas_frozen, frozen_intervals_new_dict,
+        resultado,            # resultado completo
+        frozen_linhas_ordered,
+    )
 
     # ranking informativo (apenas EDD global para comparação)
     pedidos_para_ranking = pedidos_orig if estado_salvo else pedidos
