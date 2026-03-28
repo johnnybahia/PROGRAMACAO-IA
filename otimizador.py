@@ -520,11 +520,9 @@ def ler_estado_planejamento(spreadsheet, data_base: date, limite_h: float):
         return None
 
     if abs(saved_lim - limite_h) > 0.5:
-        # Limite mudou (usuário alterou N1/N2 ou parse da data mudou).
-        # Não descarta: reusa os pedidos congelados que ainda cabem no novo limite.
         print(f'  ℹ Limite da zona congelada mudou '
               f'({round(saved_lim/24,1)}d → {round(limite_h/24,1)}d) — '
-              f'pedidos já congelados serão preservados dentro do novo limite.')
+              f'pedidos serão re-selecionados pelo novo limite.')
 
     try:
         filas = np.array([float(v) for v in meta[2:] if v != ''], dtype=np.float64)
@@ -581,6 +579,7 @@ def ler_estado_planejamento(spreadsheet, data_base: date, limite_h: float):
         'frozen_intervals':    frozen_intervals,
         'frozen_linhas':       set(frozen_linhas),
         'resultado_congelado': resultado_congelado,
+        'saved_lim':           saved_lim,
     }
 
 
@@ -3254,6 +3253,7 @@ def main():
     print(f'  ✔ {len(pedidos)} pedidos | zona congelada: {info_zona}.')
 
     # ── Carregar estado congelado (se existir e for válido) ───────────────────
+    # Sempre tenta carregar — permite ativar congelamento sem re-executar duas vezes.
     estado_salvo        = None
     resultado_congelado = []
     filas_iniciais_glob = None
@@ -3261,41 +3261,54 @@ def main():
     frozen_linhas_set   = set()
     pedidos_orig        = pedidos
 
-    if limite_h_zona > 0:
-        estado_salvo = ler_estado_planejamento(spreadsheet, data_base, limite_h_zona)
-        if estado_salvo:
-            linhas_atuais = {p['linha_sheet'] for p in pedidos_orig}
+    estado_salvo = ler_estado_planejamento(spreadsheet, data_base, limite_h_zona)
 
-            # ── Reconciliação: remove pedidos apagados da aba PEDIDO ──────────
-            frozen_linhas_set     = estado_salvo['frozen_linhas'] & linhas_atuais
-            deletados             = estado_salvo['frozen_linhas'] - linhas_atuais
-            resultado_congelado   = [r for r in estado_salvo['resultado_congelado']
-                                     if r['linha_sheet'] in frozen_linhas_set]
+    if estado_salvo and limite_h_zona > 0:
+        linhas_atuais = {p['linha_sheet'] for p in pedidos_orig}
+        saved_lim     = estado_salvo.get('saved_lim', limite_h_zona)
 
-            if deletados:
-                print(f'  ⚠ {len(deletados)} pedido(s) congelado(s) apagado(s) da aba PEDIDO '
-                      f'— espaço liberado e pedidos abaixo serão reorganizados.')
-                # Recalcula filas e intervalos SEM os pedidos deletados
-                # (feito após precomputar_maquinas, mais abaixo — sinaliza com None)
-                filas_iniciais_glob   = None
-                frozen_intervals_glob = None
-                _recalcular_filas_frozen = True
-            else:
-                filas_iniciais_glob   = estado_salvo['filas']
-                frozen_intervals_glob = estado_salvo['frozen_intervals'] or None
-                _recalcular_filas_frozen = False
-
-            for r in resultado_congelado:
-                r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
-                r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
-                r['congelado']  = True
-            pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
-            print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
-                  f'{len(pedidos)} a otimizar.'
-                  + (' [Tetris ativo]' if frozen_intervals_glob else '')
-                  + (' [filas serão recalculadas]' if _recalcular_filas_frozen else ''))
+        # ── Se o limite mudou (inclusive de 0→N), re-seleciona congelados ────
+        # Usa inicio_horas do resultado salvo para determinar quem cabe no novo limite.
+        if abs(saved_lim - limite_h_zona) > 0.5:
+            min_ini_saved: dict = {}
+            for r in estado_salvo['resultado_congelado']:
+                ln  = r.get('linha_sheet')
+                ini = r.get('inicio_horas', float('inf'))
+                if ln is not None and (ln not in min_ini_saved or ini < min_ini_saved[ln]):
+                    min_ini_saved[ln] = ini
+            frozen_linhas_set    = {ln for ln, ini in min_ini_saved.items()
+                                    if ini < limite_h_zona and ln in linhas_atuais}
+            _recalcular_filas_frozen = True   # filas/intervalos precisam ser recalculados
         else:
+            # Limite não mudou: usa frozen_linhas salvas diretamente
+            frozen_linhas_set        = estado_salvo['frozen_linhas'] & linhas_atuais
             _recalcular_filas_frozen = False
+
+        # ── Pedidos apagados da aba PEDIDO ────────────────────────────────────
+        anteriores = (set(min_ini_saved.keys()) if abs(saved_lim - limite_h_zona) > 0.5
+                      else estado_salvo['frozen_linhas'])
+        deletados  = anteriores - linhas_atuais
+        if deletados:
+            print(f'  ⚠ {len(deletados)} pedido(s) congelado(s) apagado(s) da aba PEDIDO '
+                  f'— espaço liberado e pedidos abaixo serão reorganizados.')
+            _recalcular_filas_frozen = True
+
+        resultado_congelado = [r for r in estado_salvo['resultado_congelado']
+                               if r['linha_sheet'] in frozen_linhas_set]
+
+        if not _recalcular_filas_frozen:
+            filas_iniciais_glob   = estado_salvo['filas']
+            frozen_intervals_glob = estado_salvo['frozen_intervals'] or None
+
+        for r in resultado_congelado:
+            r['dt_inicio']  = horas_para_data(data_base, r['inicio_horas'],  datas_bloqueadas)
+            r['dt_termino'] = horas_para_data(data_base, r['termino_horas'], datas_bloqueadas)
+            r['congelado']  = True
+        pedidos = [p for p in pedidos if p['linha_sheet'] not in frozen_linhas_set]
+        print(f'  ✔ Zona congelada carregada: {len(frozen_linhas_set)} preservado(s), '
+              f'{len(pedidos)} a otimizar.'
+              + (' [Tetris ativo]' if frozen_intervals_glob else '')
+              + (' [filas serão recalculadas]' if _recalcular_filas_frozen else ''))
     else:
         _recalcular_filas_frozen = False
 
@@ -3353,40 +3366,51 @@ def main():
     # Mescla resultado congelado (inalterado) com novos pedidos otimizados
     resultado = resultado_congelado + resultado_novos
 
-    # ── Atualizar zona congelada ──────────────────────────────────────────────
+    # ── Salvar estado para referência futura ─────────────────────────────────
+    # Sempre salva o resultado completo, independente de limite_h_zona estar ativo.
+    # Isso permite que o usuário ative o congelamento numa execução futura e o
+    # código encontre as posições corretas a partir do inicio_horas de cada pedido.
+    from collections import defaultdict as _dd
+
+    min_ini = _dd(lambda: float('inf'))
+    for r in resultado:
+        min_ini[r['linha_sheet']] = min(min_ini[r['linha_sheet']],
+                                        r.get('inicio_horas', float('inf')))
+
+    # frozen_linhas_new: somente os que efetivamente estão dentro do limite atual
     if limite_h_zona > 0:
-        from collections import defaultdict as _dd
-
-        # Pedido é congelado se seu início mais cedo ficar dentro da zona
-        min_ini = _dd(lambda: float('inf'))
-        for r in resultado:
-            min_ini[r['linha_sheet']] = min(min_ini[r['linha_sheet']],
-                                            r.get('inicio_horas', float('inf')))
         frozen_linhas_new = {ln for ln, ini in min_ini.items() if ini < limite_h_zona}
+    else:
+        frozen_linhas_new = set()
 
-        # Pedidos congelados em ordem de otimização (para re-simulação consistente)
-        pedidos_frozen_ord = [p for p in ordenados_total
-                              if p['linha_sheet'] in frozen_linhas_new]
-        linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
-        for p in pedidos_orig:
-            if (p['linha_sheet'] in frozen_linhas_new
-                    and p['linha_sheet'] not in linhas_ja_na_lista):
-                pedidos_frozen_ord.append(p)
-                linhas_ja_na_lista.add(p['linha_sheet'])
+    # Calcula filas/intervalos apenas para pedidos dentro do limite (para Tetris)
+    pedidos_frozen_ord = [p for p in ordenados_total
+                          if p['linha_sheet'] in frozen_linhas_new]
+    linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
+    for p in pedidos_orig:
+        if (p['linha_sheet'] in frozen_linhas_new
+                and p['linha_sheet'] not in linhas_ja_na_lista):
+            pedidos_frozen_ord.append(p)
+            linhas_ja_na_lista.add(p['linha_sheet'])
 
+    if pedidos_frozen_ord:
         preparar_restricoes_pedidos(pedidos_frozen_ord, ref_data, modelos)
-        filas_frozen, frozen_intervals_new = _calcular_filas_congeladas(
+        filas_frozen, frozen_intervals_new_dict = _calcular_filas_congeladas(
             pedidos_frozen_ord, ref_data, num_machines)
+    else:
+        filas_frozen             = np.zeros(num_machines, dtype=np.float64)
+        frozen_intervals_new_dict = {}
 
-        resultado_para_salvar = [r for r in resultado
-                                  if r['linha_sheet'] in frozen_linhas_new]
-        frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
+    frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
 
-        salvar_estado_planejamento(
-            spreadsheet, data_base, limite_h_zona,
-            filas_frozen, frozen_intervals_new,
-            resultado_para_salvar, frozen_linhas_ordered,
-        )
+    # Salva o resultado COMPLETO — não apenas os congelados — para que execuções
+    # futuras possam re-selecionar quais pedidos congelar com base no novo limite.
+    salvar_estado_planejamento(
+        spreadsheet, data_base, limite_h_zona,
+        filas_frozen, frozen_intervals_new_dict,
+        resultado,            # resultado completo
+        frozen_linhas_ordered,
+    )
 
     # ranking informativo (apenas EDD global para comparação)
     pedidos_para_ranking = pedidos_orig if estado_salvo else pedidos
