@@ -3573,6 +3573,17 @@ def main():
     # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
 
+        # Guarda proteção extra: se o número de máquinas mudou em relação ao
+        # estado salvo, NUNCA re-planeja — preserva slot_times originais.
+        # Isso cobre o caso em que _replanear_congelados foi ativado por deleção
+        # espúria (deslocamento de linha no PEDIDO) na mesma execução que a
+        # mudança de capacidade.
+        _saved_n = len(estado_salvo['filas']) if estado_salvo else 0
+        if _replanear_congelados and _saved_n > 0 and _saved_n != num_machines:
+            print(f'  ℹ Número de máquinas mudou ({_saved_n} → {num_machines}) — '
+                  f're-planejamento cancelado para preservar posições congeladas.')
+            _replanear_congelados = False
+
         if _replanear_congelados:
             # ── Pedido deletado: re-planeja congelados preservando modelo ─────
             # Ordena por EDD dentro do congelado, cada pedido fica restrito ao
