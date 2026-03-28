@@ -3549,6 +3549,16 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
+    # ── Detecta mudança de capacidade (num_machines diferente do estado salvo) ─
+    if (frozen_linhas_set
+            and filas_iniciais_glob is not None
+            and len(filas_iniciais_glob) != num_machines):
+        print(f'  ℹ Capacidade de máquinas mudou '
+              f'({len(filas_iniciais_glob)} → {num_machines} máquinas) — '
+              f'reconstruindo intervalos congelados com nova configuração.')
+        _recalcular_filas_frozen = True
+        # _replanear_congelados permanece False: não houve deleção de pedidos
+
     # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
 
