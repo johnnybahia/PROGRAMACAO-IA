@@ -663,8 +663,11 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     for p in pedidos_frozen:
         slot_times = p.get('slot_times') or []
 
-        # ── Formato novo: (ini, fim, machine_idx) — usa índices salvos ────────
-        if slot_times and len(slot_times[0]) >= 3:
+        # ── Formato intermediário: (ini, fim, machine_global_idx) ───────────
+        # Formato atual (4 elementos) é tratado por _frozen_intervals_from_resultado;
+        # esta função só é chamada via fallback legado com pedidos_orig (sem slot_times)
+        # ou com o formato de 3 elementos de versões intermediárias.
+        if slot_times and len(slot_times[0]) == 3:
             for slot in slot_times:
                 ini, fim, midx = float(slot[0]), float(slot[1]), int(slot[2])
                 if midx < num_machines:
@@ -3549,6 +3552,16 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
+    # ── Detecta mudança de capacidade (num_machines diferente do estado salvo) ─
+    if (frozen_linhas_set
+            and filas_iniciais_glob is not None
+            and len(filas_iniciais_glob) != num_machines):
+        print(f'  ℹ Capacidade de máquinas mudou '
+              f'({len(filas_iniciais_glob)} → {num_machines} máquinas) — '
+              f'reconstruindo intervalos congelados com nova configuração.')
+        _recalcular_filas_frozen = True
+        # _replanear_congelados permanece False: não houve deleção de pedidos
+
     # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
 
@@ -3631,25 +3644,26 @@ def main():
     else:
         frozen_linhas_new = set()
 
-    # Calcula filas/intervalos apenas para pedidos dentro do limite (para Tetris)
-    pedidos_frozen_ord = [p for p in ordenados_total
-                          if p['linha_sheet'] in frozen_linhas_new]
-    linhas_ja_na_lista = {p['linha_sheet'] for p in pedidos_frozen_ord}
-    for p in pedidos_orig:
-        if (p['linha_sheet'] in frozen_linhas_new
-                and p['linha_sheet'] not in linhas_ja_na_lista):
-            pedidos_frozen_ord.append(p)
-            linhas_ja_na_lista.add(p['linha_sheet'])
-
-    if pedidos_frozen_ord:
-        preparar_restricoes_pedidos(pedidos_frozen_ord, ref_data, modelos)
-        filas_frozen, frozen_intervals_new_dict = _calcular_filas_congeladas(
-            pedidos_frozen_ord, ref_data, num_machines)
+    # Calcula filas/intervalos a partir das posições reais do resultado congelado.
+    # Usa slot_times do resultado (não re-simula a partir dos pedidos), para garantir
+    # que após replanejar_congelados as posições salvas reflitam o planejamento real.
+    if frozen_linhas_new:
+        resultado_frozen_subset = [r for r in resultado
+                                   if r['linha_sheet'] in frozen_linhas_new]
+        filas_frozen, frozen_intervals_new_dict = _frozen_intervals_from_resultado(
+            resultado_frozen_subset, ridx_map, num_machines)
+        # Ordem estável para frozen_linhas_ordered (por inicio_horas)
+        frozen_sorted = sorted(
+            resultado_frozen_subset,
+            key=lambda r: r.get('inicio_horas', float('inf'))
+        )
+        frozen_linhas_ordered = list(dict.fromkeys(
+            r['linha_sheet'] for r in frozen_sorted
+        ))
     else:
-        filas_frozen             = np.zeros(num_machines, dtype=np.float64)
+        filas_frozen              = np.zeros(num_machines, dtype=np.float64)
         frozen_intervals_new_dict = {}
-
-    frozen_linhas_ordered = [p['linha_sheet'] for p in pedidos_frozen_ord]
+        frozen_linhas_ordered     = []
 
     # Salva o resultado COMPLETO — não apenas os congelados — para que execuções
     # futuras possam re-selecionar quais pedidos congelar com base no novo limite.
