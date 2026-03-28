@@ -696,6 +696,46 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     return filas, frozen_intervals
 
 
+def _frozen_intervals_from_resultado(resultado_congelado: list,
+                                     ridx_map: dict,
+                                     num_machines: int) -> tuple:
+    """
+    Reconstrói frozen_intervals e filas a partir dos resultados salvos.
+
+    Usa o formato novo de slot_times — (ini, fim, aba, local_idx) — para mapear
+    cada slot ao índice global ATUAL via ridx_map, tornando a reconstrução robusta
+    a mudanças na quantidade de máquinas entre execuções.
+
+    Se num_machines mudou (ex: 32 → 19 chinesas):
+      - Slots em máquinas que ainda existem → mapeados corretamente.
+      - Slots em máquinas removidas → ignorados (máquina não existe mais).
+      - Máquinas de outros modelos → índices remapeados automaticamente.
+
+    Fallback: slots no formato legado (ini, fim) ou (ini, fim, global_idx) são
+    simplesmente ignorados (a re-simulação via _calcular_filas_congeladas cobre
+    o caminho legado).
+    """
+    # Mapeia (aba, local_idx) → global_idx atual
+    gidx_fwd: dict = {v: k for k, v in ridx_map.items()}
+
+    state = _IntervalMachineState(num_machines)
+    filas = np.zeros(num_machines, dtype=np.float64)
+
+    for r in resultado_congelado:
+        for slot in (r.get('slot_times') or []):
+            if len(slot) < 4:
+                continue   # formato legado — não reconhece
+            ini, fim, aba, loc = float(slot[0]), float(slot[1]), slot[2], int(slot[3])
+            midx = gidx_fwd.get((aba, loc))
+            if midx is not None and midx < num_machines:
+                state.allocate(midx, ini, fim)
+                filas[midx] = max(filas[midx], fim)
+
+    frozen_intervals = {i: state._ivs[i] for i in range(num_machines)
+                        if state._ivs[i]}
+    return filas, frozen_intervals
+
+
 # ── LER DATA BASE E DATAS BLOQUEADAS ─────────────────────────────────────────
 def ler_data_base(spreadsheet) -> date:
     """Lê a data base de início (célula M1) da aba PEDIDO."""
@@ -1829,7 +1869,8 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             por_modelo[aba]['slots']   += 1
             por_modelo[aba]['termino']  = max(por_modelo[aba]['termino'], fim)
             por_modelo[aba]['inicio']   = min(por_modelo[aba]['inicio'],  inicio)
-            por_modelo[aba]['slot_times'].append((inicio, fim, int(gidxs[best])))
+            _aba_slot, _loc_idx = aba_idx[best]   # (nome_aba, índice_local_na_aba)
+            por_modelo[aba]['slot_times'].append((inicio, fim, _aba_slot, _loc_idx))
 
         for aba, aloc in por_modelo.items():
             dt_inicio  = horas_para_data(data_base, aloc['inicio'],  datas_bloqueadas)
@@ -3354,15 +3395,29 @@ def main():
     preparar_restricoes_pedidos(pedidos, ref_data, modelos)
     print(f'  ✔ Restrições de máquina especial aplicadas a todos os pedidos.')
 
-    # ── Recalcula filas/intervalos quando pedidos congelados foram deletados ──
+    # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
-        pedidos_frozen_remanescentes = [p for p in pedidos_orig
-                                        if p['linha_sheet'] in frozen_linhas_set]
-        preparar_restricoes_pedidos(pedidos_frozen_remanescentes, ref_data, modelos)
-        filas_iniciais_glob, frozen_intervals_glob = _calcular_filas_congeladas(
-            pedidos_frozen_remanescentes, ref_data, num_machines)
-        print(f'  ✔ Filas e intervalos recalculados com {len(pedidos_frozen_remanescentes)} '
-              f'pedido(s) congelado(s) remanescentes.')
+        # Prefere reconstruir a partir do resultado salvo (slot_times com aba+local_idx)
+        # pois é robusto a mudanças na quantidade de máquinas entre execuções.
+        tem_formato_novo = any(
+            len((r.get('slot_times') or [[]])[0]) >= 4
+            for r in resultado_congelado if r.get('slot_times')
+        )
+        if tem_formato_novo:
+            filas_iniciais_glob, frozen_intervals_glob = _frozen_intervals_from_resultado(
+                resultado_congelado, ridx_map, num_machines)
+            print(f'  ✔ Intervalos congelados reconstruídos via slot_times '
+                  f'({len(resultado_congelado)} alocações) — índices remapeados para '
+                  f'configuração atual de {num_machines} máquinas.')
+        else:
+            # Fallback legado: re-simula com config atual
+            pedidos_frozen_remanescentes = [p for p in pedidos_orig
+                                            if p['linha_sheet'] in frozen_linhas_set]
+            preparar_restricoes_pedidos(pedidos_frozen_remanescentes, ref_data, modelos)
+            filas_iniciais_glob, frozen_intervals_glob = _calcular_filas_congeladas(
+                pedidos_frozen_remanescentes, ref_data, num_machines)
+            print(f'  ✔ Filas e intervalos recalculados (legado) com '
+                  f'{len(pedidos_frozen_remanescentes)} pedido(s) congelado(s).')
 
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
