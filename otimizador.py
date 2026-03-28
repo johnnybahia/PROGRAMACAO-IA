@@ -645,7 +645,13 @@ def salvar_estado_planejamento(spreadsheet, data_base: date, limite_h: float,
 def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
                                 num_machines: int) -> tuple:
     """
-    Re-simula (greedy) os pedidos congelados.
+    Reconstrói o estado congelado a partir dos slot_times salvos.
+
+    Quando slot_times contém o índice global da máquina (formato novo: (ini, fim, midx)),
+    usa esses índices diretamente — sem re-simular. Isso garante que uma mudança
+    na quantidade de máquinas não corrompa o estado do dia congelado.
+
+    Fallback para re-simulação greedy quando slot_times está no formato antigo (ini, fim).
 
     Retorna (filas: np.ndarray, frozen_intervals: dict).
       filas             — último término por máquina (índice numpy)
@@ -653,7 +659,20 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     """
     state = _IntervalMachineState(num_machines)
     filas = np.zeros(num_machines, dtype=np.float64)
+
     for p in pedidos_frozen:
+        slot_times = p.get('slot_times') or []
+
+        # ── Formato novo: (ini, fim, machine_idx) — usa índices salvos ────────
+        if slot_times and len(slot_times[0]) >= 3:
+            for slot in slot_times:
+                ini, fim, midx = float(slot[0]), float(slot[1]), int(slot[2])
+                if midx < num_machines:
+                    state.allocate(midx, ini, fim)
+                    filas[midx] = max(filas[midx], fim)
+            continue
+
+        # ── Formato legado: (ini, fim) — re-simula greedy ────────────────────
         gidxs = p.get('_gidxs')
         if gidxs is None:
             d = ref_data.get(_chave_pedido(p, ref_data))
@@ -1810,7 +1829,7 @@ def otimizar_distribuicao(pedidos_ordenados, modelos, ref_data, num_machines, ri
             por_modelo[aba]['slots']   += 1
             por_modelo[aba]['termino']  = max(por_modelo[aba]['termino'], fim)
             por_modelo[aba]['inicio']   = min(por_modelo[aba]['inicio'],  inicio)
-            por_modelo[aba]['slot_times'].append((inicio, fim))
+            por_modelo[aba]['slot_times'].append((inicio, fim, int(gidxs[best])))
 
         for aba, aloc in por_modelo.items():
             dt_inicio  = horas_para_data(data_base, aloc['inicio'],  datas_bloqueadas)
@@ -2331,7 +2350,8 @@ def salvar_relatorio(spreadsheet, resultado: list, melhor: dict,
         # para que o operador saiba QUANDO montar cada lote de máquinas.
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
@@ -2446,7 +2466,8 @@ def salvar_relatorio_montagem(spreadsheet, resultado: list,
 
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
@@ -2524,7 +2545,8 @@ def salvar_espuladeira(spreadsheet, resultado: list,
 
         if slot_times and data_base is not None and datas_bloqueadas is not None:
             grupos = {}
-            for ini, fim in slot_times:
+            for slot in slot_times:
+                ini, fim = slot[0], slot[1]
                 key = round(ini, 6)
                 if key not in grupos:
                     grupos[key] = {'ini_real': ini, 'fins': []}
