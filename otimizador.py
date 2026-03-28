@@ -3622,6 +3622,51 @@ def main():
                 print(f'  ✔ Filas e intervalos recalculados (legado) com '
                       f'{len(pedidos_frozen_rem)} pedido(s) congelado(s).')
 
+    # ── Auto-diagnóstico da zona congelada ──────────────────────────────────
+    # Conta as máquinas preservadas por dia/modelo e valida que o congelamento
+    # está correto antes de iniciar a otimização dos pedidos livres.
+    if resultado_congelado and limite_h_zona > 0:
+        from collections import defaultdict as _dd2
+        por_dia: dict = {}
+        for r in resultado_congelado:
+            dt = r['dt_inicio'].date() if r.get('dt_inicio') else None
+            if dt is None:
+                continue
+            mod = r.get('nome_modelo') or r.get('aba') or '?'
+            maq = int(r.get('maquinas_alocadas') or 0)
+            por_dia.setdefault(dt, {})
+            por_dia[dt][mod] = por_dia[dt].get(mod, 0) + maq
+
+        # Conta também as máquinas via slot_times por dia (mais preciso quando
+        # um pedido tem máquinas iniciando em datas diferentes).
+        maq_slot_por_dia: dict = {}
+        for r in resultado_congelado:
+            for slot in (r.get('slot_times') or []):
+                ini = slot[0]
+                dt_slot = horas_para_data(data_base, ini, datas_bloqueadas).date()
+                maq_slot_por_dia[dt_slot] = maq_slot_por_dia.get(dt_slot, 0) + 1
+
+        lim_data = horas_para_data(data_base, limite_h_zona, datas_bloqueadas).date()
+        sep = '─' * 46
+        print(f'  {sep}')
+        print(f'  🔒 ZONA CONGELADA — verificação automática (até {lim_data.strftime("%d/%m/%Y")})')
+        print(f'  {sep}')
+        for dt in sorted(por_dia):
+            partes = '  |  '.join(
+                f'{mod}: {maq} maq'
+                for mod, maq in sorted(por_dia[dt].items())
+            )
+            total_slot = maq_slot_por_dia.get(dt, 0)
+            print(f'  📅 {dt.strftime("%d/%m/%Y")}  →  {partes}  '
+                  f'(slots ativos nesse dia: {total_slot})')
+        n_dias   = len(por_dia)
+        n_alloc  = len(resultado_congelado)
+        total_maq_all = sum(sum(v.values()) for v in por_dia.values())
+        print(f'  {sep}')
+        print(f'  ✅ {n_dias} dia(s) congelado(s) | {n_alloc} alocação(ões) | '
+              f'{total_maq_all} máquina(s)-dia preservada(s)')
+        print(f'  {sep}')
+
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
     blocos_info = agrupar_por_dia_vencimento(pedidos)
     print(f'  {len(blocos_info)} bloco(s): '
