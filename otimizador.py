@@ -3560,7 +3560,15 @@ def main():
               f'({len(filas_iniciais_glob)} → {num_machines} máquinas) — '
               f'reconstruindo intervalos congelados com nova configuração.')
         _recalcular_filas_frozen = True
-        # _replanear_congelados permanece False: não houve deleção de pedidos
+        # Quando o número de máquinas muda, NUNCA re-planeja os congelados —
+        # os registros originais (slot_times) devem ser preservados como estão.
+        # Re-planejar com a nova contagem destruiria as posições congeladas.
+        # (Se houve deleção simultânea, o usuário pode re-executar com a mesma
+        # contagem de máquinas para disparar o re-planejamento separadamente.)
+        if _replanear_congelados:
+            print('  ℹ Re-planejamento cancelado — mudança de capacidade tem prioridade. '
+                  'Os slot_times originais serão preservados.')
+        _replanear_congelados = False
 
     # ── Recalcula filas/intervalos quando limite/máquinas mudaram ───────────
     if _recalcular_filas_frozen and frozen_linhas_set:
