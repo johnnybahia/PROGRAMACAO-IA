@@ -663,8 +663,11 @@ def _calcular_filas_congeladas(pedidos_frozen: list, ref_data: dict,
     for p in pedidos_frozen:
         slot_times = p.get('slot_times') or []
 
-        # ── Formato novo: (ini, fim, machine_idx) — usa índices salvos ────────
-        if slot_times and len(slot_times[0]) >= 3:
+        # ── Formato intermediário: (ini, fim, machine_global_idx) ───────────
+        # Formato atual (4 elementos) é tratado por _frozen_intervals_from_resultado;
+        # esta função só é chamada via fallback legado com pedidos_orig (sem slot_times)
+        # ou com o formato de 3 elementos de versões intermediárias.
+        if slot_times and len(slot_times[0]) == 3:
             for slot in slot_times:
                 ini, fim, midx = float(slot[0]), float(slot[1]), int(slot[2])
                 if midx < num_machines:
