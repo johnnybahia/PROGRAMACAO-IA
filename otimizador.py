@@ -3456,9 +3456,11 @@ def main():
         print('❌ Nenhum pedido encontrado na aba PEDIDO.')
         sys.exit(1)
 
-    # Calcula o limite da zona em horas de calendário
+    # Calcula o limite da zona em horas ÚTEIS (pula datas bloqueadas),
+    # para que "até DD/MM" congele exatamente os pedidos que iniciam até DD/MM
+    # no calendário de trabalho real — sem ser distorcido por feriados/bloqueios.
     if data_lim:
-        limite_h_zona = data_para_horas_corridas(data_base, data_lim) + 24
+        limite_h_zona = data_para_horas(data_base, data_lim, datas_bloqueadas) + 24
         info_zona     = f'até {data_lim.strftime("%d/%m/%Y")} ({round(limite_h_zona/24,1)} dias)'
     elif dias_congelados > 0:
         limite_h_zona = float(dias_congelados * 24)
