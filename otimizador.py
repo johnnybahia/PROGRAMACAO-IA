@@ -3625,48 +3625,45 @@ def main():
                       f'{len(pedidos_frozen_rem)} pedido(s) congelado(s).')
 
     # ── Auto-diagnóstico da zona congelada ──────────────────────────────────
-    # Conta as máquinas preservadas por dia/modelo e valida que o congelamento
-    # está correto antes de iniciar a otimização dos pedidos livres.
+    # Mostra máquinas FÍSICAS ativas por modelo/dia via slot_times,
+    # permitindo verificar se cada período tem a capacidade correta.
     if resultado_congelado and limite_h_zona > 0:
-        from collections import defaultdict as _dd2
-        por_dia: dict = {}
+        # slots_por_dia_mod[dt][aba] = conjunto de global_idx ativos nesse dia
+        slots_por_dia_mod: dict = {}
+        nome_mod: dict = {}   # aba → nome legível
         for r in resultado_congelado:
-            dt = r['dt_inicio'].date() if r.get('dt_inicio') else None
-            if dt is None:
-                continue
-            mod = r.get('nome_modelo') or r.get('aba') or '?'
-            maq = int(r.get('maquinas_alocadas') or 0)
-            por_dia.setdefault(dt, {})
-            por_dia[dt][mod] = por_dia[dt].get(mod, 0) + maq
-
-        # Conta também as máquinas via slot_times por dia (mais preciso quando
-        # um pedido tem máquinas iniciando em datas diferentes).
-        maq_slot_por_dia: dict = {}
-        for r in resultado_congelado:
+            mod_nome = r.get('nome_modelo') or r.get('aba') or '?'
             for slot in (r.get('slot_times') or []):
-                ini = slot[0]
-                dt_slot = horas_para_data(data_base, ini, datas_bloqueadas).date()
-                maq_slot_por_dia[dt_slot] = maq_slot_por_dia.get(dt_slot, 0) + 1
+                if len(slot) < 4:
+                    continue
+                ini, _fim, aba, loc = slot[0], slot[1], slot[2], int(slot[3])
+                dt_slot = horas_para_data(data_base, float(ini), datas_bloqueadas).date()
+                slots_por_dia_mod.setdefault(dt_slot, {})
+                slots_por_dia_mod[dt_slot].setdefault(aba, set())
+                slots_por_dia_mod[dt_slot][aba].add(loc)
+                nome_mod[aba] = mod_nome
 
         lim_data = horas_para_data(data_base, limite_h_zona, datas_bloqueadas).date()
-        sep = '─' * 46
+        sep = '─' * 56
         print(f'  {sep}')
         print(f'  🔒 ZONA CONGELADA — verificação automática (até {lim_data.strftime("%d/%m/%Y")})')
         print(f'  {sep}')
-        for dt in sorted(por_dia):
-            partes = '  |  '.join(
-                f'{mod}: {maq} maq'
-                for mod, maq in sorted(por_dia[dt].items())
-            )
-            total_slot = maq_slot_por_dia.get(dt, 0)
-            print(f'  📅 {dt.strftime("%d/%m/%Y")}  →  {partes}  '
-                  f'(slots ativos nesse dia: {total_slot})')
-        n_dias   = len(por_dia)
-        n_alloc  = len(resultado_congelado)
-        total_maq_all = sum(sum(v.values()) for v in por_dia.values())
+        total_slots_all = 0
+        for dt in sorted(slots_por_dia_mod):
+            partes = []
+            dia_total = 0
+            for aba in sorted(slots_por_dia_mod[dt]):
+                n = len(slots_por_dia_mod[dt][aba])
+                partes.append(f'{nome_mod.get(aba, aba)}: {n} máq físicas')
+                dia_total += n
+            total_slots_all += dia_total
+            print(f'  📅 {dt.strftime("%d/%m/%Y")}  →  {"  |  ".join(partes)}  '
+                  f'(total: {dia_total})')
+        n_dias  = len(slots_por_dia_mod)
+        n_alloc = len(resultado_congelado)
         print(f'  {sep}')
         print(f'  ✅ {n_dias} dia(s) congelado(s) | {n_alloc} alocação(ões) | '
-              f'{total_maq_all} máquina(s)-dia preservada(s)')
+              f'{total_slots_all} máquina(s)-dia preservada(s)')
         print(f'  {sep}')
 
     print('6/8 Otimizando em blocos por prazo (rolling-horizon)...')
