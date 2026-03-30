@@ -3617,6 +3617,15 @@ def main():
                 for _i in range(num_machines):
                     if filas_iniciais_glob[_i] < limite_h_zona:
                         filas_iniciais_glob[_i] = limite_h_zona
+                # O scheduler usa frozen_intervals (Tetris), não filas_iniciais.
+                # Para bloquear máquinas novas/sem congelamento, adiciona um
+                # intervalo sintético (last_fim → limite_h_zona) em cada máquina
+                # que ainda tem capacidade livre antes do fim da zona.
+                for _i in range(num_machines):
+                    ivs = frozen_intervals_glob.get(_i) or []
+                    last_fim = max((iv[1] for iv in ivs), default=0.0)
+                    if last_fim < limite_h_zona:
+                        frozen_intervals_glob[_i] = list(ivs) + [(last_fim, limite_h_zona)]
                 print(f'  ✔ Intervalos congelados reconstruídos via slot_times '
                       f'({len(resultado_congelado)} alocações) — índices remapeados '
                       f'para configuração atual de {num_machines} máquinas.')
