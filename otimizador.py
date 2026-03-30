@@ -3746,6 +3746,39 @@ def main():
     print(f'  ✔ {len(resultado)} alocações ({len(resultado_congelado)} congeladas + '
           f'{len(resultado_novos)} novas), {len(sem_cadastro)} sem cadastro.')
 
+    # ── Diagnóstico dos pedidos livres (primeiros dias após a zona congelada) ──
+    if resultado_novos and limite_h_zona > 0:
+        slots_livres: dict = {}
+        nome_mod_livre: dict = {}
+        for r in resultado_novos:
+            mod_nome = r.get('nome_modelo') or r.get('aba') or '?'
+            for slot in (r.get('slot_times') or []):
+                if len(slot) < 4:
+                    continue
+                ini, _fim, aba, loc = slot[0], slot[1], slot[2], int(slot[3])
+                dt_slot = horas_para_data(data_base, float(ini), datas_bloqueadas).date()
+                slots_livres.setdefault(dt_slot, {})
+                slots_livres[dt_slot].setdefault(aba, set())
+                slots_livres[dt_slot][aba].add(loc)
+                nome_mod_livre[aba] = mod_nome
+
+        dias_livres = sorted(slots_livres)[:5]   # primeiros 5 dias úteis livres
+        if dias_livres:
+            sep = '─' * 56
+            print(f'  {sep}')
+            print(f'  📋 PEDIDOS LIVRES — primeiros {len(dias_livres)} dia(s) após zona congelada')
+            print(f'  {sep}')
+            for dt in dias_livres:
+                partes = []
+                dia_total = 0
+                for aba in sorted(slots_livres[dt]):
+                    n = len(slots_livres[dt][aba])
+                    partes.append(f'{nome_mod_livre.get(aba, aba)}: {n} máq físicas')
+                    dia_total += n
+                print(f'  📅 {dt.strftime("%d/%m/%Y")}  →  {"  |  ".join(partes)}  '
+                      f'(total: {dia_total})')
+            print(f'  {sep}')
+
     print('8/8 Salvando resultados...')
     salvar_resultado(spreadsheet, resultado, sem_cadastro, sugestoes, melhor)
     salvar_comparativo(spreadsheet, melhor, ranking, len(pedidos_para_ranking), len(modelos),
