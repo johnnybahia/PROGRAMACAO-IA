@@ -3611,6 +3611,12 @@ def main():
                 filas_iniciais_glob, frozen_intervals_glob = \
                     _frozen_intervals_from_resultado(
                         resultado_congelado, ridx_map, num_machines)
+                # Garante que máquinas sem frozen_interval (ex: novas máquinas
+                # adicionadas após o congelamento) não agendem antes do fim da
+                # zona congelada — evita pedidos livres dentro do período frozen.
+                for _i in range(num_machines):
+                    if filas_iniciais_glob[_i] < limite_h_zona:
+                        filas_iniciais_glob[_i] = limite_h_zona
                 print(f'  ✔ Intervalos congelados reconstruídos via slot_times '
                       f'({len(resultado_congelado)} alocações) — índices remapeados '
                       f'para configuração atual de {num_machines} máquinas.')
