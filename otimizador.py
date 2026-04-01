@@ -949,6 +949,9 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             ordem_compra        = linha[7].strip() if len(linha) > 7 else ''
             data_ent_str        = linha[8].strip() if len(linha) > 8 else ''
             data_ent_esp_str    = linha[11].strip() if len(linha) > 11 else ''
+            # Col M (índice 12), linhas ≥ 5: "SIM" → inserir dentro da zona congelada
+            inserir_zona        = (i >= 5 and len(linha) > 12
+                                   and linha[12].strip().upper() == 'SIM')
         except IndexError:
             continue
 
@@ -1001,7 +1004,8 @@ def ler_pedidos(spreadsheet, data_base: date, datas_bloqueadas: set) -> list:
             #   3 = máquina especial definida (col B) — ocupa a máquina certa antes
             #   2 = data de início especial definida (col A) — reserva slot a partir da data
             #   1 = padrão — otimizado por prazo de entrega (EDD/SA)
-            'prioridade': (3 if maquina_especial else 2 if data_esp else 1),
+            'prioridade':   (3 if maquina_especial else 2 if data_esp else 1),
+            'inserir_zona': inserir_zona,
         })
 
     return pedidos
@@ -3238,6 +3242,172 @@ def _inserir_em_fila(fila: list, idx_atual: int, dia: int, pedidos_novos: list):
         fila.append({'bucket': dia, 'pedidos': list(pedidos_novos)})
 
 
+def _inserir_pedidos_zona_congelada(
+        pedidos_novos_zona: list,
+        resultado_congelado: list,
+        ref_data: dict,
+        modelos: dict,
+        ridx_map: dict,
+        num_machines: int,
+        data_base,
+        datas_bloqueadas: set,
+        limite_h_zona: float) -> tuple:
+    """
+    Encaixa pedidos marcados 'inserir_zona=True' dentro da zona congelada via
+    Tetris, sem mover nenhuma alocação já existente.
+
+    Se um novo pedido não couber nos buracos disponíveis, empurra para fora
+    (fila livre) o pedido congelado com o início mais tardio — repetindo até
+    o novo caber ou não restar mais candidatos a empurrar.
+
+    Ordena os novos pedidos por prazo de entrega (EDD) antes de tentar encaixar.
+
+    Retorna:
+        (resultado_atualizado, empurrados_linha_sheets, encaixados_linha_sheets)
+        onde empurrados_linha_sheets são linha_sheet dos pedidos retirados da
+        zona e encaixados_linha_sheets são linha_sheet dos novos inseridos.
+    """
+    preparar_restricoes_pedidos(pedidos_novos_zona, ref_data, modelos)
+
+    sem_cad = [p for p in pedidos_novos_zona if p.get('_gidxs') is None]
+    if sem_cad:
+        print(f'  ⚠ {len(sem_cad)} pedido(s) SIM sem cadastro de máquina — ignorado(s).')
+
+    novos_edd = sorted(
+        [p for p in pedidos_novos_zona if p.get('_gidxs') is not None],
+        key=lambda p: (p.get('deadline_horas') or float('inf'),
+                       p.get('min_start', 0.0))
+    )
+
+    # Mapa reverso (aba, loc_idx) → global_idx para o ridx_map atual
+    gidx_fwd: dict = {v: k for k, v in ridx_map.items()}
+
+    def _build_ms(resultado):
+        """Constrói _IntervalMachineState a partir dos slot_times de resultado."""
+        ms = _IntervalMachineState(num_machines)
+        for r in resultado:
+            for slot in (r.get('slot_times') or []):
+                if len(slot) < 4:
+                    continue
+                ini, fim, aba, loc = float(slot[0]), float(slot[1]), slot[2], int(slot[3])
+                gidx = gidx_fwd.get((aba, loc))
+                if gidx is not None and gidx < num_machines:
+                    ms.allocate(gidx, ini, fim)
+        return ms
+
+    def _tentar_encaixar(pedido, resultado_base):
+        """
+        Tenta alocar pedido nos buracos de resultado_base dentro de limite_h_zona.
+        Retorna (slots, ini_slot, fim_slot) se coube, ou None se não coube.
+        """
+        ms        = _build_ms(resultado_base)
+        gidxs     = pedido['_gidxs']
+        tempos    = pedido['_tempos']
+        total_maq = pedido['maquinas_necessarias']
+        min_s     = float(pedido.get('min_start', 0.0))
+        ng        = len(gidxs)
+        if ng == 0:
+            return None
+
+        slots    = []
+        ini_slot = float('inf')
+        fim_slot = 0.0
+        for _ in range(total_maq):
+            ft   = np.array([ms.earliest_fit(int(gidxs[i]), float(tempos[i]), min_s)
+                              + float(tempos[i]) for i in range(ng)])
+            best  = int(np.argmin(ft))
+            inicio = ms.earliest_fit(int(gidxs[best]), float(tempos[best]), min_s)
+            fim    = inicio + float(tempos[best])
+            if fim > limite_h_zona:
+                return None          # não cabe dentro da zona congelada
+            ms.allocate(int(gidxs[best]), inicio, fim)
+            aba_s, loc_i = ridx_map[int(gidxs[best])]
+            slots.append((inicio, fim, aba_s, loc_i))
+            ini_slot = min(ini_slot, inicio)
+            fim_slot = max(fim_slot, fim)
+        return slots, ini_slot, fim_slot
+
+    def _criar_resultado(pedido, slots, ini_slot, fim_slot):
+        """Monta um registro de resultado compatível com o formato padrão."""
+        dt_inicio  = horas_para_data(data_base, ini_slot,  datas_bloqueadas)
+        dt_termino = horas_para_data(data_base, fim_slot,  datas_bloqueadas)
+        data_ent   = pedido.get('data_entrega')
+        prazo_delta, prazo_str = None, ''
+        if data_ent:
+            delta       = (data_ent - dt_termino.date()).days
+            prazo_delta = delta
+            prazo_str   = (f'{delta} dias antecipado' if delta >= 0
+                           else f'{delta} dias atrasado')
+        aba_s    = slots[0][2] if slots else ''
+        nome_mod = next((k for k in modelos if k == aba_s), aba_s)
+        tempo_p  = float(pedido['_tempos'][0]) if len(pedido['_tempos']) else 0.0
+        return {
+            'referencia':            pedido['referencia'],
+            'produto':               pedido.get('produto', ''),
+            'cor':                   pedido.get('cor', '') or '-',
+            'cliente':               pedido.get('cliente', ''),
+            'ordem_compra':          pedido.get('ordem_compra', ''),
+            'nome_modelo':           nome_mod,
+            'aba':                   aba_s,
+            'maquinas_alocadas':     pedido['maquinas_necessarias'],
+            'tempo_producao':        tempo_p,
+            'inicio_horas':          round(ini_slot, 4),
+            'termino_horas':         round(fim_slot, 4),
+            'slot_times':            slots,
+            'dt_inicio':             dt_inicio,
+            'dt_termino':            dt_termino,
+            'data_entrega':          data_ent,
+            'prazo_delta':           prazo_delta,
+            'prazo_str':             prazo_str,
+            'linha_sheet':           pedido['linha_sheet'],
+            'data_especial':         pedido.get('data_especial'),
+            'data_entrega_especial': pedido.get('data_entrega_especial'),
+            'maquina_especial':      pedido.get('maquina_especial', ''),
+        }
+
+    resultado_atual       = list(resultado_congelado)
+    empurrados_lns: list  = []   # linha_sheet dos empurrados para fora
+    encaixados_lns: list  = []   # linha_sheet dos novos inseridos
+
+    for pedido in novos_edd:
+        resultado_cand   = list(resultado_atual)   # cópia de trabalho
+        pushados_agora   = []                      # empurrados nesta tentativa
+
+        while True:
+            ret = _tentar_encaixar(pedido, resultado_cand)
+            if ret is not None:
+                # Encaixou — confirma inserção e pushes
+                slots, ini_slot, fim_slot = ret
+                novo_r = _criar_resultado(pedido, slots, ini_slot, fim_slot)
+                resultado_atual = resultado_cand + [novo_r]
+                empurrados_lns.extend(r['linha_sheet'] for r in pushados_agora)
+                encaixados_lns.append(pedido['linha_sheet'])
+                ln   = pedido['linha_sheet']
+                ref  = pedido['referencia']
+                npsh = len(pushados_agora)
+                msg  = (f'  ✔ Pedido ln{ln} ({ref}) inserido na zona congelada'
+                        + (f' — {npsh} pedido(s) empurrado(s) para fila livre.'
+                           if npsh else '.'))
+                print(msg)
+                break
+            else:
+                # Não coube — empurra o de início mais tardio
+                if not resultado_cand:
+                    break
+                ultimo = max(resultado_cand,
+                             key=lambda r: r.get('inicio_horas', 0.0))
+                resultado_cand = [r for r in resultado_cand if r is not ultimo]
+                pushados_agora.append(ultimo)
+        else:
+            # Loop terminou sem break → pedido não coube
+            ln  = pedido['linha_sheet']
+            ref = pedido['referencia']
+            print(f'  ⚠ Pedido ln{ln} ({ref}) não coube na zona congelada '
+                  f'mesmo após empurrar todos — vai para fila livre.')
+
+    return resultado_atual, empurrados_lns, encaixados_lns
+
+
 # ── OTIMIZAÇÃO EM BLOCOS POR PRAZO (rolling-horizon) ─────────────────────────
 def otimizar_em_blocos(pedidos, modelos, ref_data, num_machines):
     """
@@ -3638,6 +3808,45 @@ def main():
                     pedidos_frozen_rem, ref_data, num_machines)
                 print(f'  ✔ Filas e intervalos recalculados (legado) com '
                       f'{len(pedidos_frozen_rem)} pedido(s) congelado(s).')
+
+    # ── Auto-diagnóstico da zona congelada ──────────────────────────────────
+    # ── Inserção de pedidos SIM na zona congelada ────────────────────────────
+    # Pedidos marcados com SIM na col M (linhas ≥ 5) que ainda não estão
+    # congelados são encaixados via Tetris nos buracos da zona; se não
+    # couberem, empurram o de início mais tardio para a fila livre.
+    if limite_h_zona > 0:
+        pedidos_zona_nova = [p for p in pedidos_orig
+                             if p.get('inserir_zona')
+                             and p['linha_sheet'] not in frozen_linhas_set]
+        if pedidos_zona_nova:
+            print(f'  ℹ {len(pedidos_zona_nova)} pedido(s) SIM para inserir na zona congelada...')
+            resultado_congelado, empurrados_lns, encaixados_lns = \
+                _inserir_pedidos_zona_congelada(
+                    pedidos_zona_nova, resultado_congelado,
+                    ref_data, modelos, ridx_map, num_machines,
+                    data_base, datas_bloqueadas, limite_h_zona)
+            if encaixados_lns or empurrados_lns:
+                # Atualiza frozen_linhas_set: adiciona encaixados, remove empurrados
+                frozen_linhas_set = (
+                    (frozen_linhas_set | set(encaixados_lns)) - set(empurrados_lns)
+                )
+                # Reconstrói frozen_intervals com os novos encaixados
+                fi_new, frozen_intervals_glob = _frozen_intervals_from_resultado(
+                    resultado_congelado, ridx_map, num_machines)
+                filas_iniciais_glob = fi_new
+                # Aplica bloqueio de zona para máquinas sem intervalos
+                for _i in range(num_machines):
+                    ivs = frozen_intervals_glob.get(_i) or []
+                    last_fim = max((iv[1] for iv in ivs), default=0.0)
+                    if last_fim < limite_h_zona:
+                        frozen_intervals_glob[_i] = list(ivs) + [(last_fim, limite_h_zona)]
+                # Pedidos empurrados voltam para a fila livre
+                pedidos = [p for p in pedidos if p['linha_sheet'] not in encaixados_lns]
+                empurrados_pedidos = [p for p in pedidos_orig
+                                      if p['linha_sheet'] in empurrados_lns
+                                      and p['linha_sheet'] not in
+                                      {pp['linha_sheet'] for pp in pedidos}]
+                pedidos = pedidos + empurrados_pedidos
 
     # ── Auto-diagnóstico da zona congelada ──────────────────────────────────
     # Mostra máquinas FÍSICAS ativas por modelo/dia via slot_times,
