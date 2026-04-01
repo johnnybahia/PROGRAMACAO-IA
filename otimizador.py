@@ -3758,18 +3758,47 @@ def main():
 
         if _replanear_congelados:
             # ── Pedido deletado: re-planeja congelados preservando modelo ─────
-            # Ordena por EDD dentro do congelado, cada pedido fica restrito ao
-            # mesmo modelo (aba) que foi originalmente atribuído.
             resultado_congelado, filas_iniciais_glob, frozen_intervals_glob = \
                 replanejar_congelados(
                     resultado_congelado, pedidos_orig, ridx_map,
                     num_machines, data_base, datas_bloqueadas)
-            # Atualiza o conjunto de linhas congeladas com o resultado re-planejado
             frozen_linhas_set = {r['linha_sheet'] for r in resultado_congelado}
             pedidos = [p for p in pedidos_orig
                        if p['linha_sheet'] not in frozen_linhas_set]
             print(f'  ✔ Zona congelada re-planejada: {len(resultado_congelado)} alocações '
                   f'(modelos preservados, EDD interno, Tetris ativo).')
+
+            # ── Pull-in: tenta puxar o primeiro livre da fila para a zona ────
+            # Após deleção pode ter sobrado espaço — o primeiro pedido livre
+            # (EDD) é testado; se couber entra na zona, se não couber fica fora.
+            pedidos_edd = sorted(pedidos,
+                                 key=lambda p: (p.get('deadline_horas') or float('inf'),
+                                                p.get('min_start', 0.0)))
+            if pedidos_edd:
+                preparar_restricoes_pedidos([pedidos_edd[0]], ref_data, modelos)
+                candidato = pedidos_edd[0]
+                if candidato.get('_gidxs') is not None:
+                    ret = _inserir_pedidos_zona_congelada(
+                        [candidato], resultado_congelado,
+                        ref_data, modelos, ridx_map, num_machines,
+                        data_base, datas_bloqueadas, limite_h_zona)
+                    res_upd, empurrados_lns, encaixados_lns = ret
+                    if encaixados_lns:
+                        resultado_congelado = res_upd
+                        frozen_linhas_set   = {r['linha_sheet']
+                                               for r in resultado_congelado}
+                        pedidos = [p for p in pedidos_orig
+                                   if p['linha_sheet'] not in frozen_linhas_set]
+                        fi_new, frozen_intervals_glob = \
+                            _frozen_intervals_from_resultado(
+                                resultado_congelado, ridx_map, num_machines)
+                        filas_iniciais_glob = fi_new
+                        for _i in range(num_machines):
+                            ivs      = frozen_intervals_glob.get(_i) or []
+                            last_fim = max((iv[1] for iv in ivs), default=0.0)
+                            if last_fim < limite_h_zona:
+                                frozen_intervals_glob[_i] = list(ivs) + \
+                                    [(last_fim, limite_h_zona)]
 
         else:
             # ── Limite mudou ou config de máquinas mudou: só reconstrói intervalos
